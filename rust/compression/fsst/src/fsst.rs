@@ -1605,6 +1605,105 @@ But exactly how the acquaintance and friendship came about, we cannot say.";
         helper_64_bit(&test_input);
     }
 
+    /// Verify the unsafe set_len(capacity()) pattern used in the legacy FSST decoder
+    /// (lance-encoding/src/previous/encodings/physical/fsst.rs:82-83).
+    ///
+    /// The legacy decoder allocates `vec![0u8; compressed.len() * 8]`, then calls
+    /// `unsafe { buf.set_len(buf.capacity()) }` before passing to decompress.
+    /// This test replicates that exact pattern and verifies:
+    /// 1. decompress truncates the vec to actual decompressed size
+    /// 2. all bytes within the decompressed range are valid (match original)
+    /// 3. no trailing uninitialized bytes leak into the output
+    #[test]
+    fn test_legacy_decoder_set_len_safety() {
+        // Use various input sizes including small (below FSST_LEAST_INPUT_SIZE)
+        // and large (triggering actual symbol table compression)
+        let medium = "hello world! ".repeat(100);
+        let large = TEST_PARAGRAPH.repeat(5);
+        let test_cases: Vec<&str> = vec![
+            "short",       // small input, no compression
+            &medium,       // medium, some compression
+            &large,        // large, good compression
+        ];
+
+        for (i, input) in test_cases.iter().enumerate() {
+            let lines: Vec<&str> = input.lines().collect();
+            if lines.is_empty() {
+                continue;
+            }
+            let string_array = StringArray::from(lines);
+
+            // Step 1: Compress
+            let mut compressed_buf: Vec<u8> = vec![0; string_array.value_data().len() * 2];
+            let mut compressed_offsets: Vec<i32> = vec![0; string_array.value_offsets().len() * 2];
+            let mut symbol_table = [0u8; FSST_SYMBOL_TABLE_SIZE];
+
+            compress(
+                symbol_table.as_mut(),
+                string_array.value_data(),
+                string_array.value_offsets(),
+                &mut compressed_buf,
+                &mut compressed_offsets,
+            )
+            .unwrap();
+
+            // Step 2: Replicate the EXACT legacy decoder pattern:
+            //   let mut decompressed_bytes = vec![0u8; bytes.len() * 8];
+            //   unsafe { decompressed_bytes.set_len(decompressed_bytes.capacity()); }
+            let mut decompressed_bytes = vec![0u8; compressed_buf.len() * 8];
+            let pre_capacity = decompressed_bytes.capacity();
+            unsafe {
+                decompressed_bytes.set_len(pre_capacity);
+            }
+            let mut decompressed_offsets = vec![0_i32; compressed_offsets.len()];
+
+            decompress(
+                &symbol_table,
+                &compressed_buf,
+                &compressed_offsets,
+                &mut decompressed_bytes,
+                &mut decompressed_offsets,
+            )
+            .unwrap();
+
+            // Verify decompress truncated the vec to actual decompressed size
+            assert!(
+                decompressed_bytes.len() <= pre_capacity,
+                "case {i}: decompress should truncate len <= capacity, got len={} capacity={}",
+                decompressed_bytes.len(),
+                pre_capacity,
+            );
+
+            // Verify each string matches the original
+            for j in 1..decompressed_offsets.len() {
+                let start = decompressed_offsets[j - 1] as usize;
+                let end = decompressed_offsets[j] as usize;
+                assert!(
+                    end <= decompressed_bytes.len(),
+                    "case {i} string {j}: offset {end} exceeds decompressed len {}",
+                    decompressed_bytes.len(),
+                );
+                let decompressed = &decompressed_bytes[start..end];
+                let orig_start = string_array.value_offsets()[j - 1] as usize;
+                let orig_end = string_array.value_offsets()[j] as usize;
+                let original = &string_array.value_data()[orig_start..orig_end];
+                assert_eq!(
+                    decompressed, original,
+                    "case {i} string {j}: mismatch"
+                );
+            }
+
+            // Verify the last offset equals the vec length (no trailing garbage accessible)
+            if let Some(&last_offset) = decompressed_offsets.last() {
+                assert_eq!(
+                    last_offset as usize,
+                    decompressed_bytes.len(),
+                    "case {i}: last offset should equal vec len (no trailing uninitialized bytes accessible)"
+                );
+            }
+        }
+    }
+
     fn helper_64_bit(test_input: &str) {
         use arrow_array::LargeStringArray;
         let lines_vec = test_input.lines().collect::<Vec<&str>>();

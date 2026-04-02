@@ -652,4 +652,82 @@ mod test {
         let decoded_values = decoded.data.borrow_to_typed_slice::<u32>();
         assert_eq!(decoded_values.as_ref(), values.as_slice());
     }
+
+    /// Verify that unsafe set_len in bitpack_out_of_line / unpack_out_of_line
+    /// produces correct results for edge-case buffer sizes that stress the
+    /// boundary between whole chunks and runt tails.
+    #[test]
+    fn test_set_len_safety_edge_cases() {
+        let bit_width = 4usize;
+        let word_bits = std::mem::size_of::<u16>() as u64 * 8;
+
+        // Edge cases: exactly one chunk, one more than a chunk, one fewer,
+        // a single element, and two full chunks.
+        let sizes: Vec<usize> = vec![
+            1,
+            ELEMS_PER_CHUNK as usize - 1,
+            ELEMS_PER_CHUNK as usize,
+            ELEMS_PER_CHUNK as usize + 1,
+            ELEMS_PER_CHUNK as usize * 2,
+            ELEMS_PER_CHUNK as usize * 2 + 513,
+        ];
+
+        for num_values in sizes {
+            let values: Vec<u16> = (0..num_values).map(|i| (i % 15) as u16).collect();
+            let input = FixedWidthDataBlock {
+                data: LanceBuffer::reinterpret_vec(values.clone()),
+                bits_per_value: word_bits,
+                num_values: values.len() as u64,
+                block_info: BlockInfo::new(),
+            };
+
+            let compressed = bitpack_out_of_line::<u16>(input, bit_width);
+            let compressed_words = compressed.borrow_to_typed_slice::<u16>().to_vec();
+
+            let compressed_block = FixedWidthDataBlock {
+                data: LanceBuffer::reinterpret_vec(compressed_words.clone()),
+                bits_per_value: word_bits,
+                num_values: compressed_words.len() as u64,
+                block_info: BlockInfo::new(),
+            };
+
+            let decoded = unpack_out_of_line::<u16>(compressed_block, values.len(), bit_width);
+            let decoded_values = decoded.data.borrow_to_typed_slice::<u16>();
+            assert_eq!(
+                decoded_values.as_ref(),
+                values.as_slice(),
+                "roundtrip failed for num_values={num_values}"
+            );
+        }
+    }
+
+    /// Verify roundtrip with all-zero values (bit_width=0 after analysis)
+    /// to ensure set_len doesn't leave garbage when no packing work is done.
+    #[test]
+    fn test_set_len_safety_all_zeros() {
+        let bit_width = 1usize;
+        let word_bits = std::mem::size_of::<u32>() as u64 * 8;
+        let values: Vec<u32> = vec![0; ELEMS_PER_CHUNK as usize + 7];
+
+        let input = FixedWidthDataBlock {
+            data: LanceBuffer::reinterpret_vec(values.clone()),
+            bits_per_value: word_bits,
+            num_values: values.len() as u64,
+            block_info: BlockInfo::new(),
+        };
+
+        let compressed = bitpack_out_of_line::<u32>(input, bit_width);
+        let compressed_words = compressed.borrow_to_typed_slice::<u32>().to_vec();
+
+        let compressed_block = FixedWidthDataBlock {
+            data: LanceBuffer::reinterpret_vec(compressed_words.clone()),
+            bits_per_value: word_bits,
+            num_values: compressed_words.len() as u64,
+            block_info: BlockInfo::new(),
+        };
+
+        let decoded = unpack_out_of_line::<u32>(compressed_block, values.len(), bit_width);
+        let decoded_values = decoded.data.borrow_to_typed_slice::<u32>();
+        assert_eq!(decoded_values.as_ref(), values.as_slice());
+    }
 }

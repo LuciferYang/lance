@@ -373,6 +373,96 @@ async fn test_retry_sq_full_current_thread() -> Result<()> {
     Ok(())
 }
 
+/// Verify that the unsafe set_len pattern in submit_read produces correct data
+/// for reads of various sizes including:
+/// - Very small reads (1 byte) where the buffer is tiny
+/// - Reads that are not page-aligned
+/// - Reads that exactly match the file size
+///
+/// This exercises the code path at reader.rs:188-190 where
+/// `BytesMut::with_capacity(length)` + `unsafe { buffer.set_len(length) }`
+/// exposes uninitialized memory to the kernel. If the kernel fails to write
+/// all bytes, we'd get uninitialized data in the output.
+#[tokio::test]
+async fn test_set_len_safety_various_read_sizes() -> Result<()> {
+    let file_size = 8192;
+    let (file, expected_data) = create_test_file(file_size)?;
+    let file_path = file.path().to_str().unwrap();
+    let uri = format!("file+uring://{}", file_path);
+
+    let (store, path) = ObjectStore::from_uri(&uri).await?;
+
+    // Test various read sizes that exercise different buffer alignments
+    let test_ranges: Vec<std::ops::Range<usize>> = vec![
+        0..1,          // single byte
+        0..7,          // odd size, not word-aligned
+        0..4096,       // page-aligned
+        100..101,      // single byte from middle
+        4095..4097,    // crosses page boundary
+        0..file_size,  // entire file
+        8000..8192,    // last 192 bytes
+    ];
+
+    for range in test_ranges {
+        let reader = store.open(&path).await?;
+        let data = reader.get_range(range.clone()).await.unwrap();
+        assert_eq!(
+            data.as_ref(),
+            &expected_data[range.clone()],
+            "data mismatch for range {:?}",
+            range
+        );
+    }
+
+    Ok(())
+}
+
+/// Verify that concurrent reads with different sizes don't corrupt each other's
+/// buffers. Each submit_read allocates its own BytesMut via set_len; this test
+/// ensures no cross-contamination between concurrent uninitialized buffers.
+#[tokio::test]
+async fn test_set_len_safety_concurrent_different_sizes() -> Result<()> {
+    let file_size = 16384;
+    let (file, expected_data) = create_test_file(file_size)?;
+    let file_path = file.path().to_str().unwrap();
+    let uri = format!("file+uring://{}", file_path);
+
+    let (store, path) = ObjectStore::from_uri(&uri).await?;
+
+    let mut tasks = vec![];
+    // Launch reads of varying sizes concurrently
+    let ranges: Vec<std::ops::Range<usize>> = vec![
+        0..1,
+        0..100,
+        100..4096,
+        4096..8192,
+        8192..16384,
+        0..16384,
+        1000..1001,
+    ];
+
+    for range in &ranges {
+        let reader = store.open(&path).await?;
+        let range = range.clone();
+        let expected = expected_data[range.clone()].to_vec();
+        tasks.push(tokio::spawn(async move {
+            let data = reader.get_range(range.clone()).await.unwrap();
+            assert_eq!(
+                data.as_ref(),
+                expected.as_slice(),
+                "concurrent read mismatch for range {:?}",
+                range
+            );
+        }));
+    }
+
+    for task in tasks {
+        task.await.unwrap();
+    }
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_uring_not_enabled_with_file_scheme() -> Result<()> {
     // Verify that files opened with file:// don't use uring
