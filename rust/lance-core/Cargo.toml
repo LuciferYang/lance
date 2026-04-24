@@ -34,14 +34,16 @@ pin-project.workspace = true
 prost.workspace = true
 rand.workspace = true
 roaring.workspace = true
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 snafu.workspace = true
 tempfile.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["time"] }
 tokio-stream.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 url.workspace = true
+uuid.workspace = true
 log.workspace = true
 
 # This is used to detect CPU features at runtime.
@@ -53,9 +55,11 @@ libc = { version = "0.2" }
 lance-testing.workspace = true
 proptest.workspace = true
 rstest.workspace = true
+tokio = { workspace = true, features = ["test-util", "time", "macros", "rt-multi-thread"] }
 
 [features]
 datafusion = ["dep:datafusion-common", "dep:datafusion-sql"]
+testing = []
 
 [lints]
 workspace = true

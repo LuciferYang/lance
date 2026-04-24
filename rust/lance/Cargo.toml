@@ -95,6 +95,7 @@ pprof.workspace = true
 lzma-sys = { version = "0.1" }
 
 [dev-dependencies]
+lance-core = { workspace = true, features = ["testing"] }
 lance-test-macros = { workspace = true }
 lance-datagen = { workspace = true }
 pretty_assertions = { workspace = true }

@@ -14,6 +14,9 @@ pub mod traits;
 pub mod utils;
 
 pub use error::{ArrowResult, Error, Result, box_error};
+pub use utils::lease::{
+    LeaseGuard, LeaseOptions, LeaseRegistry, ObjectStoreLeaseRegistry, VersionLease,
+};
 
 /// Wildcard to indicate all non-system columns
 pub const WILDCARD: &str = "*";

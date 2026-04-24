@@ -102,9 +102,15 @@ impl ProxyObjectStore {
     }
 
     fn before_method(&self, method: &str, location: &Path) -> OSResult<()> {
-        let policy = self.policy.lock().unwrap();
-        for policy in policy.before_policies.values() {
-            policy(method, location).map_err(OSError::from)?;
+        // Snapshot policies under the lock, then drop the guard before invoking
+        // them so a policy that re-enters the proxy won't deadlock/panic.
+        let snapshot: Vec<PolicyFn> = {
+            let policy = self.policy.lock().unwrap();
+            policy.before_policies.values().cloned().collect()
+        };
+        for p in snapshot {
+            // `PolicyFn` returns `crate::Result<()>`; map into `object_store::Error`.
+            p(method, location).map_err(OSError::from)?;
         }
         Ok(())
     }
@@ -212,12 +218,23 @@ impl ObjectStore for ProxyObjectStore {
         let target = self.target.clone();
         let policy = Arc::clone(&self.policy);
 
+        let prefix_path: Path = prefix.cloned().unwrap_or_else(|| Path::from(""));
+        if let Err(e) = self.before_method("list", &prefix_path) {
+            return futures::stream::once(async move { Err(e) }).boxed();
+        }
+
         target
             .list(prefix)
             .and_then(move |meta| {
-                let policy = policy.lock().unwrap();
+                let object_meta_policies: Vec<ObjectMetaPolicyFn> = {
+                    let policy = policy.lock().unwrap();
+                    policy.object_meta_policies.values().cloned().collect()
+                };
                 let mut meta = meta;
-                for p in policy.object_meta_policies.values() {
+                // object_meta_policies are infallible transformations; panic
+                // on policy error. Only `before_method` policies above can
+                // fail, and those are propagated via `?`.
+                for p in object_meta_policies {
                     meta = p("list", meta).map_err(OSError::from).unwrap();
                 }
                 future::ready(Ok(meta))
@@ -304,5 +321,67 @@ impl ObjectStore for CountingObjectStore {
 
     async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
         self.target.copy_if_not_exists(from, to).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn list_fires_before_method() {
+        use futures::StreamExt;
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let policy = Arc::new(std::sync::Mutex::new(ProxyObjectStorePolicy::new()));
+        let proxy = ProxyObjectStore::new(store, policy.clone());
+        policy.lock().unwrap().set_before_policy(
+            "fail_list",
+            Arc::new(|op, _| -> crate::Result<()> {
+                if op == "list" {
+                    Err(crate::Error::io("boom"))
+                } else {
+                    Ok(())
+                }
+            }),
+        );
+        let results: Vec<_> = proxy.list(None).collect().await;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_err(), "list should surface the injected error");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reentrant_policy_does_not_deadlock() {
+        // Regression for the snapshot-then-release refactor: a policy that calls
+        // back into the proxy (triggering another `before_method`) must not
+        // deadlock/panic on a non-reentrant `std::sync::Mutex`.
+        //
+        // Requires `multi_thread` flavor because the re-entry uses `block_in_place`,
+        // which panics on a `current_thread` runtime.
+        use object_store::{path::Path, ObjectStore, PutPayload};
+        let inner: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let policy = Arc::new(std::sync::Mutex::new(ProxyObjectStorePolicy::new()));
+        let proxy = Arc::new(ProxyObjectStore::new(inner, policy.clone()));
+
+        let proxy_for_policy = proxy.clone();
+        policy.lock().unwrap().set_before_policy(
+            "reenter_on_head",
+            Arc::new(move |op, _| -> crate::Result<()> {
+                if op == "head" {
+                    let proxy = proxy_for_policy.clone();
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async move {
+                            let _ = proxy
+                                .put(&Path::from("nested/blob"), PutPayload::from_static(b"x"))
+                                .await;
+                        });
+                    });
+                }
+                Ok(())
+            }),
+        );
+
+        let _ = proxy.head(&Path::from("does_not_exist")).await;
+        // If we got here without panic, the re-entry fix holds.
     }
 }

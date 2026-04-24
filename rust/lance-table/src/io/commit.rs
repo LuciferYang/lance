@@ -67,6 +67,7 @@ use {
 };
 
 pub const VERSIONS_DIR: &str = "_versions";
+pub const LEASES_SUBDIR: &str = ".leases";
 const MANIFEST_EXTENSION: &str = "manifest";
 const DETACHED_VERSION_PREFIX: &str = "d";
 

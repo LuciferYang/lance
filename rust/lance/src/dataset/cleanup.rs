@@ -43,7 +43,7 @@ use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt, stream};
 use humantime::parse_duration;
 use lance_core::{
-    Error, Result,
+    Error, Result, VersionLease,
     utils::tracing::{
         AUDIT_MODE_DELETE, AUDIT_MODE_DELETE_UNVERIFIED, AUDIT_TYPE_DATA, AUDIT_TYPE_DELETION,
         AUDIT_TYPE_INDEX, AUDIT_TYPE_MANIFEST, TRACE_FILE_AUDIT,
@@ -139,37 +139,41 @@ impl<'a> CleanupTask<'a> {
 
     async fn run(self) -> Result<RemovalStats> {
         let mut final_stats = RemovalStats::default();
-        // First check if we need to clean referenced branches
-        // For cases that referenced branches never clean and the current cleanup cannot clean anything
-        // This must happen before cleaning the current branch if the setting is enabled.
 
         let referenced_branches: Vec<(String, u64)> = self.find_referenced_branches().await?;
         if self.policy.clean_referenced_branches {
             self.clean_referenced_branches(&referenced_branches).await?;
         }
 
-        // we process all manifest files in parallel to figure
-        // out which files are referenced by valid manifests
-
-        // get protected manifests first, and include those in process_manifests
-        // pass on option to process manifests around whether to return error
-        // or clean around the manifest
         let tags = self.dataset.tags().list().await?;
         let current_branch = &self.dataset.manifest.branch;
-
-        // Only retain tags on the current branch.
-        // Tags on other branches would take effect in retain_branch_lineage_files
         let tagged_versions: HashSet<u64> = tags
             .values()
             .filter(|tag| match (tag.branch.as_ref(), current_branch.as_ref()) {
-                (Some(branch_of_tag), Some(current_branch)) => branch_of_tag == current_branch,
+                (Some(a), Some(b)) => a == b,
                 (None, None) => true,
                 _ => false,
             })
-            .map(|tag_content| tag_content.version)
+            .map(|t| t.version)
             .collect();
 
-        let mut inspection = self.process_manifests(&tagged_versions).await?;
+        // Phase 1: snapshot active leases. Hoisted so phase 2 reuses the same registry instance.
+        let lease_registry = self.dataset.lease_registry();
+        let phase1_leases = lease_registry.list_active().await?;
+        let leased_versions_phase1: HashSet<u64> =
+            phase1_leases.iter().map(|l| l.version()).collect();
+        let phase1_lease_ids: HashSet<uuid::Uuid> =
+            phase1_leases.iter().map(|l| l.lease_id()).collect();
+
+        let retained_versions: HashSet<u64> = tagged_versions
+            .iter()
+            .chain(leased_versions_phase1.iter())
+            .copied()
+            .collect();
+
+        let mut inspection = self
+            .process_manifests(&retained_versions, &tagged_versions)
+            .await?;
 
         if self.policy.error_if_tagged_old_versions && !inspection.tagged_old_versions.is_empty() {
             return Err(tagged_old_versions_cleanup_error(
@@ -181,8 +185,32 @@ impl<'a> CleanupTask<'a> {
         if !referenced_branches.is_empty() {
             inspection = self
                 .retain_branch_lineage_files(inspection, &referenced_branches)
-                .await?
-        };
+                .await?;
+        }
+
+        // Phase 2 (pre-delete): any new lease (by lease_id) whose version is in
+        // the delete set? If so, abort — no partial deletes.
+        let phase2_leases = lease_registry.list_active().await?;
+        let versions_to_delete: HashSet<u64> = inspection.old_manifests.values().copied().collect();
+        let new_conflicts: Vec<&VersionLease> = phase2_leases
+            .iter()
+            .filter(|l| {
+                !phase1_lease_ids.contains(&l.lease_id())
+                    && versions_to_delete.contains(&l.version())
+            })
+            .collect();
+        if !new_conflicts.is_empty() {
+            let details: Vec<String> = new_conflicts
+                .iter()
+                .map(|l| format!("version={} lease_id={}", l.version(), l.lease_id()))
+                .collect();
+            return Err(Error::Cleanup {
+                message: format!(
+                    "cleanup aborted: new lease(s) arrived for version(s) that would have been deleted; retry later: [{}]",
+                    details.join(", ")
+                ),
+            });
+        }
 
         let stats = self.delete_unreferenced_files(inspection).await?;
         final_stats.bytes_removed += stats.bytes_removed;
@@ -197,6 +225,7 @@ impl<'a> CleanupTask<'a> {
     #[instrument(level = "debug", skip_all)]
     async fn process_manifests(
         &'a self,
+        retained_versions: &HashSet<u64>,
         tagged_versions: &HashSet<u64>,
     ) -> Result<CleanupInspection> {
         let inspection = Mutex::new(CleanupInspection::default());
@@ -204,7 +233,12 @@ impl<'a> CleanupTask<'a> {
             .commit_handler
             .list_manifest_locations(&self.dataset.base, &self.dataset.object_store, false)
             .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
-                self.process_manifest_file(location, &inspection, tagged_versions)
+                self.process_manifest_file(
+                    location,
+                    &inspection,
+                    retained_versions,
+                    tagged_versions,
+                )
             })
             .await?;
         Ok(inspection.into_inner().unwrap())
@@ -214,6 +248,7 @@ impl<'a> CleanupTask<'a> {
         &self,
         location: ManifestLocation,
         inspection: &Mutex<CleanupInspection>,
+        retained_versions: &HashSet<u64>,
         tagged_versions: &HashSet<u64>,
     ) -> Result<()> {
         // TODO: We can't cleanup invalid manifests.  There is no way to distinguish
@@ -226,12 +261,14 @@ impl<'a> CleanupTask<'a> {
             read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
         let dataset_version = self.dataset.version().version;
 
-        // Don't delete the latest version, even if it is old. Don't delete tagged versions,
-        // regardless of age. Don't delete manifests if their version is newer than the dataset
-        // version.  These are either in-progress or newly added since we started.
+        // Don't delete the latest version, even if it is old. Don't delete tagged
+        // or leased versions, regardless of age. Don't delete manifests if their
+        // version is newer than the dataset version. These are either in-progress
+        // or newly added since we started.
         let is_latest = dataset_version <= manifest.version;
         let is_tagged = tagged_versions.contains(&manifest.version);
-        let in_working_set = is_latest || !self.policy.should_clean(&manifest) || is_tagged;
+        let is_retained = retained_versions.contains(&manifest.version);
+        let in_working_set = is_latest || !self.policy.should_clean(&manifest) || is_retained;
         let indexes =
             read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
 
@@ -250,13 +287,12 @@ impl<'a> CleanupTask<'a> {
                 .insert(location.path.clone(), manifest.version);
         } else {
             let commit_ts = manifest.timestamp();
-            if let Some(ts) = inspection.earliest_retained_manifest_time {
-                if commit_ts < ts {
-                    inspection.earliest_retained_manifest_time = Some(commit_ts);
-                }
-            } else {
-                inspection.earliest_retained_manifest_time = Some(commit_ts);
-            }
+            let earliest = inspection.earliest_retained_manifest_time;
+            inspection.earliest_retained_manifest_time = match earliest {
+                Some(ts) if commit_ts < ts => Some(commit_ts),
+                Some(ts) => Some(ts),
+                None => Some(commit_ts),
+            };
         }
         Ok(())
     }
@@ -1529,6 +1565,18 @@ mod tests {
             let db = self.open().await?;
             let count = db.count_rows(None).await?;
             Ok(count)
+        }
+
+        async fn lease_registry(
+            &self,
+        ) -> Result<std::sync::Arc<dyn lance_core::utils::lease::LeaseRegistry>> {
+            Ok(self.open().await?.lease_registry())
+        }
+
+        async fn open_version(&self, v: u64) -> Result<Box<Dataset>> {
+            let ds = self.open().await?;
+            let versioned = ds.checkout_version(v).await?;
+            Ok(Box::new(versioned))
         }
     }
 
@@ -3813,5 +3861,229 @@ mod tests {
             "expected cleanup to be rate-limited (elapsed: {:?})",
             elapsed
         );
+    }
+
+    #[tokio::test]
+    async fn dataset_exposes_lease_registry() {
+        // Methods on the returned `Arc<dyn LeaseRegistry>` trait object are
+        // dispatched through the vtable, so no `use` for `LeaseRegistry` is
+        // required here. Task 6 will add a file-level import when concrete
+        // usages appear.
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let dataset = fixture.load().await.unwrap();
+        assert!(
+            dataset
+                .lease_registry()
+                .list_active()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn lease_retains_old_version_from_cleanup() {
+        use lance_core::utils::lease::LeaseOptions;
+
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap(); // v1
+        fixture.append_some_data().await.unwrap(); // v2
+        fixture.append_some_data().await.unwrap(); // v3
+
+        let reg = fixture.lease_registry().await.unwrap();
+        let opts = LeaseOptions::try_new(std::time::Duration::from_secs(60))
+            .unwrap()
+            .with_holder("test");
+        let lease = reg.acquire(1, &opts).await.unwrap();
+
+        let before = fixture.count_files().await.unwrap();
+        let policy = CleanupPolicy {
+            before_version: Some(3),
+            error_if_tagged_old_versions: false,
+            ..Default::default()
+        };
+        fixture.run_cleanup_with_policy(policy).await.unwrap();
+        let after = fixture.count_files().await.unwrap();
+
+        assert!(
+            after.num_manifest_files < before.num_manifest_files,
+            "some manifest file(s) should have been cleaned"
+        );
+        // v1 must still open AND its data files must still be readable.
+        // Merely loading the manifest is not enough — if cleanup had
+        // erroneously deleted data while retaining the manifest, open would
+        // still succeed but a scan would fail.
+        let ds = fixture.open_version(1).await.unwrap();
+        let rows = ds.count_rows(None).await.unwrap();
+        assert!(rows > 0, "v1 data must be readable (lease should have retained the data files)");
+
+        reg.release(&lease).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_lease_does_not_protect() {
+        use lance_core::utils::lease::VersionLease;
+        use object_store::ObjectStore as _; // brings `put` into scope on `Arc<dyn ObjectStore>`
+
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap(); // v1
+        fixture.append_some_data().await.unwrap(); // v2
+
+        let ds = fixture.open().await.unwrap();
+        let lease = VersionLease::new_for_test(
+            uuid::Uuid::new_v4(),
+            1,
+            chrono::Utc::now() - chrono::Duration::minutes(10),
+            None,
+        );
+        let lease_path = ds.lease_dir().child(format!("{}.lease", lease.lease_id()));
+        ds.object_store
+            .inner
+            .put(&lease_path, lease.to_json_bytes().unwrap().into())
+            .await
+            .unwrap();
+
+        let policy = CleanupPolicy {
+            before_version: Some(2),
+            error_if_tagged_old_versions: false,
+            ..Default::default()
+        };
+        fixture.run_cleanup_with_policy(policy).await.unwrap();
+        assert!(
+            fixture.open_version(1).await.is_err(),
+            "v1 must be unopenable after cleanup with only an expired lease"
+        );
+    }
+
+    #[tokio::test]
+    async fn lease_list_io_error_fails_cleanup_closed() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.append_some_data().await.unwrap();
+
+        {
+            let mut policy = fixture.mock_store.policy.lock().unwrap();
+            policy.set_before_policy(
+                "break_leases_list",
+                std::sync::Arc::new(|op, path| -> Result<()> {
+                    if op == "list" && path.as_ref().contains(".leases") {
+                        Err(Error::io("simulated list failure".to_string()))
+                    } else {
+                        Ok(())
+                    }
+                }),
+            );
+        }
+
+        let policy = CleanupPolicy {
+            before_version: Some(2),
+            error_if_tagged_old_versions: false,
+            ..Default::default()
+        };
+        let err = fixture
+            .run_cleanup_with_policy(policy)
+            .await
+            .expect_err("cleanup must fail closed on lease-list error");
+        assert!(
+            err.to_string().to_lowercase().contains("list")
+                || err.to_string().to_lowercase().contains("simulated"),
+            "error should mention list failure: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_leases_dir_is_not_an_error() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.append_some_data().await.unwrap();
+
+        let policy = CleanupPolicy {
+            before_version: Some(2),
+            error_if_tagged_old_versions: false,
+            ..Default::default()
+        };
+        let stats = fixture.run_cleanup_with_policy(policy).await.unwrap();
+        assert!(stats.old_versions >= 1);
+    }
+
+    #[tokio::test]
+    async fn lease_file_is_not_deleted_by_cleanup() {
+        use lance_core::utils::lease::LeaseOptions;
+
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.append_some_data().await.unwrap();
+
+        let reg = fixture.lease_registry().await.unwrap();
+        let lease = reg.acquire(1, &LeaseOptions::default()).await.unwrap();
+
+        let policy = CleanupPolicy {
+            before_version: Some(2),
+            error_if_tagged_old_versions: false,
+            ..Default::default()
+        };
+        fixture.run_cleanup_with_policy(policy).await.unwrap();
+
+        let active = reg.list_active().await.unwrap();
+        assert!(
+            active.iter().any(|l| l.lease_id() == lease.lease_id()),
+            "cleanup must not delete lease files"
+        );
+        reg.release(&lease).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn phase2_conflict_aborts_cleanup() {
+        use lance_core::utils::lease::LeaseOptions;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.append_some_data().await.unwrap();
+        fixture.append_some_data().await.unwrap();
+
+        let reg = fixture.lease_registry().await.unwrap();
+        let list_count = std::sync::Arc::new(AtomicUsize::new(0));
+        {
+            let list_count = list_count.clone();
+            let reg_for_policy = reg.clone();
+            let mut policy = fixture.mock_store.policy.lock().unwrap();
+            policy.set_before_policy(
+                "race_acquire",
+                std::sync::Arc::new(move |op, path| -> Result<()> {
+                    if op == "list" && path.as_ref().contains(".leases") {
+                        let n = list_count.fetch_add(1, Ordering::SeqCst);
+                        // n==0 = phase-1's list, n==1 = phase-2's list. Inject at n==1
+                        // so the new lease appears ONLY in phase-2's snapshot.
+                        if n == 1 {
+                            let reg = reg_for_policy.clone();
+                            tokio::task::block_in_place(|| {
+                                tokio::runtime::Handle::current().block_on(async move {
+                                    let _ = reg.acquire(2, &LeaseOptions::default()).await;
+                                });
+                            });
+                        }
+                    }
+                    Ok(())
+                }),
+            );
+        }
+
+        let policy = CleanupPolicy {
+            before_version: Some(3),
+            error_if_tagged_old_versions: false,
+            ..Default::default()
+        };
+        let err = fixture
+            .run_cleanup_with_policy(policy)
+            .await
+            .expect_err("cleanup must abort when a new lease arrives between probes");
+        assert!(
+            err.to_string().to_lowercase().contains("lease"),
+            "error should mention lease conflict: {err}"
+        );
+
+        fixture.open_version(2).await.unwrap();
     }
 }

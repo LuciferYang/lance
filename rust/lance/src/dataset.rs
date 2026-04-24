@@ -23,6 +23,7 @@ use lance_core::ROW_ADDR;
 use lance_core::datatypes::{OnMissing, OnTypeMismatch, Projectable, Projection};
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
+use lance_core::utils::lease::{LeaseRegistry, ObjectStoreLeaseRegistry};
 use lance_core::utils::tracing::{
     DATASET_CLEANING_EVENT, DATASET_DELETING_EVENT, DATASET_DROPPING_COLUMN_EVENT,
     TRACE_DATASET_EVENTS,
@@ -45,9 +46,9 @@ use lance_table::format::{
     DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest, RowIdMeta, pb,
 };
 use lance_table::io::commit::{
-    CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation, ManifestNamingScheme,
-    VERSIONS_DIR, external_manifest::ExternalManifestCommitHandler, migrate_scheme_to_v2,
-    write_manifest_file_to_path,
+    CommitConfig, CommitError, CommitHandler, CommitLock, LEASES_SUBDIR, ManifestLocation,
+    ManifestNamingScheme, VERSIONS_DIR, external_manifest::ExternalManifestCommitHandler,
+    migrate_scheme_to_v2, write_manifest_file_to_path,
 };
 
 use crate::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
@@ -149,6 +150,11 @@ pub const DEFAULT_INDEX_CACHE_SIZE: usize = 6 * 1024 * 1024 * 1024;
 // so this should be enough for a few hundred columns. Other metadata is much
 // smaller.
 pub const DEFAULT_METADATA_CACHE_SIZE: usize = 1024 * 1024 * 1024;
+
+/// Default skew grace applied to the lease registry exposed by this Dataset.
+/// Matches 2× the documented renew interval. May become per-dataset config
+/// later if deployments need per-dataset tuning.
+const DEFAULT_LEASE_SKEW_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Lance Dataset
 #[derive(Clone)]
@@ -1773,6 +1779,18 @@ impl Dataset {
 
     pub fn versions_dir(&self) -> Path {
         self.base.child(VERSIONS_DIR)
+    }
+
+    pub fn lease_dir(&self) -> object_store::path::Path {
+        self.versions_dir().child(LEASES_SUBDIR)
+    }
+
+    pub fn lease_registry(&self) -> std::sync::Arc<dyn LeaseRegistry> {
+        std::sync::Arc::new(ObjectStoreLeaseRegistry::new(
+            self.object_store.inner.clone(),
+            self.lease_dir(),
+            DEFAULT_LEASE_SKEW_GRACE,
+        ))
     }
 
     pub(crate) fn data_file_dir(&self, data_file: &DataFile) -> Result<Path> {

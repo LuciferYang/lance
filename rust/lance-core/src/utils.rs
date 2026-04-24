@@ -11,6 +11,7 @@ pub mod cpu;
 pub mod deletion;
 pub mod futures;
 pub mod hash;
+pub mod lease;
 pub mod mask;
 pub mod parse;
 pub mod path;
