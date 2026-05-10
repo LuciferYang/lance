@@ -55,6 +55,7 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
 import java.nio.channels.ReadableByteChannel;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -586,6 +587,29 @@ public class Dataset implements Closeable {
    * @param storageOptions Storage options
    */
   public static native void drop(String path, Map<String, String> storageOptions);
+
+  /**
+   * Resolve the latest committed version number for a dataset URI without opening the Dataset.
+   *
+   * <p>This is the cheap static equivalent of {@link #latestVersion()} (instance method) — it
+   * performs only the manifest-head resolve needed to determine the current version, not the full
+   * schema + index hydration that {@link #open(String)} triggers. It is intended for query-planning
+   * paths that need to pin a version early (for cache keying or snapshot isolation) without paying
+   * the cost of a full Dataset open.
+   *
+   * @param uri dataset URI (must be non-null and non-blank)
+   * @param storageOptions storage options for object-store access (may be null or empty)
+   * @return the latest committed version id
+   */
+  public static long latestVersionId(String uri, Map<String, String> storageOptions) {
+    Preconditions.checkNotNull(uri, "uri must not be null");
+    Preconditions.checkArgument(!uri.trim().isEmpty(), "uri must not be blank");
+    Map<String, String> opts = storageOptions != null ? storageOptions : Collections.emptyMap();
+    return nativeGetLatestVersionIdAtUri(uri, opts);
+  }
+
+  private static native long nativeGetLatestVersionIdAtUri(
+      String uri, Map<String, String> storageOptions);
 
   /**
    * Migrate the manifest paths to the new format.

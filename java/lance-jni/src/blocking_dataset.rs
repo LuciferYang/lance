@@ -35,7 +35,7 @@ use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{
     ColumnAlteration, CommitBuilder, Dataset, NewColumnTransform, ProjectionRequest, ReadParams,
-    Version, WriteParams,
+    Version, WriteParams, latest_version_at_uri,
 };
 use lance::index::DatasetIndexExt;
 use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
@@ -1567,6 +1567,62 @@ fn inner_latest_version_id(env: &mut JNIEnv, java_dataset: JObject) -> Result<u6
     let dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
     dataset_guard.latest_version()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeGetLatestVersionIdAtUri(
+    mut env: JNIEnv,
+    _class: JObject,
+    uri: JString,
+    storage_options_obj: JObject, // Map<String, String>
+) -> jlong {
+    ok_or_throw_with_return!(
+        env,
+        inner_latest_version_id_at_uri(&mut env, uri, storage_options_obj),
+        -1
+    ) as jlong
+}
+
+fn inner_latest_version_id_at_uri(
+    env: &mut JNIEnv,
+    uri: JString,
+    storage_options_obj: JObject,
+) -> Result<u64> {
+    // Defensive null check: `FromJString::extract` calls `env.get_string(self)?.into()` and
+    // passing a null JString triggers a JNI exception; re-entering the JNI with an exception
+    // already pending would abort the JVM. Surface a clean Rust-side error instead so our
+    // `ok_or_throw_with_return!` macro can raise a single well-formed Java exception.
+    if uri.is_null() {
+        return Err(Error::input_error("uri must not be null".to_string()));
+    }
+    let uri_str: String = uri.extract(env)?;
+    // `JMap::from_env` looks up Map interface methods via JNI and will NPE if the underlying
+    // JObject is null. The Java facade intentionally passes `null` to mean "no storage
+    // options", so convert that into Rust-side `None` before touching any JNI method lookup.
+    // Mirrors the uri null-guard above for the same "exception-pending-would-abort" reason.
+    let opts = if storage_options_obj.is_null() {
+        None
+    } else {
+        let jmap = JMap::from_env(env, &storage_options_obj)?;
+        let storage_options = to_rust_map(env, &jmap)?;
+        if storage_options.is_empty() {
+            None
+        } else {
+            Some(storage_options)
+        }
+    };
+    // Panic safety across `extern "system"`: `latest_version_at_uri` polls object-store
+    // futures (S3/GCS/Azure SDKs, rustls, reqwest) that do not promise panic-freedom. An
+    // unwinding panic crossing the FFI boundary is UB per the Rust reference and would
+    // abort the JVM rather than surface as a Java exception. Catch the unwind and convert
+    // it to an IO error so the `ok_or_throw_with_return!` macro can raise it cleanly.
+    let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        RT.block_on(latest_version_at_uri(&uri_str, opts))
+    }))
+    .map_err(|_| {
+        Error::io_error("panic while resolving latest Lance dataset version".to_string())
+    })??;
+    Ok(resolved)
 }
 
 #[unsafe(no_mangle)]

@@ -64,7 +64,7 @@ use std::num::NonZero;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
-use tracing::{info, instrument};
+use tracing::{debug, info, instrument};
 
 pub(crate) mod blob;
 mod branch_location;
@@ -2648,6 +2648,49 @@ impl Dataset {
             _ => true,
         }
     }
+}
+
+/// Resolve the latest version number for a dataset URI without opening the Dataset.
+///
+/// This is the free-function equivalent of [`Dataset::latest_version_id`] — it builds only
+/// the `object_store` + `commit_handler` (no manifest decode, no index load, no schema
+/// hydration) and returns the version number pointed to by the manifest head.
+///
+/// Intended for query-planning paths that need to pin a version early (for cache keying
+/// or snapshot isolation) but don't yet need an opened Dataset.
+///
+/// # Performance note
+///
+/// This function does **not** share its `ObjectStore` or `CommitHandler` with a subsequent
+/// [`DatasetBuilder::load`] call. Callers that resolve the version here and then open the
+/// Dataset at that pinned version will pay the object-store init cost **twice**: once for
+/// the manifest-head resolve and again when the Dataset is opened. For Spark-style planners
+/// that cache the opened Dataset by pinned version this is still a net win (the manifest-head
+/// resolve is far cheaper than a full Dataset open, and cache hits on subsequent executor
+/// opens dominate the cost), but callers that need to open the Dataset exactly once should
+/// prefer [`Dataset::latest_version_id`] on an already-opened handle.
+pub async fn latest_version_at_uri(
+    uri: &str,
+    storage_options: Option<HashMap<String, String>>,
+) -> Result<u64> {
+    let mut builder = DatasetBuilder::from_uri(uri);
+    if let Some(opts) = storage_options {
+        builder = builder.with_storage_options(opts);
+    }
+    let (object_store, base_path, commit_handler) = builder.build_object_store().await?;
+    let location = commit_handler
+        .resolve_latest_location(&base_path, &object_store)
+        .await?;
+    // Breadcrumb only. The URI is intentionally omitted because object-store URIs frequently
+    // embed credentials (s3://AKIA...:SECRET@bucket/path) or signed-URL query parameters that
+    // must not reach the log stream even at debug level. Callers that need URI context have it
+    // at the call site.
+    debug!(
+        target: TRACE_DATASET_EVENTS,
+        event = "version_resolve",
+        version = location.version,
+    );
+    Ok(location.version)
 }
 
 pub(crate) struct NewTransactionResult<'a> {

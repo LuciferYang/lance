@@ -276,6 +276,56 @@ public class DatasetTest {
   }
 
   @Test
+  void testLatestVersionIdResolvesWithoutOpen(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("latest_version_id_resolve").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+
+      // Version 1 (empty commit)
+      try (Dataset v1 = testDataset.createEmptyDataset()) {
+        assertEquals(1L, Dataset.latestVersionId(datasetPath, null));
+        assertEquals(1L, Dataset.latestVersionId(datasetPath, Collections.emptyMap()));
+        assertEquals(1L, Dataset.latestVersionId(datasetPath, new HashMap<>()));
+      }
+
+      // Version 2 (first data append)
+      try (Dataset v2 = testDataset.write(1, 5)) {
+        assertEquals(2L, Dataset.latestVersionId(datasetPath, null));
+
+        // Version 3 (second data append) — verify head advances as new commits land
+        try (Dataset v3 = testDataset.write(2, 3)) {
+          assertEquals(3L, Dataset.latestVersionId(datasetPath, null));
+          // v2 handle is still open and pinned to version 2, but the resolver must
+          // return the current head without affecting existing handles.
+          assertEquals(2L, v2.version());
+          assertEquals(3L, v3.version());
+        }
+      }
+    }
+  }
+
+  @Test
+  void testLatestVersionIdRejectsInvalidUri() {
+    assertThrows(NullPointerException.class, () -> Dataset.latestVersionId(null, null));
+    assertThrows(
+        IllegalArgumentException.class, () -> Dataset.latestVersionId("", Collections.emptyMap()));
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> Dataset.latestVersionId("   ", Collections.emptyMap()));
+  }
+
+  @Test
+  void testLatestVersionIdThrowsOnMissingDataset(@TempDir Path tempDir) {
+    String missingPath = tempDir.resolve("does_not_exist").toString();
+    // The JNI surfaces a checked IOException when the manifest head can't be resolved
+    // (object-store "not found"). Callers on the Spark driver catch this via
+    // LanceExceptions.wrap(...) — here we just confirm the resolver refuses to silently
+    // return a bogus version for a non-existent dataset.
+    assertThrows(Exception.class, () -> Dataset.latestVersionId(missingPath, null));
+  }
+
+  @Test
   void testDatasetCheckoutVersion(@TempDir Path tempDir) {
     String datasetPath = tempDir.resolve("dataset_checkout_version").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {

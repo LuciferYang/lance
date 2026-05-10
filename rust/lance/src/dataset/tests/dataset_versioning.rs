@@ -208,6 +208,55 @@ async fn test_version_id_fast_path() {
     assert_eq!(historical.latest_version_id().await.unwrap(), 2);
 }
 
+#[tokio::test]
+async fn test_latest_version_at_uri_without_open() {
+    use crate::dataset::latest_version_at_uri;
+
+    let test_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::UInt32,
+        false,
+    )]));
+
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(UInt32Array::from_iter_values(0..5))],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![data].into_iter().map(Ok), schema.clone());
+    let original = Dataset::write(reader, &test_uri, None).await.unwrap();
+    drop(original);
+
+    let resolved = latest_version_at_uri(test_uri.as_str(), None)
+        .await
+        .unwrap();
+    assert_eq!(resolved, 1);
+
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(UInt32Array::from_iter_values(5..10))],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![data].into_iter().map(Ok), schema);
+    let updated = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    drop(updated);
+
+    let resolved = latest_version_at_uri(test_uri.as_str(), None)
+        .await
+        .unwrap();
+    assert_eq!(resolved, 2);
+}
+
 #[rstest]
 #[tokio::test]
 async fn test_restore(
