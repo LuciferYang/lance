@@ -3451,27 +3451,55 @@ fn inner_get_zonemap_stats<'local>(
                             .unwrap_or_default()
                     });
 
-                    let mut batches = Vec::with_capacity(indices.len());
-                    for index in &indices {
-                        let index_store = Arc::new(
-                            LanceIndexStore::from_dataset_for_existing(&dataset, index)
+                    // Open and read segments concurrently. Multi-segment zonemap (one
+                    // IndexMetadata per fragment under a shared name) means N segments
+                    // for an N-fragment table; sequentially serialising N round-trips
+                    // dominates plan-time latency on cold object storage. `buffered`
+                    // preserves the fragment-id order established by the sort above
+                    // while limiting in-flight requests to a fixed window.
+                    use futures::stream::{self, StreamExt, TryStreamExt};
+                    use lance_index::scalar::zonemap::ZONEMAP_FILENAME;
+                    // Concurrency window for the per-segment open+read stream — defer to the
+                    // object store's own io_parallelism, matching the BTree scalar-index reader's
+                    // precedent (`.buffered(self.store.io_parallelism())`). Local stores default
+                    // to a small value; cloud stores default to ~64 with environment overrides.
+                    // Operators who run plan-time stats from a memory-constrained Spark driver can
+                    // dial this down via lance-io's storage options instead of a hardcoded cap
+                    // here. Sequential segment reads were the original bottleneck and any
+                    // io_parallelism >= 4 captures most of the gain measured in
+                    // ZonemapStatsTest.perfMeasureZonemapStatsShapes.
+                    let max_concurrent_segment_reads = dataset
+                        .object_store(None)
+                        .await
+                        .map_err(Error::from)?
+                        .io_parallelism();
+                    let dataset_ref = &dataset;
+                    let batches: Vec<arrow_array::RecordBatch> = stream::iter(indices.iter())
+                        .map(|index| async move {
+                            let index_store = Arc::new(
+                                LanceIndexStore::from_dataset_for_existing(dataset_ref, index)
+                                    .await
+                                    .map_err(Error::from)?,
+                            );
+                            let index_file = index_store
+                                .open_index_file(ZONEMAP_FILENAME)
                                 .await
-                                .map_err(Error::from)?,
-                        );
-                        let index_file = index_store
-                            .open_index_file("zonemap.lance")
-                            .await
-                            .map_err(Error::from)?;
-                        if index_file.num_rows() == 0 {
-                            continue;
-                        }
-                        batches.push(
-                            index_file
-                                .read_range(0..index_file.num_rows(), None)
-                                .await
-                                .map_err(Error::from)?,
-                        );
-                    }
+                                .map_err(Error::from)?;
+                            if index_file.num_rows() == 0 {
+                                Ok::<Option<arrow_array::RecordBatch>, Error>(None)
+                            } else {
+                                Ok(Some(
+                                    index_file
+                                        .read_range(0..index_file.num_rows(), None)
+                                        .await
+                                        .map_err(Error::from)?,
+                                ))
+                            }
+                        })
+                        .buffered(max_concurrent_segment_reads)
+                        .try_filter_map(|opt| std::future::ready(Ok(opt)))
+                        .try_collect()
+                        .await?;
                     Ok::<_, Error>(batches)
                 }
                 None => Ok(Vec::new()),
