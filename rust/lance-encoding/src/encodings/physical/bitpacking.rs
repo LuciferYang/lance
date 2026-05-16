@@ -169,6 +169,7 @@ impl InlineBitpacking {
             16 => Self::bitpack_chunked::<u16>(data),
             32 => Self::bitpack_chunked::<u32>(data),
             64 => Self::bitpack_chunked::<u64>(data),
+            128 => Self::bitpack_chunked::<u128>(data),
             _ => unreachable!(),
         };
         (
@@ -196,7 +197,11 @@ impl InlineBitpacking {
         // Copy for memory alignment
         let chunk_in_u8: Vec<u8> = data.to_vec();
         let bit_width_bytes = &chunk_in_u8[..std::mem::size_of::<T>()];
-        let bit_width_value = LittleEndian::read_uint(bit_width_bytes, std::mem::size_of::<T>());
+        let bit_width_value = if std::mem::size_of::<T>() <= 8 {
+            LittleEndian::read_uint(bit_width_bytes, std::mem::size_of::<T>())
+        } else {
+            LittleEndian::read_u128(bit_width_bytes) as u64
+        };
         let chunk = cast_slice(&chunk_in_u8[std::mem::size_of::<T>()..]);
         // The bit-packed chunk should have number of bytes (bit_width_value * ELEMS_PER_CHUNK / 8)
         assert!(std::mem::size_of_val(chunk) == (bit_width_value * ELEMS_PER_CHUNK) as usize / 8);
@@ -246,7 +251,8 @@ impl MiniBlockDecompressor for InlineBitpacking {
             16 => Self::unchunk::<u16>(data, num_values),
             32 => Self::unchunk::<u32>(data, num_values),
             64 => Self::unchunk::<u64>(data, num_values),
-            _ => unimplemented!("Bitpacking word size must be 8, 16, 32, or 64"),
+            128 => Self::unchunk::<u128>(data, num_values),
+            _ => unimplemented!("Bitpacking word size must be 8, 16, 32, 64, or 128"),
         }
     }
 }
@@ -258,7 +264,8 @@ impl BlockDecompressor for InlineBitpacking {
             16 => Self::unchunk::<u16>(data, num_values),
             32 => Self::unchunk::<u32>(data, num_values),
             64 => Self::unchunk::<u64>(data, num_values),
-            _ => unimplemented!("Bitpacking word size must be 8, 16, 32, or 64"),
+            128 => Self::unchunk::<u128>(data, num_values),
+            _ => unimplemented!("Bitpacking word size must be 8, 16, 32, 64, or 128"),
         }
     }
 }
@@ -471,7 +478,8 @@ impl BlockCompressor for OutOfLineBitpacking {
             16 => bitpack_out_of_line::<u16>(fixed_width, self.compressed_bit_width as usize),
             32 => bitpack_out_of_line::<u32>(fixed_width, self.compressed_bit_width as usize),
             64 => bitpack_out_of_line::<u64>(fixed_width, self.compressed_bit_width as usize),
-            _ => panic!("Bitpacking word size must be 8,16,32,64"),
+            128 => bitpack_out_of_line::<u128>(fixed_width, self.compressed_bit_width as usize),
+            _ => panic!("Bitpacking word size must be 8,16,32,64,128"),
         };
         Ok(compressed)
     }
@@ -484,7 +492,8 @@ impl BlockDecompressor for OutOfLineBitpacking {
             16 => std::mem::size_of::<u16>(),
             32 => std::mem::size_of::<u32>(),
             64 => std::mem::size_of::<u64>(),
-            _ => panic!("Bitpacking word size must be 8,16,32,64"),
+            128 => std::mem::size_of::<u128>(),
+            _ => panic!("Bitpacking word size must be 8,16,32,64,128"),
         };
         debug_assert_eq!(data.len() % word_size, 0);
         let total_words = (data.len() / word_size) as u64;
@@ -512,6 +521,11 @@ impl BlockDecompressor for OutOfLineBitpacking {
                 self.compressed_bit_width as usize,
             ),
             64 => unpack_out_of_line::<u64>(
+                block,
+                num_values as usize,
+                self.compressed_bit_width as usize,
+            ),
+            128 => unpack_out_of_line::<u128>(
                 block,
                 num_values as usize,
                 self.compressed_bit_width as usize,

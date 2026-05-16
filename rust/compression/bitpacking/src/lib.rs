@@ -28,6 +28,7 @@ impl FastLanes for u8 {}
 impl FastLanes for u16 {}
 impl FastLanes for u32 {}
 impl FastLanes for u64 {}
+impl FastLanes for u128 {}
 
 macro_rules! pack {
     ($T:ty, $W:expr, $packed:expr, $lane:expr, | $_1:tt $idx:ident | $($body:tt)*) => {
@@ -173,6 +174,7 @@ macro_rules! seq_t {
     ($ident:ident in u16 $body:tt) => {seq_macro::seq!($ident in 0..16 $body)};
     ($ident:ident in u32 $body:tt) => {seq_macro::seq!($ident in 0..32 $body)};
     ($ident:ident in u64 $body:tt) => {seq_macro::seq!($ident in 0..64 $body)};
+    ($ident:ident in u128 $body:tt) => {seq_macro::seq!($ident in 0..128 $body)};
 }
 
 /// `BitPack` into a compile-time known bit-width.
@@ -1705,6 +1707,68 @@ pack_64!(pack_64_61, 61);
 pack_64!(pack_64_62, 62);
 pack_64!(pack_64_63, 63);
 pack_64!(pack_64_64, 64);
+
+// u128 bitpacking: scalar implementation (no per-width generated functions).
+// Uses a simple bit-stream approach that packs 1024 u128 values at a given width.
+impl BitPacking for u128 {
+    unsafe fn unchecked_pack(width: usize, input: &[Self], output: &mut [Self]) {
+        let packed_len = 128 * width / size_of::<Self>();
+        debug_assert_eq!(output.len(), packed_len);
+        debug_assert_eq!(input.len(), 1024);
+        debug_assert!(width <= Self::T);
+
+        if width == 0 {
+            return;
+        }
+        if width == 128 {
+            output.copy_from_slice(input);
+            return;
+        }
+
+        let mask: u128 = if width == 128 { u128::MAX } else { (1u128 << width) - 1 };
+        output.fill(0);
+        let mut bit_offset: usize = 0;
+        for &val in input.iter() {
+            let val = val & mask;
+            let word_idx = bit_offset / 128;
+            let bit_idx = bit_offset % 128;
+            output[word_idx] |= val << bit_idx;
+            if bit_idx + width > 128 {
+                output[word_idx + 1] |= val >> (128 - bit_idx);
+            }
+            bit_offset += width;
+        }
+    }
+
+    unsafe fn unchecked_unpack(width: usize, input: &[Self], output: &mut [Self]) {
+        let packed_len = 128 * width / size_of::<Self>();
+        debug_assert_eq!(input.len(), packed_len);
+        debug_assert_eq!(output.len(), 1024);
+        debug_assert!(width <= Self::T);
+
+        if width == 0 {
+            output.fill(0);
+            return;
+        }
+        if width == 128 {
+            output.copy_from_slice(input);
+            return;
+        }
+
+        let mask: u128 = (1u128 << width) - 1;
+        let mut bit_offset: usize = 0;
+        for out in output.iter_mut() {
+            let word_idx = bit_offset / 128;
+            let bit_idx = bit_offset % 128;
+            let mut val = input[word_idx] >> bit_idx;
+            if bit_idx + width > 128 {
+                val |= input[word_idx + 1] << (128 - bit_idx);
+            }
+            *out = val & mask;
+            bit_offset += width;
+        }
+    }
+}
 
 #[cfg(test)]
 mod test {
