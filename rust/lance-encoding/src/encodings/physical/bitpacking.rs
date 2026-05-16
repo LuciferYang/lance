@@ -189,15 +189,21 @@ impl InlineBitpacking {
         assert!(data.len() >= std::mem::size_of::<T>());
         assert!(num_values <= ELEMS_PER_CHUNK);
 
-        // This macro decompresses a chunk(1024 values) of bitpacked values.
         let uncompressed_bit_width = std::mem::size_of::<T>() * 8;
-        let mut decompressed = vec![T::from_usize(0).unwrap(); ELEMS_PER_CHUNK as usize];
 
-        // Copy for memory alignment
-        let chunk_in_u8: Vec<u8> = data.to_vec();
-        let bit_width_bytes = &chunk_in_u8[..std::mem::size_of::<T>()];
-        let bit_width_value = LittleEndian::read_uint(bit_width_bytes, std::mem::size_of::<T>());
-        let chunk = cast_slice(&chunk_in_u8[std::mem::size_of::<T>()..]);
+        // Allocate output without zeroing — unchecked_unpack writes all 1024 positions
+        let mut decompressed: Vec<T> = Vec::with_capacity(ELEMS_PER_CHUNK as usize);
+        unsafe { decompressed.set_len(ELEMS_PER_CHUNK as usize) };
+
+        // LanceBuffer (Arrow Buffer) is 64-byte aligned, safe to cast directly
+        let data_bytes: &[u8] = &data;
+        let bit_width_bytes = &data_bytes[..std::mem::size_of::<T>()];
+        let bit_width_value = if std::mem::size_of::<T>() <= 8 {
+            LittleEndian::read_uint(bit_width_bytes, std::mem::size_of::<T>())
+        } else {
+            LittleEndian::read_u128(bit_width_bytes) as u64
+        };
+        let chunk = cast_slice(&data_bytes[std::mem::size_of::<T>()..]);
         // The bit-packed chunk should have number of bytes (bit_width_value * ELEMS_PER_CHUNK / 8)
         assert!(std::mem::size_of_val(chunk) == (bit_width_value * ELEMS_PER_CHUNK) as usize / 8);
         unsafe {
