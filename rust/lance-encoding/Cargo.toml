@@ -30,6 +30,7 @@ itertools.workspace = true
 log.workspace = true
 num-traits.workspace = true
 prost.workspace = true
+rayon.workspace = true
 hyperloglogplus.workspace = true
 rand.workspace = true
 strum = { workspace =true, features = ["derive"] }

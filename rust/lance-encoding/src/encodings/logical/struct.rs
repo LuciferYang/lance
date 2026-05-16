@@ -33,6 +33,7 @@ use lance_arrow::FieldExt;
 use lance_arrow::{deepcopy::deep_copy_nulls, r#struct::StructArrayExt};
 use lance_core::{Error, Result};
 use log::trace;
+use rayon::prelude::*;
 
 #[derive(Debug)]
 struct StructuralSchedulingJobWithStatus<'a> {
@@ -364,7 +365,7 @@ impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
 
         let arrays = self
             .children
-            .into_iter()
+            .into_par_iter()
             .map(|task| task.decode())
             .collect::<Result<Vec<_>>>()?;
         let mut children = Vec::with_capacity(arrays.len());
