@@ -4971,7 +4971,7 @@ impl PrimitiveStructuralEncoder {
                 if fixed.bits_per_value == 64 && version < LanceFileVersion::V2_2 {
                     return None;
                 }
-                if fixed.bits_per_value != 64 && fixed.bits_per_value != 128 {
+                if fixed.bits_per_value != 32 && fixed.bits_per_value != 64 && fixed.bits_per_value != 128 {
                     return None;
                 }
                 if fixed.bits_per_value % 8 != 0 {
