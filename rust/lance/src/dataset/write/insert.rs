@@ -193,7 +193,10 @@ impl<'a> InsertBuilder<'a> {
         let target_base_info =
             validate_and_resolve_target_bases(&mut context.params, existing_base_paths).await?;
 
-        let (written_fragments, _) = write_fragments_internal(
+        // Genuine insert/append path: materialise write-time defaults for omitted columns.
+        context.params.inject_write_defaults = true;
+
+        let (written_fragments, written_schema) = write_fragments_internal(
             context.dest.dataset(),
             context.object_store.clone(),
             &context.base_path,
@@ -204,7 +207,22 @@ impl<'a> InsertBuilder<'a> {
         )
         .await?;
 
-        let transaction = Self::build_transaction(schema, written_fragments, &context)?;
+        // For Overwrite, the committed manifest schema must include any columns that were
+        // injected as write-defaults: they were omitted from the batch but physically
+        // materialised into the data files by `augment_with_write_defaults`.
+        // `write_fragments_internal` returns the augmented schema — use it so the manifest
+        // correctly declares those columns (preventing the "silent vanish" hazard).
+        //
+        // For Create the schema comes from the batch and no augmentation was applied (there is no
+        // existing dataset to read defaults from), so the original `schema` is still correct.
+        // For Append the committed schema is the prior manifest schema (constructed inside
+        // `build_transaction` from the existing dataset), so `written_schema` is not used there.
+        let commit_schema = match context.params.mode {
+            WriteMode::Overwrite => written_schema,
+            WriteMode::Create | WriteMode::Append => schema,
+        };
+
+        let transaction = Self::build_transaction(commit_schema, written_fragments, &context)?;
 
         Ok((transaction, context))
     }
@@ -307,7 +325,34 @@ impl<'a> InsertBuilder<'a> {
                     ..Default::default()
                 };
 
-                data_schema.check_compatible(dataset.schema(), &schema_cmp_opts)?;
+                // A column carrying a default may be omitted from the incoming batch even when it
+                // is non-nullable.  Two cases:
+                //   * write-default: `augment_with_write_defaults` materialises it before the data
+                //     is written.
+                //   * initial-default only (Model A): the column is left structurally absent and the
+                //     read path (`DefaultReader`) backfills the live initial-default.
+                // `allow_missing_if_nullable` only tolerates missing *nullable* fields, so exclude
+                // such omitted defaulted columns from the expected schema for this pre-write check to
+                // avoid a spurious SchemaMismatch. The post-augmentation `check_compatible` in
+                // `write_fragments_internal` still validates the remaining schema.
+                let incoming_names: std::collections::HashSet<&str> =
+                    data_schema.fields.iter().map(|f| f.name.as_str()).collect();
+                let expected_schema = Schema {
+                    fields: dataset
+                        .schema()
+                        .fields
+                        .iter()
+                        .filter(|f| {
+                            incoming_names.contains(f.name.as_str())
+                                || (f.write_default_raw().is_none()
+                                    && f.initial_default_raw().is_none())
+                        })
+                        .cloned()
+                        .collect(),
+                    metadata: dataset.schema().metadata.clone(),
+                };
+
+                data_schema.check_compatible(&expected_schema, &schema_cmp_opts)?;
             }
         }
 
@@ -610,5 +655,698 @@ mod test {
                 Ok(_) => panic!("Expected error"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod write_default_tests {
+    use std::sync::Arc;
+
+    use arrow_array::{cast::AsArray, Array, Int32Array, RecordBatch, RecordBatchIterator};
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use lance_core::datatypes::{LANCE_INITIAL_DEFAULT_META_KEY, LANCE_WRITE_DEFAULT_META_KEY};
+    use lance_file::version::LanceFileVersion;
+
+    use crate::dataset::write::insert::InsertBuilder;
+    use crate::dataset::{Dataset, WriteMode, WriteParams};
+
+    async fn make_dataset_with_write_default() -> Dataset {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("c", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1_i32, 2])),
+                Arc::new(Int32Array::from(vec![10_i32, 20])),
+            ],
+        )
+        .unwrap();
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://write_default_mat",
+            None,
+        )
+        .await
+        .unwrap();
+
+        ds.update_field_metadata()
+            .update(
+                "c",
+                [
+                    (LANCE_INITIAL_DEFAULT_META_KEY, Some("1")),
+                    (LANCE_WRITE_DEFAULT_META_KEY, Some("2")),
+                ],
+            )
+            .unwrap()
+            .await
+            .unwrap();
+
+        ds
+    }
+
+    #[tokio::test]
+    async fn test_write_default_materialized_on_append() {
+        let ds = make_dataset_with_write_default().await;
+        let ds = Arc::new(ds);
+
+        let append_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            DataType::Int32,
+            false,
+        )]));
+        let append_batch = RecordBatch::try_new(
+            append_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![3_i32, 4]))],
+        )
+        .unwrap();
+
+        let ds = InsertBuilder::new(ds)
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            })
+            .execute_stream(RecordBatchIterator::new(
+                vec![Ok(append_batch)],
+                append_schema,
+            ))
+            .await
+            .unwrap();
+
+        let batches = ds
+            .scan()
+            .project(&["a", "c"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let c_col = batches.column_by_name("c").unwrap();
+        let c_vals = c_col.as_primitive::<arrow_array::types::Int32Type>();
+
+        assert_eq!(c_vals.len(), 4);
+        // Rows 0,1 — original values
+        assert_eq!(c_vals.value(0), 10);
+        assert_eq!(c_vals.value(1), 20);
+        // Rows 2,3 — write-default materialized (== 2, physically present, NOT NULL)
+        assert!(
+            !c_vals.is_null(2),
+            "row 2 c should be non-null (materialized)"
+        );
+        assert_eq!(c_vals.value(2), 2);
+        assert!(
+            !c_vals.is_null(3),
+            "row 3 c should be non-null (materialized)"
+        );
+        assert_eq!(c_vals.value(3), 2);
+    }
+
+    #[tokio::test]
+    async fn test_write_default_materialized_on_append_non_nullable() {
+        // A NON-NULLABLE column carrying a write-default that is omitted from the append batch
+        // must be materialised, not rejected by the pre-write schema-compatibility check.
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("c", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1_i32, 2])),
+                Arc::new(Int32Array::from(vec![10_i32, 20])),
+            ],
+        )
+        .unwrap();
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://write_default_mat_non_nullable",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        ds.update_field_metadata()
+            .update("c", [(LANCE_WRITE_DEFAULT_META_KEY, Some("2"))])
+            .unwrap()
+            .await
+            .unwrap();
+
+        let ds = Arc::new(ds);
+
+        // Append omitting the non-nullable write-default column `c`.
+        let append_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            DataType::Int32,
+            false,
+        )]));
+        let append_batch = RecordBatch::try_new(
+            append_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![3_i32, 4]))],
+        )
+        .unwrap();
+
+        let ds = InsertBuilder::new(ds)
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            })
+            .execute_stream(RecordBatchIterator::new(
+                vec![Ok(append_batch)],
+                append_schema,
+            ))
+            .await
+            .expect("append omitting a non-nullable write-default column must succeed");
+
+        let batches = ds
+            .scan()
+            .project(&["a", "c"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let c_col = batches.column_by_name("c").unwrap();
+        let c_vals = c_col.as_primitive::<arrow_array::types::Int32Type>();
+
+        assert_eq!(c_vals.len(), 4);
+        assert_eq!(c_vals.value(0), 10);
+        assert_eq!(c_vals.value(1), 20);
+        // Rows 2,3 — write-default materialized (== 2, physically present, NOT NULL)
+        assert!(
+            !c_vals.is_null(2),
+            "row 2 c should be non-null (materialized)"
+        );
+        assert_eq!(c_vals.value(2), 2);
+        assert!(
+            !c_vals.is_null(3),
+            "row 3 c should be non-null (materialized)"
+        );
+        assert_eq!(c_vals.value(3), 2);
+    }
+
+    #[tokio::test]
+    async fn test_no_write_default_left_absent() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("c", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1_i32])),
+                Arc::new(Int32Array::from(vec![99_i32])),
+            ],
+        )
+        .unwrap();
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://write_default_absent",
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Only initial-default, no write-default
+        ds.update_field_metadata()
+            .update("c", [(LANCE_INITIAL_DEFAULT_META_KEY, Some("1"))])
+            .unwrap()
+            .await
+            .unwrap();
+
+        let ds = Arc::new(ds);
+        let append_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            DataType::Int32,
+            false,
+        )]));
+        let append_batch = RecordBatch::try_new(
+            append_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![2_i32]))],
+        )
+        .unwrap();
+
+        let ds = InsertBuilder::new(ds)
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            })
+            .execute_stream(RecordBatchIterator::new(
+                vec![Ok(append_batch)],
+                append_schema,
+            ))
+            .await
+            .unwrap();
+
+        let batches = ds
+            .scan()
+            .project(&["a", "c"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let c_col = batches.column_by_name("c").unwrap();
+        let c_vals = c_col.as_primitive::<arrow_array::types::Int32Type>();
+
+        assert_eq!(c_vals.len(), 2);
+        assert_eq!(c_vals.value(0), 99);
+        // Row 1: absent fragment — read-backfill applies initial-default = 1
+        assert_eq!(c_vals.value(1), 1);
+    }
+
+    /// Regression: a NON-nullable column carrying only an initial-default (no write-default)
+    /// may be omitted from an Append.  The column is left structurally absent and the read path
+    /// backfills the initial-default.  Previously this was rejected with a SchemaMismatch
+    /// because the omitted non-nullable field was kept in the expected schema and
+    /// `allow_missing_if_nullable` only tolerates nullable fields.
+    #[tokio::test]
+    async fn test_append_omitting_non_nullable_initial_default_column() {
+        use crate::dataset::schema_evolution::NewColumnTransform;
+
+        // Dataset with a single column `a`.
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1_i32, 2, 3]))],
+        )
+        .unwrap();
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://append_omit_non_nullable_default",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Add a NON-nullable column `c` with only an initial-default (Model A).
+        let c_field = ArrowField::new("c", DataType::Int32, false).with_metadata(
+            std::collections::HashMap::from([(
+                LANCE_INITIAL_DEFAULT_META_KEY.to_string(),
+                "42".to_string(),
+            )]),
+        );
+        ds.add_columns(
+            NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![c_field]))),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Append a batch that omits `c` entirely — must succeed (not SchemaMismatch).
+        let ds = Arc::new(ds);
+        let append_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            DataType::Int32,
+            false,
+        )]));
+        let append_batch = RecordBatch::try_new(
+            append_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![4_i32, 5]))],
+        )
+        .unwrap();
+
+        let ds = InsertBuilder::new(ds)
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            })
+            .execute_stream(RecordBatchIterator::new(
+                vec![Ok(append_batch)],
+                append_schema,
+            ))
+            .await
+            .expect("append omitting a non-nullable initial-default column must succeed");
+
+        // All rows (original absent + newly appended absent) read the initial-default 42.
+        let batches = ds
+            .scan()
+            .project(&["a", "c"])
+            .unwrap()
+            .scan_in_order(true)
+            .try_into_batch()
+            .await
+            .unwrap();
+        let c_vals = batches
+            .column_by_name("c")
+            .unwrap()
+            .as_primitive::<arrow_array::types::Int32Type>();
+        assert_eq!(c_vals.len(), 5);
+        assert_eq!(
+            c_vals.null_count(),
+            0,
+            "non-null backfill must produce no nulls"
+        );
+        assert!((0..5).all(|i| c_vals.value(i) == 42));
+    }
+
+    #[tokio::test]
+    async fn test_explicit_null_preserved() {
+        let ds = make_dataset_with_write_default().await;
+        let ds = Arc::new(ds);
+
+        // Append a batch that provides c=NULL explicitly
+        let append_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("c", DataType::Int32, true),
+        ]));
+        let c_null: Option<i32> = None;
+        let append_batch = RecordBatch::try_new(
+            append_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![5_i32])),
+                Arc::new(Int32Array::from(vec![c_null])),
+            ],
+        )
+        .unwrap();
+
+        let ds = InsertBuilder::new(ds)
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            })
+            .execute_stream(RecordBatchIterator::new(
+                vec![Ok(append_batch)],
+                append_schema,
+            ))
+            .await
+            .unwrap();
+
+        let batches = ds
+            .scan()
+            .project(&["a", "c"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let c_col = batches.column_by_name("c").unwrap();
+        let c_vals = c_col.as_primitive::<arrow_array::types::Int32Type>();
+
+        // Row 2 (index 2): explicitly written NULL must survive
+        assert!(
+            c_vals.is_null(2),
+            "explicitly written NULL must be preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_callers_dont_inject() {
+        // WriteParams::default() must have inject_write_defaults = false
+        let params = WriteParams::default();
+        assert!(
+            !params.inject_write_defaults,
+            "inject_write_defaults must default to false"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Model B Overwrite tests (committed-schema correctness)
+    // -----------------------------------------------------------------------
+
+    /// Overwrite an existing Model-B dataset omitting a write-default column `c`.
+    ///
+    /// After the overwrite:
+    /// * The **committed manifest schema** must still declare `c` (with its write-default
+    ///   metadata) — this is the key correctness invariant; a test that only checks data
+    ///   values would miss the committed-schema bug.
+    /// * Rows in the new version must carry the materialised write-default value for `c`.
+    #[tokio::test]
+    async fn test_overwrite_write_default_committed_schema_retains_column() {
+        // Create an initial dataset with columns `a` and `c`, then add write-defaults.
+        let ds = make_dataset_with_write_default().await;
+        let ds = Arc::new(ds);
+
+        // Overwrite using a batch that includes only `a` — `c` is absent.
+        let overwrite_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            DataType::Int32,
+            false,
+        )]));
+        let overwrite_batch = RecordBatch::try_new(
+            overwrite_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![10_i32, 20]))],
+        )
+        .unwrap();
+
+        let ds_after = InsertBuilder::new(ds)
+            .with_params(&WriteParams {
+                mode: WriteMode::Overwrite,
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            })
+            .execute_stream(RecordBatchIterator::new(
+                vec![Ok(overwrite_batch)],
+                overwrite_schema,
+            ))
+            .await
+            .unwrap();
+
+        // --- Committed schema assertion ---
+        // The manifest schema must still include `c` with its write-default metadata.
+        let committed_schema = ds_after.schema();
+        let c_field = committed_schema.field("c").unwrap_or_else(|| {
+            panic!("committed manifest schema must retain column 'c' after overwrite")
+        });
+        assert!(
+            c_field.write_default_raw().is_some(),
+            "committed field 'c' must preserve write-default metadata; got: {:?}",
+            c_field.metadata
+        );
+
+        // --- Data assertion ---
+        // Both rows must carry the materialised write-default value (== 2).
+        let batches = ds_after
+            .scan()
+            .project(&["a", "c"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let c_col = batches.column_by_name("c").unwrap();
+        let c_vals = c_col.as_primitive::<arrow_array::types::Int32Type>();
+        assert_eq!(c_vals.len(), 2, "expected 2 rows after overwrite");
+        assert!(
+            !c_vals.is_null(0),
+            "row 0 c must be non-null (materialised)"
+        );
+        assert_eq!(c_vals.value(0), 2, "row 0 c must equal the write-default");
+        assert!(
+            !c_vals.is_null(1),
+            "row 1 c must be non-null (materialised)"
+        );
+        assert_eq!(c_vals.value(1), 2, "row 1 c must equal the write-default");
+    }
+
+    /// Regression: a plain Append after the fix still commits the prior manifest schema
+    /// (not the augmented written schema), preserving all metadata and field ids.
+    #[tokio::test]
+    async fn test_append_after_overwrite_fix_regression() {
+        let ds = make_dataset_with_write_default().await;
+        let prior_schema = ds.schema().clone();
+        let ds = Arc::new(ds);
+
+        let append_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            DataType::Int32,
+            false,
+        )]));
+        let append_batch = RecordBatch::try_new(
+            append_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![5_i32]))],
+        )
+        .unwrap();
+
+        let ds_after = InsertBuilder::new(ds)
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            })
+            .execute_stream(RecordBatchIterator::new(
+                vec![Ok(append_batch)],
+                append_schema,
+            ))
+            .await
+            .unwrap();
+
+        // Committed schema after Append must equal the prior manifest schema.
+        let committed_schema = ds_after.schema();
+        assert_eq!(
+            committed_schema.fields.len(),
+            prior_schema.fields.len(),
+            "Append must not alter the number of committed schema fields"
+        );
+        for (before, after) in prior_schema
+            .fields
+            .iter()
+            .zip(committed_schema.fields.iter())
+        {
+            assert_eq!(
+                before.name, after.name,
+                "Append must preserve field names in the committed schema"
+            );
+            assert_eq!(
+                before.metadata, after.metadata,
+                "Append must preserve field metadata (incl. write-default) in the committed schema"
+            );
+        }
+    }
+
+    /// A normal Overwrite that supplies all columns (no omission) must remain unaffected:
+    /// the committed schema must include all columns that were written.
+    #[tokio::test]
+    async fn test_overwrite_all_columns_no_regression() {
+        let ds = make_dataset_with_write_default().await;
+        let ds = Arc::new(ds);
+
+        // Overwrite providing both `a` and `c` — no column is omitted.
+        let overwrite_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("c", DataType::Int32, true),
+        ]));
+        let overwrite_batch = RecordBatch::try_new(
+            overwrite_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![7_i32])),
+                Arc::new(Int32Array::from(vec![99_i32])),
+            ],
+        )
+        .unwrap();
+
+        let ds_after = InsertBuilder::new(ds)
+            .with_params(&WriteParams {
+                mode: WriteMode::Overwrite,
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            })
+            .execute_stream(RecordBatchIterator::new(
+                vec![Ok(overwrite_batch)],
+                overwrite_schema,
+            ))
+            .await
+            .unwrap();
+
+        let committed_schema = ds_after.schema();
+        assert!(
+            committed_schema.field("a").is_some(),
+            "column 'a' must be in committed schema after full overwrite"
+        );
+        assert!(
+            committed_schema.field("c").is_some(),
+            "column 'c' must be in committed schema after full overwrite"
+        );
+
+        let batches = ds_after
+            .scan()
+            .project(&["a", "c"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let c_col = batches.column_by_name("c").unwrap();
+        let c_vals = c_col.as_primitive::<arrow_array::types::Int32Type>();
+        assert_eq!(
+            c_vals.value(0),
+            99,
+            "explicitly written value must be preserved"
+        );
+    }
+
+    /// Regression for the duplicate-field-id corruption on Overwrite: when the
+    /// overwrite batch omits a write-default column AND introduces a brand-new
+    /// column, the new column receives a fresh id that previously collided with
+    /// the injected write-default field's stale id (cloned from the prior dataset
+    /// schema).  The collision was not caught at commit, but the resulting
+    /// dataset was unreadable ("Duplicate field name"/"Duplicate field id").
+    /// The injected column must get a fresh, non-colliding id and the dataset
+    /// must be scannable.
+    #[tokio::test]
+    async fn test_overwrite_write_default_new_column_no_duplicate_field_id() {
+        // Initial dataset: a(id=0), c(id=1, write-default=2, initial-default=1).
+        let ds = make_dataset_with_write_default().await;
+        let ds = Arc::new(ds);
+
+        // Overwrite with a batch [a, b] that omits `c` and adds a new column `b`.
+        // The incoming `a`/`b` get fresh ids 0/1; injected `c` must NOT keep id 1.
+        let overwrite_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Int32, true),
+        ]));
+        let overwrite_batch = RecordBatch::try_new(
+            overwrite_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![10_i32, 20])),
+                Arc::new(Int32Array::from(vec![100_i32, 200])),
+            ],
+        )
+        .unwrap();
+
+        let ds_after = InsertBuilder::new(ds)
+            .with_params(&WriteParams {
+                mode: WriteMode::Overwrite,
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            })
+            .execute_stream(RecordBatchIterator::new(
+                vec![Ok(overwrite_batch)],
+                overwrite_schema,
+            ))
+            .await
+            .unwrap();
+
+        // Committed schema must have unique field ids (validate would have caught
+        // a duplicate at commit time after the fix).
+        ds_after
+            .schema()
+            .validate()
+            .expect("committed schema must have unique field ids/names");
+
+        // `c` must be retained with its write-default preserved.
+        let committed_schema = ds_after.schema();
+        let c_field = committed_schema
+            .field("c")
+            .expect("committed schema must retain column 'c'");
+        assert!(
+            c_field.write_default_raw().is_some(),
+            "committed field 'c' must preserve write-default metadata"
+        );
+
+        // The dataset must be readable: prior to the fix this scan failed with a
+        // duplicate-field error.
+        let batches = ds_after
+            .scan()
+            .project(&["a", "b", "c"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .expect("scan of overwritten dataset must succeed");
+
+        assert_eq!(batches.num_rows(), 2);
+        let c_col = batches.column_by_name("c").unwrap();
+        let c_vals = c_col.as_primitive::<arrow_array::types::Int32Type>();
+        assert!(
+            !c_vals.is_null(0),
+            "row 0 c must be materialised (non-null)"
+        );
+        assert_eq!(c_vals.value(0), 2, "row 0 c must equal the write-default");
+        assert_eq!(c_vals.value(1), 2, "row 1 c must equal the write-default");
     }
 }

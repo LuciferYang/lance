@@ -58,6 +58,7 @@ from .lance import (
     ScanStatistics,
     _Dataset,
     _MergeInsertBuilder,
+    _encode_default_value,
     _Scanner,
     _write_dataset,
     indices,
@@ -1842,6 +1843,8 @@ class LanceDataset(pa.dataset.Dataset):
         read_columns: List[str] | None = None,
         reader_schema: Optional[pa.Schema] = None,
         batch_size: Optional[int] = None,
+        *,
+        default: Any = None,
     ):
         """
         Add new columns with defined values.
@@ -1881,6 +1884,24 @@ class LanceDataset(pa.dataset.Dataset):
         batch_size: int, optional
             The number of rows to read at a time from the source dataset when applying
             the transform.  This is ignored if the dataset is a v1 dataset.
+        default : any, keyword-only, optional
+            An initial default value for the new column(s).  Only valid when
+            *transforms* is a :class:`pyarrow.Field` or a list of
+            :class:`pyarrow.Field` (the metadata-only / AllNulls route).
+
+            When provided, Lance stores the value as ``lance-schema:initial-default``
+            field metadata so that any read of a row written *before* this column
+            was added returns the default rather than ``null``.
+
+            The value is encoded with the canonical JSON single-value codec (the
+            same one used by :func:`lance_core::datatypes::encode_default`).  A
+            :class:`ValueError` is raised if the type is unsupported (nested,
+            dictionary, run-end-encoded) or the value overflows the field's type.
+
+            .. note::
+               ``default=`` is **not** accepted when *transforms* is a dict,
+               :class:`BatchUDF`, or reader — those paths materialise every row
+               explicitly, so an initial-default has no meaning.
 
         Examples
         --------
@@ -1905,10 +1926,21 @@ class LanceDataset(pa.dataset.Dataset):
         1  2         4         6
         2  3         6         9
 
+        Add a column whose pre-existing rows default to ``7``:
+
+        >>> dataset.add_columns(pa.field("score", pa.int32()), default=7)
+        >>> dataset.to_table().to_pandas()
+           a  double_a  triple_a  score
+        0  1         2         3      7
+        1  2         4         6      7
+        2  3         6         9      7
+
         See Also
         --------
         LanceDataset.merge :
             Merge a pre-computed set of columns into the dataset.
+        LanceDataset.add_column_with_default :
+            Convenience wrapper that always uses the metadata-only path.
         """
         if isinstance(transforms, pa.Field):
             transforms = [transforms]
@@ -1920,8 +1952,20 @@ class LanceDataset(pa.dataset.Dataset):
             transforms = pa.schema(transforms)
 
         if isinstance(transforms, pa.Schema):
+            if default is not None:
+                transforms = _attach_default_to_schema(transforms, default)
             self._ds.add_columns_with_schema(transforms)
             return
+
+        # Beyond this point we are on the data-rewrite / merge route —
+        # default= is meaningless and would silently be ignored, so reject it.
+        if default is not None:
+            raise ValueError(
+                "default= is only supported when transforms is a pa.Field, "
+                "a list of pa.Field, or a pa.Schema (metadata-only add path). "
+                "Dict / UDF / reader transforms materialise column values for "
+                "every row explicitly, so an initial-default has no meaning."
+            )
 
         transforms = normalize_transform(transforms, self, read_columns, reader_schema)
         if isinstance(transforms, pa.RecordBatchReader):
@@ -1933,6 +1977,153 @@ class LanceDataset(pa.dataset.Dataset):
             if isinstance(transforms, BatchUDF):
                 if transforms.cache is not None:
                     transforms.cache.cleanup()
+
+    def add_column_with_default(
+        self,
+        field: pyarrow.Field,
+        default: Any,
+        *,
+        read_columns: List[str] | None = None,
+        batch_size: Optional[int] = None,
+    ):
+        """Add a single column whose pre-existing rows return *default*.
+
+        This is a convenience wrapper around :meth:`add_columns` that always
+        uses the metadata-only / AllNulls route, so *default* is guaranteed to
+        be stored rather than silently dropped.
+
+        Parameters
+        ----------
+        field : pa.Field
+            The Arrow field descriptor for the new column.  Must not be a
+            nested or physically-encoded type, and must not be a primary-key
+            column.  A non-nullable (required) field is supported **only when a
+            default is provided** — pre-existing rows will read the default
+            (never null); a non-nullable field without a default is rejected.
+        default : any
+            The Python value to store as ``lance-schema:initial-default``.
+            Any row written *before* this column was added will read back this
+            value instead of ``null``.  The value is encoded via the canonical
+            Lance JSON single-value codec; a :class:`ValueError` is raised when
+            the codec does not support the field's type or the value overflows.
+        read_columns : list of str, optional
+            Unused; accepted for API symmetry with :meth:`add_columns`.
+        batch_size : int, optional
+            Unused; accepted for API symmetry with :meth:`add_columns`.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> table = pa.table({"x": [10, 20, 30]})
+        >>> dataset = lance.write_dataset(table, "example")
+        >>> dataset.add_column_with_default(pa.field("y", pa.int32()), default=99)
+        >>> dataset.to_table().to_pandas()
+            x   y
+        0  10  99
+        1  20  99
+        2  30  99
+        """
+        self.add_columns(field, default=default)
+
+    def set_column_default(self, column: str, default) -> None:
+        """Set or update the initial default value for an existing top-level column.
+
+        Stores *default* as the ``lance-schema:initial-default`` metadata value
+        for *column*.  Pre-existing rows that were written before the column was
+        added will read back this value instead of ``null``.
+
+        This is the **guarded** setter.  Unlike
+        :meth:`update_field_metadata`, it applies the §1.4a scalar-index guard:
+        the operation is rejected with an ``OSError`` if the column is covered by
+        a scalar index (BTree, Bitmap, Inverted, …).  Drop the index first, then
+        set the default, then recreate the index.
+
+        Parameters
+        ----------
+        column : str
+            Name of an existing top-level column.  Dotted paths (nested columns)
+            are not supported.
+        default : any
+            The Python value to store as the initial default.  A length-1
+            ``pyarrow`` array is constructed from ``pa.array([default],
+            type=<column Arrow type>)`` and encoded to the canonical Lance JSON
+            single-value form.
+
+        Raises
+        ------
+        OSError
+            If the column does not exist, the value is incompatible with the
+            column's Arrow type, or the column has a covering scalar index.
+        ValueError
+            If the value cannot be encoded by the Lance JSON codec (e.g. an
+            unsupported nested type, or a float ``NaN`` / ``Inf``).
+
+        Notes
+        -----
+        ``update_field_metadata`` bypasses the scalar-index guard; always prefer
+        this method when setting defaults.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> table = pa.table({"id": pa.array([1, 2, 3], type=pa.int32())})
+        >>> ds = lance.write_dataset(table, "example")
+        >>> ds.add_columns(pa.field("score", pa.int32()))
+        >>> ds.set_column_default("score", 0)
+        >>> ds.to_table().column("score").to_pylist()
+        [0, 0, 0]
+        """
+        col_type = self.schema.field(column).type
+        arr = pa.array([default], type=col_type)
+        json_str = _encode_default_value(arr)
+        self._ds.set_column_default_json(column, json_str)
+
+    def remove_column_default(self, column: str) -> None:
+        """Remove the initial default value from an existing top-level column.
+
+        Deletes the ``lance-schema:initial-default`` metadata key from *column*.
+        After removal, pre-existing rows that were written before the column was
+        added will read back ``null`` instead of the previously stored default.
+        No-ops gracefully if the key was not set.
+
+        This is the **guarded** remover.  Unlike
+        :meth:`update_field_metadata`, it applies the §1.4a scalar-index guard:
+        the operation is rejected with an ``OSError`` if the column is covered by
+        a scalar index.
+
+        Parameters
+        ----------
+        column : str
+            Name of an existing top-level column.  Dotted paths (nested columns)
+            are not supported.
+
+        Raises
+        ------
+        OSError
+            If the column does not exist or it has a covering scalar index.
+
+        Notes
+        -----
+        ``update_field_metadata`` bypasses the scalar-index guard; always prefer
+        this method when removing defaults.
+
+        Examples
+        --------
+        Add a column with a default, then remove it so rows read ``null``::
+
+            import lance
+            import pyarrow as pa
+
+            table = pa.table({"id": pa.array([1, 2], type=pa.int32())})
+            ds = lance.write_dataset(table, "example")
+            ds.add_column_with_default(pa.field("score", pa.int32()), default=5)
+            # score reads [5, 5] here
+            ds.remove_column_default("score")
+            # score reads [None, None] after removal
+        """
+        self._ds.remove_column_default(column)
 
     def drop_columns(self, columns: List[str]):
         """Drop one or more columns from the dataset
@@ -5939,6 +6130,43 @@ def _validate_metadata(metadata: dict):
                 )
         elif isinstance(v, dict):
             _validate_metadata(v)
+
+
+_LANCE_INITIAL_DEFAULT_META_KEY = "lance-schema:initial-default"
+
+
+def _attach_default_to_schema(schema: pa.Schema, default: Any) -> pa.Schema:
+    """Return a new pa.Schema where every field carries *default* as
+    ``lance-schema:initial-default`` field metadata.
+
+    The default value is encoded via the PyO3 ``_encode_default_value`` helper
+    which calls the canonical Rust codec
+    (``lance_core::datatypes::encode_default``).  A ``ValueError`` is raised
+    when the codec does not support a field's type or the value overflows.
+
+    Parameters
+    ----------
+    schema : pa.Schema
+        The schema whose fields will receive the default.
+    default : any
+        The Python value to encode.  For schemas with a single field the value
+        is encoded against that field's type.  For multi-field schemas the same
+        Python value is encoded against each field's type independently.
+
+    Returns
+    -------
+    pa.Schema
+        A new schema (the original is not mutated) with the encoded default
+        attached to every field's metadata.
+    """
+    new_fields: List[pa.Field] = []
+    for field in schema:
+        arr = pa.array([default], type=field.type)
+        json_default = _encode_default_value(arr)
+        existing_meta = field.metadata or {}
+        new_meta = {**existing_meta, _LANCE_INITIAL_DEFAULT_META_KEY: json_default}
+        new_fields.append(field.with_metadata(new_meta))
+    return pa.schema(new_fields, metadata=schema.metadata)
 
 
 def _merge_message_to_properties(

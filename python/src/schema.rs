@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow::pyarrow::PyArrowType;
+use arrow::pyarrow::{PyArrowType, ToPyArrow};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
 use lance::datatypes::{Field, Schema};
 use lance_arrow::json::{convert_lance_json_to_arrow, has_json_fields};
+use lance_core::datatypes::{decode_default, LANCE_INITIAL_DEFAULT_META_KEY};
+
+/// Metadata key for write-default values (Model B; always absent in Model A).
+const LANCE_WRITE_DEFAULT_META_KEY: &str = "lance-schema:write-default";
 use lance_file::datatypes::{Fields, FieldsWithMeta};
 use lance_file::format::pb;
 use prost::Message;
@@ -74,6 +78,80 @@ impl LanceField {
 
     pub fn to_arrow(&self) -> PyArrowType<arrow_schema::Field> {
         PyArrowType((&self.0).into())
+    }
+
+    /// Decode and return the ``lance-schema:initial-default`` value for this
+    /// field, or ``None`` if the key is absent.
+    ///
+    /// Returns a pyarrow scalar (element 0 of a length-1 array) whose type
+    /// matches this field's Arrow data type.
+    ///
+    /// Notes
+    /// -----
+    /// This is a read-only accessor.  To set or remove the initial default on
+    /// a dataset column use :meth:`LanceDataset.set_column_default` or
+    /// :meth:`LanceDataset.remove_column_default`, which apply the §1.4a
+    /// scalar-index guard.  Bypassing those methods via
+    /// :meth:`LanceDataset.update_field_metadata` skips that guard.
+    pub fn initial_default<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        self.decode_meta_key(py, LANCE_INITIAL_DEFAULT_META_KEY)
+    }
+
+    /// Decode and return the ``lance-schema:write-default`` value for this
+    /// field, or ``None`` if the key is absent.
+    ///
+    /// Returns a pyarrow scalar (element 0 of a length-1 array) whose type
+    /// matches this field's Arrow data type, or ``None`` on genuine absence.
+    /// In Model A (the current model) this key is never present, so this
+    /// method always returns ``None``.
+    ///
+    /// Notes
+    /// -----
+    /// The return value is determined purely by key presence in field metadata
+    /// and does **not** fall back to the initial-default value.  See
+    /// :meth:`effective_default` for the combined fallback logic.
+    pub fn write_default<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        self.decode_meta_key(py, LANCE_WRITE_DEFAULT_META_KEY)
+    }
+
+    /// Return the effective default for this field.
+    ///
+    /// Returns :meth:`write_default` when the ``lance-schema:write-default``
+    /// key is present, otherwise :meth:`initial_default`.  Returns ``None``
+    /// when neither key is set.
+    ///
+    /// The shape is stable across the Model A → Model B transition: in Model A
+    /// there is no write-default key, so this always returns the initial-default
+    /// (if any).  In Model B the write-default key takes precedence.
+    pub fn effective_default<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        if self.0.metadata.contains_key(LANCE_WRITE_DEFAULT_META_KEY) {
+            self.decode_meta_key(py, LANCE_WRITE_DEFAULT_META_KEY)
+        } else {
+            self.decode_meta_key(py, LANCE_INITIAL_DEFAULT_META_KEY)
+        }
+    }
+}
+
+impl LanceField {
+    /// Decode the value stored at *key* in this field's metadata and return it
+    /// as a pyarrow scalar (element [0] of the decoded length-1 array), or
+    /// ``None`` when the key is absent.
+    fn decode_meta_key<'py>(
+        &self,
+        py: Python<'py>,
+        key: &str,
+    ) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let Some(json) = self.0.metadata.get(key) else {
+            return Ok(None);
+        };
+        let dt = self.0.data_type();
+        let arr = decode_default(json, &dt)
+            .map_err(|e| PyValueError::new_err(format!("failed to decode default: {e}")))?;
+        // Convert the length-1 array to a pyarrow array and take element [0]
+        // as a scalar so callers get a convenient Python value.
+        let py_arr = arr.to_data().to_pyarrow(py)?;
+        let scalar = py_arr.call_method1("__getitem__", (0,))?;
+        Ok(Some(scalar))
     }
 }
 

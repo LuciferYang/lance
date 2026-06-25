@@ -1582,6 +1582,7 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use super::*;
+    use crate::datatypes::LANCE_INITIAL_DEFAULT_META_KEY;
 
     #[test]
     fn projection_from_schema_defaults_to_v1() {
@@ -2721,5 +2722,93 @@ mod tests {
         assert_eq!(pk_fields[0].name, "f");
         assert_eq!(pk_fields[1].name, "e");
         assert_eq!(pk_fields[2].name, "g");
+    }
+
+    // ── initial-default metadata-preservation invariant tests (design §1.4 step 3) ───────────────
+    //
+    // INVARIANT: The `lance-schema:initial-default` metadata key must survive every
+    // step of the projection→reader pipeline without being stripped.  The hazard
+    // (e.g. `remove_metadata()` on the schema before the reader sees it) would
+    // silently drop backfill defaults, causing absent-column rows to read as NULL
+    // instead of the stored default value.  These tests lock the chain at each
+    // individual step so that any future regression fails loudly.
+
+    /// Test 1 — `Schema::project_by_ids` must preserve field-level
+    /// `lance-schema:initial-default` metadata.
+    ///
+    /// Locks the invariant at `schema.rs:358` / `field.rs:657`:
+    /// if `project_by_ids` were to re-build the field without copying its
+    /// metadata HashMap, the key would be silently lost and DefaultReader
+    /// would fall back to NULL instead of the stored default.
+    #[test]
+    fn test_project_by_ids_preserves_initial_default_metadata() {
+        // Build an Arrow field that carries the initial-default metadata key.
+        let default_field = ArrowField::new("d", ArrowDataType::Int32, true).with_metadata(
+            [(LANCE_INITIAL_DEFAULT_META_KEY.to_owned(), "7".to_owned())]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+        );
+        let arrow_schema = ArrowSchema::new(vec![default_field]);
+
+        // Convert to Lance Schema and assign stable field IDs.
+        let mut schema = Schema::try_from(&arrow_schema).unwrap();
+        schema.set_field_id(None);
+        // After set_field_id(None) the single top-level field gets id=0.
+        let field_id = schema.fields[0].id;
+        assert_eq!(field_id, 0, "sanity: field should have id 0");
+
+        // Project using the field ID — this is the path DefaultReader exercises.
+        let projected = schema.project_by_ids(&[field_id], true);
+
+        assert_eq!(
+            projected.fields.len(),
+            1,
+            "projected schema should contain the field"
+        );
+        let projected_field = &projected.fields[0];
+        assert_eq!(
+            projected_field.metadata.get(LANCE_INITIAL_DEFAULT_META_KEY),
+            Some(&"7".to_owned()),
+            "project_by_ids must not strip `{}` from field metadata",
+            LANCE_INITIAL_DEFAULT_META_KEY,
+        );
+    }
+
+    /// Test 2 — Lance→Arrow conversion (`From<&Schema> for ArrowSchema`) must
+    /// preserve field-level `lance-schema:initial-default` metadata.
+    ///
+    /// Locks the invariant at `schema.rs:791` / `field.rs:1206`:
+    /// the Arrow schema handed to `DefaultReader::batch` is produced by this
+    /// conversion; if the key were stripped here, DefaultReader would silently
+    /// produce NULL arrays instead of backfilling the default value.
+    #[test]
+    fn test_lance_to_arrow_conversion_preserves_initial_default_metadata() {
+        // Build a Lance Schema whose field carries the initial-default key.
+        let default_field = ArrowField::new("d", ArrowDataType::Int32, true).with_metadata(
+            [(LANCE_INITIAL_DEFAULT_META_KEY.to_owned(), "7".to_owned())]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+        );
+        let arrow_schema = ArrowSchema::new(vec![default_field]);
+        let mut schema = Schema::try_from(&arrow_schema).unwrap();
+        schema.set_field_id(None);
+
+        // Project by field id first (as DefaultReader does) to confirm the
+        // key survives the round-trip after projection.
+        let field_id = schema.fields[0].id;
+        let projected_lance = schema.project_by_ids(&[field_id], true);
+
+        // Convert the projected Lance schema to an Arrow schema — this is the
+        // exact conversion path that produces the `projection: Arc<ArrowSchema>`
+        // argument passed to `DefaultReader::batch`.
+        let projected_arrow = ArrowSchema::from(&projected_lance);
+
+        let arrow_field = projected_arrow.field_with_name("d").unwrap();
+        assert_eq!(
+            arrow_field.metadata().get(LANCE_INITIAL_DEFAULT_META_KEY),
+            Some(&"7".to_owned()),
+            "From<&Schema> for ArrowSchema must not strip `{}` from field metadata",
+            LANCE_INITIAL_DEFAULT_META_KEY,
+        );
     }
 }

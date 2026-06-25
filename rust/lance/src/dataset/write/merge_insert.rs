@@ -1128,6 +1128,14 @@ impl MergeInsertJob {
                     OnTypeMismatch::Error,
                 )?;
 
+                // These batches are the newly INSERTED (not-matched) rows only; updated and kept
+                // rows never reach this path. Materialise write-time defaults for columns the
+                // subschema source omits so inserts behave like the genuine append path. Columns
+                // with only an initial-default (Model A) are left structurally absent and remain
+                // governed by the live read-time default.
+                let (stream, write_schema) =
+                    super::augment_with_write_defaults(stream, write_schema, dataset.as_ref())?;
+
                 let (fragments, _) = write_fragments_internal(
                     Some(dataset.as_ref()),
                     dataset.object_store.clone(),
@@ -6641,5 +6649,481 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
                 Ok(_) => panic!("Expected error"),
             }
         }
+    }
+
+    /// Regression: a partial-schema upsert must NOT freeze the live initial-default of a Model A
+    /// column (mutable initial-default, no write-default) that is structurally absent from the
+    /// target fragments and is NOT supplied by the merge.  The merge rewrites the matched
+    /// fragments via a scan that read-backfills the absent column at its current default; without a
+    /// guard those values get materialised into the rewritten fragments, freezing them so a later
+    /// `set_column_default` no longer affects the merge-touched rows.  Mirrors
+    /// `update::test_update_preserves_mutable_initial_default_for_absent_column`.
+    #[tokio::test]
+    async fn test_merge_insert_preserves_mutable_initial_default_for_absent_column() {
+        use crate::dataset::schema_evolution::NewColumnTransform;
+        use arrow_array::cast::AsArray;
+        use arrow_array::Array;
+        use lance_core::datatypes::LANCE_INITIAL_DEFAULT_META_KEY;
+
+        // Single fragment with key column `key` and data column `value`, v2 storage.
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::UInt32, false),
+            Field::new("value", DataType::UInt32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![0, 1, 2, 3])),
+                Arc::new(UInt32Array::from(vec![10, 11, 12, 13])),
+            ],
+        )
+        .unwrap();
+        let batches = RecordBatchIterator::new([Ok(batch)], arrow_schema.clone());
+        let mut dataset = Dataset::write(
+            batches,
+            "memory://merge_preserve_default",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Add Model A column `c` (initial-default 42, no write-default), structurally absent.
+        let c_field = Field::new("c", DataType::Int32, true).with_metadata(HashMap::from([(
+            LANCE_INITIAL_DEFAULT_META_KEY.to_string(),
+            "42".to_string(),
+        )]));
+        dataset
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(Schema::new(vec![c_field]))),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        dataset.checkout_latest().await.unwrap();
+
+        // Partial-schema upsert that touches only `{key, value}` and never mentions `c`. Keys 2,3
+        // are updated; KEEP (the default) preserves untouched rows 0,1.  Because the source schema
+        // omits `c`, the operation does NOT supply it, so `c` must stay structurally absent for
+        // every target row.
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::UInt32, false),
+            Field::new("value", DataType::UInt32, true),
+        ]));
+        let source_batch = RecordBatch::try_new(
+            source_schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![2, 3])),
+                Arc::new(UInt32Array::from(vec![112, 113])),
+            ],
+        )
+        .unwrap();
+        let source_reader = Box::new(RecordBatchIterator::new([Ok(source_batch)], source_schema));
+        let source_stream = reader_to_stream(source_reader);
+
+        let job = MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["key".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched_by_source(WhenNotMatchedBySource::Keep)
+            .try_build()
+            .unwrap();
+        let (merged, _stats) = job.execute(source_stream).await.unwrap();
+        let mut dataset = (*merged).clone();
+
+        // Changing the default must retroactively affect ALL originally-absent rows, including the
+        // merge-rewritten rows, because `c` stayed structurally absent.
+        dataset.set_column_default("c", "77").await.unwrap();
+        dataset.checkout_latest().await.unwrap();
+
+        let batch = dataset
+            .scan()
+            .project(&["key", "value", "c"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let key = batch
+            .column_by_name("key")
+            .unwrap()
+            .as_primitive::<UInt32Type>();
+        let value = batch
+            .column_by_name("value")
+            .unwrap()
+            .as_primitive::<UInt32Type>();
+        let c = batch
+            .column_by_name("c")
+            .unwrap()
+            .as_primitive::<Int32Type>();
+        let mut c_by_key: HashMap<u32, Option<i32>> = HashMap::new();
+        let mut value_by_key: HashMap<u32, u32> = HashMap::new();
+        for i in 0..batch.num_rows() {
+            c_by_key.insert(
+                key.value(i),
+                if c.is_null(i) { None } else { Some(c.value(i)) },
+            );
+            value_by_key.insert(key.value(i), value.value(i));
+        }
+        // The merge's explicit value updates must still apply.
+        assert_eq!(
+            value_by_key.get(&2),
+            Some(&112),
+            "key=2 value must be updated"
+        );
+        assert_eq!(
+            value_by_key.get(&3),
+            Some(&113),
+            "key=3 value must be updated"
+        );
+        // Every row's `c` was structurally absent and the merge never supplied it, so all rows
+        // (kept rows 0,1 and rewritten rows 2,3) MUST read back the NEW default 77, not 42.
+        assert_eq!(c.null_count(), 0, "merge must not introduce nulls in `c`");
+        for k in [0u32, 1, 2, 3] {
+            assert_eq!(
+                c_by_key.get(&k),
+                Some(&Some(77)),
+                "row key={k} must reflect new default 77, not the frozen value"
+            );
+        }
+    }
+
+    /// Regression: a partial-schema merge-insert that INSERTS a not-matched row while omitting a
+    /// Model B column (write-default 7, initial-default 42) must materialise the write-default for
+    /// the inserted row, mirroring the plain append path.  Without the fix the inserted row is
+    /// written structurally absent and the read path backfills the initial-default (42) instead.
+    #[tokio::test]
+    async fn test_merge_insert_materializes_write_default_for_inserted_row() {
+        use arrow_array::cast::AsArray;
+        use arrow_array::Array;
+        use lance_core::datatypes::{LANCE_INITIAL_DEFAULT_META_KEY, LANCE_WRITE_DEFAULT_META_KEY};
+
+        // Target: {key, value, c} where `c` carries initial-default 42 + write-default 7.
+        let target_schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::UInt32, false),
+            Field::new("value", DataType::UInt32, true),
+            Field::new("c", DataType::Int32, true).with_metadata(HashMap::from([
+                (LANCE_INITIAL_DEFAULT_META_KEY.to_string(), "42".to_string()),
+                (LANCE_WRITE_DEFAULT_META_KEY.to_string(), "7".to_string()),
+            ])),
+        ]));
+        let batch = RecordBatch::try_new(
+            target_schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![0u32, 1])),
+                Arc::new(UInt32Array::from(vec![10u32, 11])),
+                Arc::new(Int32Array::from(vec![100, 101])),
+            ],
+        )
+        .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], target_schema),
+            "memory://merge_insert_write_default",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Partial-schema source omitting `c` and inserting a brand-new key=2.
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::UInt32, false),
+            Field::new("value", DataType::UInt32, true),
+        ]));
+        let source_batch = RecordBatch::try_new(
+            source_schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![2u32])),
+                Arc::new(UInt32Array::from(vec![12u32])),
+            ],
+        )
+        .unwrap();
+        let source_stream = reader_to_stream(Box::new(RecordBatchIterator::new(
+            [Ok(source_batch)],
+            source_schema,
+        )));
+
+        let job = MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["key".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .when_not_matched_by_source(WhenNotMatchedBySource::Keep)
+            .try_build()
+            .unwrap();
+        let (merged, _stats) = job.execute(source_stream).await.unwrap();
+
+        let batch = merged
+            .scan()
+            .project(&["key", "c"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let key = batch
+            .column_by_name("key")
+            .unwrap()
+            .as_primitive::<UInt32Type>();
+        let c = batch
+            .column_by_name("c")
+            .unwrap()
+            .as_primitive::<Int32Type>();
+        let mut c_by_key: HashMap<u32, Option<i32>> = HashMap::new();
+        for i in 0..batch.num_rows() {
+            c_by_key.insert(
+                key.value(i),
+                if c.is_null(i) { None } else { Some(c.value(i)) },
+            );
+        }
+        // The inserted not-matched row must materialise the write-default 7, NOT the
+        // initial-default 42.
+        assert_eq!(
+            c_by_key.get(&2),
+            Some(&Some(7)),
+            "inserted row must materialise write-default 7"
+        );
+        // Existing rows are untouched.
+        assert_eq!(c_by_key.get(&0), Some(&Some(100)));
+        assert_eq!(c_by_key.get(&1), Some(&Some(101)));
+    }
+
+    /// Regression (P0): a NON-nullable column carrying a write-default but no initial-default must
+    /// be materialised for a merge-inserted not-matched row.  Without the fix the row is written
+    /// absent and the dataset becomes UNREADABLE (the non-nullable absent-column branch of
+    /// `DefaultReader` errors because there is no initial-default to backfill).
+    #[tokio::test]
+    async fn test_merge_insert_materializes_write_default_for_inserted_row_non_nullable() {
+        use arrow_array::cast::AsArray;
+        use arrow_array::Array;
+        use lance_core::datatypes::LANCE_WRITE_DEFAULT_META_KEY;
+
+        let target_schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::UInt32, false),
+            Field::new("value", DataType::UInt32, true),
+            Field::new("c", DataType::Int32, false).with_metadata(HashMap::from([(
+                LANCE_WRITE_DEFAULT_META_KEY.to_string(),
+                "7".to_string(),
+            )])),
+        ]));
+        let batch = RecordBatch::try_new(
+            target_schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![0u32, 1])),
+                Arc::new(UInt32Array::from(vec![10u32, 11])),
+                Arc::new(Int32Array::from(vec![100, 101])),
+            ],
+        )
+        .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], target_schema),
+            "memory://merge_insert_write_default_non_nullable",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::UInt32, false),
+            Field::new("value", DataType::UInt32, true),
+        ]));
+        let source_batch = RecordBatch::try_new(
+            source_schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![2u32])),
+                Arc::new(UInt32Array::from(vec![12u32])),
+            ],
+        )
+        .unwrap();
+        let source_stream = reader_to_stream(Box::new(RecordBatchIterator::new(
+            [Ok(source_batch)],
+            source_schema,
+        )));
+
+        let job = MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["key".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .when_not_matched_by_source(WhenNotMatchedBySource::Keep)
+            .try_build()
+            .unwrap();
+        let (merged, _stats) = job.execute(source_stream).await.unwrap();
+
+        // Must scan without error and the inserted row must carry the write-default.
+        let batch = merged
+            .scan()
+            .project(&["key", "c"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .expect("dataset must remain readable after merge-insert of non-nullable column");
+        let key = batch
+            .column_by_name("key")
+            .unwrap()
+            .as_primitive::<UInt32Type>();
+        let c = batch
+            .column_by_name("c")
+            .unwrap()
+            .as_primitive::<Int32Type>();
+        assert_eq!(c.null_count(), 0, "non-nullable column must have no nulls");
+        let mut c_by_key: HashMap<u32, i32> = HashMap::new();
+        for i in 0..batch.num_rows() {
+            c_by_key.insert(key.value(i), c.value(i));
+        }
+        assert_eq!(
+            c_by_key.get(&2),
+            Some(&7),
+            "inserted row must materialise write-default 7"
+        );
+    }
+
+    /// Regression: a full-schema upsert with `WhenNotMatchedBySource::Keep` must not freeze the
+    /// live initial-default of a structurally-absent Model A column for the rows the merge does NOT
+    /// supply.  In a full-schema merge only the matched (UpdateAll) and inserted rows are written
+    /// from the source; not-matched-by-source rows are kept and never re-materialised, so the
+    /// absent Model A column stays governed by the live read-time default for them.  Verified for
+    /// both the non-indexed fast path and the indexed slow path.
+    #[rstest::rstest]
+    #[case::no_index(false)]
+    #[case::scalar_index(true)]
+    #[tokio::test]
+    async fn test_merge_insert_keep_rows_track_mutable_initial_default(#[case] with_index: bool) {
+        use crate::dataset::schema_evolution::NewColumnTransform;
+        use arrow_array::cast::AsArray;
+        use arrow_array::Array;
+        use lance_core::datatypes::LANCE_INITIAL_DEFAULT_META_KEY;
+
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::UInt32, false),
+            Field::new("value", DataType::UInt32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![0, 1, 2, 3])),
+                Arc::new(UInt32Array::from(vec![10, 11, 12, 13])),
+            ],
+        )
+        .unwrap();
+        let batches = RecordBatchIterator::new([Ok(batch)], arrow_schema.clone());
+        let mut dataset = Dataset::write(
+            batches,
+            "memory://merge_keep_default",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        if with_index {
+            dataset
+                .create_index(
+                    &["key"],
+                    IndexType::Scalar,
+                    None,
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+
+        // Add Model A column `c` (initial-default 42, no write-default), structurally absent.
+        let c_field = Field::new("c", DataType::Int32, true).with_metadata(HashMap::from([(
+            LANCE_INITIAL_DEFAULT_META_KEY.to_string(),
+            "42".to_string(),
+        )]));
+        dataset
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(Schema::new(vec![c_field]))),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        dataset.checkout_latest().await.unwrap();
+
+        // FULL-schema upsert. The source matches keys 2,3 (UpdateAll, explicitly supplying c=99)
+        // and KEEPs keys 0,1, which the source never mentions.
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::UInt32, false),
+            Field::new("value", DataType::UInt32, true),
+            Field::new("c", DataType::Int32, true),
+        ]));
+        let source_batch = RecordBatch::try_new(
+            source_schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![2, 3])),
+                Arc::new(UInt32Array::from(vec![112, 113])),
+                Arc::new(Int32Array::from(vec![Some(99), Some(99)])),
+            ],
+        )
+        .unwrap();
+        let source_reader = Box::new(RecordBatchIterator::new([Ok(source_batch)], source_schema));
+        let source_stream = reader_to_stream(source_reader);
+
+        let job = MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["key".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched_by_source(WhenNotMatchedBySource::Keep)
+            .try_build()
+            .unwrap();
+        let (merged, _stats) = job.execute(source_stream).await.unwrap();
+        let mut dataset = (*merged).clone();
+
+        dataset.set_column_default("c", "77").await.unwrap();
+        dataset.checkout_latest().await.unwrap();
+
+        let batch = dataset
+            .scan()
+            .project(&["key", "c"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let key = batch
+            .column_by_name("key")
+            .unwrap()
+            .as_primitive::<UInt32Type>();
+        let c = batch
+            .column_by_name("c")
+            .unwrap()
+            .as_primitive::<Int32Type>();
+        let mut c_by_key: HashMap<u32, Option<i32>> = HashMap::new();
+        for i in 0..batch.num_rows() {
+            c_by_key.insert(
+                key.value(i),
+                if c.is_null(i) { None } else { Some(c.value(i)) },
+            );
+        }
+        // KEEP rows (0,1): never supplied by the merge, so they MUST track the NEW default 77.
+        assert_eq!(
+            c_by_key.get(&0),
+            Some(&Some(77)),
+            "kept row key=0 must track new default 77"
+        );
+        assert_eq!(
+            c_by_key.get(&1),
+            Some(&Some(77)),
+            "kept row key=1 must track new default 77"
+        );
+        // Matched rows (2,3): the source explicitly supplied c=99, so that value is preserved
+        // (UpdateAll overwrite semantics) and is NOT affected by the later default change.
+        assert_eq!(
+            c_by_key.get(&2),
+            Some(&Some(99)),
+            "updated row key=2 keeps supplied value 99"
+        );
+        assert_eq!(
+            c_by_key.get(&3),
+            Some(&Some(99)),
+            "updated row key=3 keeps supplied value 99"
+        );
     }
 }

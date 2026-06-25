@@ -14,12 +14,18 @@ use lance_arrow::bfloat16::{is_bfloat16_field, BFLOAT16_EXT_NAME};
 use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
 use snafu::location;
 
+pub mod default_value;
 mod field;
 mod schema;
 
 use crate::{Error, Result};
+pub use default_value::{
+    decode_default, encode_default, validate_default_assignable, DefaultValueError,
+    DefaultValueResult,
+};
 pub use field::{
     BlobVersion, Encoding, Field, NullabilityComparison, OnTypeMismatch, SchemaCompareOptions,
+    LANCE_INITIAL_DEFAULT_META_KEY, LANCE_WRITE_DEFAULT_META_KEY,
 };
 pub use schema::{
     escape_field_path_for_project, format_field_path, parse_field_path, BlobHandling, FieldRef,

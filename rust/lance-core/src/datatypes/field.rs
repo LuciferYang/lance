@@ -49,6 +49,14 @@ pub const LANCE_UNENFORCED_PRIMARY_KEY: &str = "lance-schema:unenforced-primary-
 pub const LANCE_UNENFORCED_PRIMARY_KEY_POSITION: &str =
     "lance-schema:unenforced-primary-key:position";
 
+/// Use this config key in Arrow field metadata to store the initial default value for a column.
+/// This is the default value set when the column is first created.
+pub const LANCE_INITIAL_DEFAULT_META_KEY: &str = "lance-schema:initial-default";
+
+/// Use this config key in Arrow field metadata to store the write-time default value for a column.
+/// This is the default value used when a write operation does not provide a value for this column.
+pub const LANCE_WRITE_DEFAULT_META_KEY: &str = "lance-schema:write-default";
+
 fn has_blob_v2_extension(field: &ArrowField) -> bool {
     field
         .metadata()
@@ -1064,6 +1072,60 @@ impl Field {
     pub fn is_unenforced_primary_key(&self) -> bool {
         self.unenforced_primary_key_position.is_some()
     }
+
+    /// Return the raw JSON-serialized initial default value stored in field metadata, if any.
+    ///
+    /// This is the value associated with the [`LANCE_INITIAL_DEFAULT_META_KEY`] metadata key.
+    /// Returns `None` when the key is absent.
+    pub fn initial_default_raw(&self) -> Option<String> {
+        self.metadata.get(LANCE_INITIAL_DEFAULT_META_KEY).cloned()
+    }
+
+    /// Return the raw JSON-serialized write-time default value stored in field metadata, if any.
+    ///
+    /// This is the value associated with the [`LANCE_WRITE_DEFAULT_META_KEY`] metadata key.
+    /// Returns `None` when the key is absent.
+    pub fn write_default_raw(&self) -> Option<String> {
+        self.metadata.get(LANCE_WRITE_DEFAULT_META_KEY).cloned()
+    }
+
+    /// Return the effective raw default value for this field.
+    ///
+    /// The write-time default (if set) takes precedence over the initial default.
+    /// Falls back to [`initial_default_raw`](Self::initial_default_raw) when no write-time
+    /// default is present.  Returns `None` when neither key is set.
+    pub fn effective_default_raw(&self) -> Option<String> {
+        self.write_default_raw()
+            .or_else(|| self.initial_default_raw())
+    }
+
+    /// Return true if this field is part of the (unenforced) primary key according to raw
+    /// metadata, without relying on the cached [`unenforced_primary_key_position`] field.
+    ///
+    /// This reads directly from [`self.metadata`] and is therefore accurate even after an
+    /// in-place `UpdateConfig` metadata mutation that modifies the metadata map without
+    /// rebuilding the cached `unenforced_primary_key_position` (design §1.6).
+    ///
+    /// Returns `true` if **either**:
+    /// - [`LANCE_UNENFORCED_PRIMARY_KEY_POSITION`] is present in the metadata (any value), **or**
+    /// - [`LANCE_UNENFORCED_PRIMARY_KEY`] is present with a truthy value (`true`, `1`, or `yes`,
+    ///   case-insensitive).
+    pub fn is_unenforced_pk_raw(&self) -> bool {
+        self.metadata
+            .contains_key(LANCE_UNENFORCED_PRIMARY_KEY_POSITION)
+            || self
+                .metadata
+                .get(LANCE_UNENFORCED_PRIMARY_KEY)
+                .map(|v| is_truthy_pk_value(v))
+                .unwrap_or(false)
+    }
+}
+
+/// Return true if the value is a truthy primary-key flag (`true`, `1`, or `yes`,
+/// case-insensitive).  Matches the same set accepted by [`TryFrom<&ArrowField>`] for
+/// [`LANCE_UNENFORCED_PRIMARY_KEY`].
+fn is_truthy_pk_value(value: &str) -> bool {
+    matches!(value.to_lowercase().as_str(), "true" | "1" | "yes")
 }
 
 impl fmt::Display for Field {
@@ -1150,7 +1212,7 @@ impl TryFrom<&ArrowField> for Field {
                 // Backward compatibility: use 0 for legacy boolean flag
                 metadata
                     .get(LANCE_UNENFORCED_PRIMARY_KEY)
-                    .filter(|s| matches!(s.to_lowercase().as_str(), "true" | "1" | "yes"))
+                    .filter(|s| is_truthy_pk_value(s))
                     .map(|_| 0)
             });
         let is_blob_v2 = has_blob_v2_extension(field);
@@ -1815,5 +1877,51 @@ mod tests {
         let unloaded = field.into_unloaded_with_version(BlobVersion::V2);
         assert_eq!(unloaded.children.len(), 5);
         assert_eq!(unloaded.logical_type, BLOB_V2_DESC_LANCE_FIELD.logical_type);
+    }
+
+    #[test]
+    fn default_value_key_constants() {
+        assert_eq!(
+            LANCE_INITIAL_DEFAULT_META_KEY,
+            "lance-schema:initial-default"
+        );
+        assert_eq!(LANCE_WRITE_DEFAULT_META_KEY, "lance-schema:write-default");
+    }
+
+    #[test]
+    fn field_default_accessors() {
+        let mut f = Field::try_from(&ArrowField::new("c", DataType::Int32, true)).unwrap();
+        f.metadata
+            .insert(LANCE_INITIAL_DEFAULT_META_KEY.to_string(), "1".to_string());
+        assert_eq!(f.initial_default_raw(), Some("1".to_string()));
+        assert_eq!(f.write_default_raw(), None); // genuine absence
+        assert_eq!(f.effective_default_raw(), Some("1".to_string())); // falls back to initial
+        f.metadata
+            .insert(LANCE_WRITE_DEFAULT_META_KEY.to_string(), "2".to_string());
+        assert_eq!(f.write_default_raw(), Some("2".to_string()));
+        assert_eq!(f.effective_default_raw(), Some("2".to_string())); // write takes precedence
+    }
+
+    #[test]
+    fn raw_pk_membership_detects_position_only() {
+        let mut f = Field::try_from(&ArrowField::new("c", DataType::Int32, true)).unwrap();
+        f.metadata.insert(
+            LANCE_UNENFORCED_PRIMARY_KEY_POSITION.to_string(),
+            "0".to_string(),
+        );
+        assert!(f.is_unenforced_pk_raw()); // detected via :position alone (no legacy bool key)
+    }
+
+    #[test]
+    fn raw_pk_membership_truthy_legacy_key() {
+        let mut f = Field::try_from(&ArrowField::new("c", DataType::Int32, true)).unwrap();
+        f.metadata
+            .insert(LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "yes".to_string());
+        assert!(f.is_unenforced_pk_raw()); // truthy value
+        f.metadata.insert(
+            LANCE_UNENFORCED_PRIMARY_KEY.to_string(),
+            "false".to_string(),
+        );
+        assert!(!f.is_unenforced_pk_raw()); // non-truthy => not a PK (and no :position)
     }
 }

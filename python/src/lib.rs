@@ -58,6 +58,7 @@ use scanner::ScanStatistics;
 use session::Session;
 
 pub(crate) mod arrow;
+pub(crate) mod capabilities;
 #[cfg(feature = "datagen")]
 pub(crate) mod datagen;
 pub(crate) mod dataset;
@@ -82,11 +83,13 @@ use crate::file::LanceFileSession;
 use crate::fragment::{write_fragments, write_fragments_transaction};
 use crate::tracing::{capture_trace_events, shutdown_tracing, PyTraceEvent};
 pub use crate::tracing::{trace_to_chrome, TraceGuard};
+use crate::utils::{decode_default_value, encode_default_value};
 use crate::utils::Hnsw;
 use crate::utils::KMeans;
 pub use dataset::write_dataset;
 pub use dataset::Dataset;
 use fragment::{FileFragment, PyDeletionFile, PyRowDatasetVersionMeta, PyRowIdMeta};
+pub use capabilities::register_capabilities;
 pub use indices::register_indices;
 pub use reader::LanceReader;
 pub use scanner::Scanner;
@@ -280,6 +283,8 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<namespace::PyRestNamespace>()?;
     m.add_class::<namespace::PyRestAdapter>()?;
     m.add_class::<storage_options::PyStorageOptionsAccessor>()?;
+    m.add_wrapped(wrap_pyfunction!(encode_default_value))?;
+    m.add_wrapped(wrap_pyfunction!(decode_default_value))?;
     m.add_wrapped(wrap_pyfunction!(bfloat16_array))?;
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments))?;
@@ -301,6 +306,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(debug::list_transactions))?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
 
+    register_capabilities(py, m)?;
     register_datagen(py, m)?;
     register_indices(py, m)?;
     Ok(())

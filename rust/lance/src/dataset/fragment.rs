@@ -16,13 +16,15 @@ use arrow_array::cast::as_primitive_array;
 use arrow_array::{
     new_null_array, RecordBatch, RecordBatchReader, StructArray, UInt32Array, UInt64Array,
 };
-use arrow_schema::Schema as ArrowSchema;
+use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::future::try_join_all;
 use futures::{join, stream, FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use lance_arrow::{RecordBatchExt, SchemaExt};
-use lance_core::datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions};
+use lance_core::datatypes::{
+    decode_default, OnMissing, OnTypeMismatch, SchemaCompareOptions, LANCE_INITIAL_DEFAULT_META_KEY,
+};
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{cache::CacheKey, datatypes::Schema, Error, Result};
@@ -492,30 +494,99 @@ mod v2_adapter {
     }
 }
 
-/// A reader where all rows are null. Used when there are fields that have no
-/// data files in a fragment.
+/// A reader that materializes absent columns.
+///
+/// For each field in the projection:
+/// - If the Arrow field metadata contains [`LANCE_INITIAL_DEFAULT_META_KEY`], that
+///   JSON literal is decoded and broadcast to `num_rows`, producing a constant array
+///   of the field's exact `DataType`.
+/// - Otherwise the column is filled with nulls (original behaviour).
+///
+/// Decode errors propagate as recoverable `Result::Err` values — they never panic.
 #[derive(Debug, Clone)]
-struct NullReader {
+struct DefaultReader {
     schema: Arc<Schema>,
     num_rows: u32,
 }
 
-impl NullReader {
+impl DefaultReader {
     fn new(schema: Arc<Schema>, num_rows: u32) -> Self {
         Self { schema, num_rows }
     }
 
-    fn batch(projection: Arc<ArrowSchema>, num_rows: usize) -> RecordBatch {
-        let columns = projection
-            .fields()
-            .iter()
-            .map(|f| new_null_array(f.data_type(), num_rows))
-            .collect::<Vec<_>>();
-        RecordBatch::try_new(projection, columns).unwrap()
+    /// Build a [`RecordBatch`] with `num_rows` rows for each field in `projection`.
+    ///
+    /// Fields whose Arrow metadata contains [`LANCE_INITIAL_DEFAULT_META_KEY`] are
+    /// filled with the decoded default value; all other fields are filled with nulls.
+    fn batch(projection: Arc<ArrowSchema>, num_rows: usize) -> Result<RecordBatch> {
+        let mut columns = Vec::with_capacity(projection.fields().len());
+        for f in projection.fields() {
+            let col = Self::make_column(f, num_rows)?;
+            columns.push(col);
+        }
+        RecordBatch::try_new(projection, columns).map_err(|e| Error::Arrow {
+            message: format!("DefaultReader: failed to build RecordBatch: {e}"),
+            location: location!(),
+        })
+    }
+
+    /// Build a single column array of length `num_rows`.
+    ///
+    /// If the field carries an initial-default literal, decode it and broadcast
+    /// the single decoded value across all rows.  On any decode failure the error
+    /// is propagated immediately (no panic, no silent null fallback).
+    fn make_column(field: &ArrowField, num_rows: usize) -> Result<arrow_array::ArrayRef> {
+        if let Some(json) = field.metadata().get(LANCE_INITIAL_DEFAULT_META_KEY) {
+            // Decode the stored JSON literal into a length-1 Arrow array.
+            let arr1 = decode_default(json, field.data_type()).map_err(|e| {
+                Error::corrupt_file(
+                    object_store::path::Path::from(""),
+                    format!(
+                        "initial-default literal for column '{}' cannot be decoded: {e}",
+                        field.name()
+                    ),
+                    location!(),
+                )
+            })?;
+
+            // Broadcast the single value to `num_rows` via take.
+            // A length-1 source taken at index-0 repeated N times produces a
+            // length-N constant array whose DataType equals the source exactly
+            // (preserving Timestamp timezone, Decimal precision/scale, FixedSizeBinary width).
+            let indices = UInt32Array::from(vec![0u32; num_rows]);
+            let broadcast =
+                arrow_select::take::take(arr1.as_ref(), &indices, None).map_err(|e| {
+                    Error::Arrow {
+                        message: format!(
+                            "DefaultReader: failed to broadcast default for column '{}': {e}",
+                            field.name()
+                        ),
+                        location: location!(),
+                    }
+                })?;
+            Ok(broadcast)
+        } else if !field.is_nullable() {
+            // This branch is defensive — it should be unreachable because the create-time
+            // guard (`schema_evolution.rs`) ensures every non-nullable added column carries
+            // an initial-default.  If reached, it means a corrupt manifest or a future
+            // code path bypassed the guard.  Return a recoverable error rather than
+            // silently producing an invalid null array.
+            Err(Error::corrupt_file(
+                object_store::path::Path::from(""),
+                format!(
+                    "absent column '{}' is non-nullable but has no initial-default metadata; \
+                     cannot backfill without violating the non-null contract",
+                    field.name()
+                ),
+                location!(),
+            ))
+        } else {
+            Ok(new_null_array(field.data_type(), num_rows))
+        }
     }
 }
 
-impl GenericFileReader for NullReader {
+impl GenericFileReader for DefaultReader {
     fn read_range_tasks(
         &self,
         range: Range<u64>,
@@ -541,9 +612,9 @@ impl GenericFileReader for NullReader {
 
             let num_rows = remaining_rows.min(batch_size as u64) as usize;
             remaining_rows -= num_rows as u64;
-            let batch = Self::batch(projection.clone(), num_rows);
+            let batch_result = Self::batch(projection.clone(), num_rows);
             let task = ReadBatchTask {
-                task: futures::future::ready(Ok(batch)).boxed(),
+                task: futures::future::ready(batch_result).boxed(),
                 num_rows: num_rows as u32,
             };
             Some(task)
@@ -572,7 +643,7 @@ impl GenericFileReader for NullReader {
     }
 
     fn update_storage_stats(&self, _field_stats: &mut HashMap<u32, FieldStatistics>) {
-        // No-op for null reader
+        // No-op for default reader
     }
 
     fn projection(&self) -> &Arc<Schema> {
@@ -1063,8 +1134,8 @@ impl FileFragment {
         missing_fields.retain(|f| !field_ids_in_files.contains(f) && *f >= 0);
         if !missing_fields.is_empty() {
             let missing_projection = projection.project_by_ids(&missing_fields, true);
-            let null_reader = NullReader::new(Arc::new(missing_projection), num_rows as u32);
-            opened_files.push(Box::new(null_reader));
+            let default_reader = DefaultReader::new(Arc::new(missing_projection), num_rows as u32);
+            opened_files.push(Box::new(default_reader));
         }
 
         Ok(opened_files)
@@ -2628,7 +2699,7 @@ impl FragmentReader {
 mod tests {
     use arrow_arith::numeric::mul;
     use arrow_array::{
-        ArrayRef, BooleanArray, Int32Array, Int64Array, RecordBatchIterator, StringArray,
+        Array, ArrayRef, BooleanArray, Int32Array, Int64Array, RecordBatchIterator, StringArray,
     };
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::utils::tempfile::TempStrDir;
@@ -3954,5 +4025,523 @@ mod tests {
         let stats = dataset.object_store().io_stats_incremental();
         assert_io_eq!(stats, read_iops, 1);
         assert_io_lt!(stats, read_bytes, 4096);
+    }
+
+    // ── DefaultReader / initial-default backfill tests ──────────────────────────
+
+    /// Create a v2 dataset with a single `i` column (Int32), add an absent column
+    /// carrying an initial-default, then verify that the pre-existing rows read the
+    /// default value rather than null.
+    #[tokio::test]
+    async fn test_default_reader_int32_backfill() -> Result<()> {
+        use arrow_array::Int32Array as Arr;
+        use arrow_schema::DataType;
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            true,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Arr::from_iter_values(0..5))])?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://default_reader_int32",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        // Add an absent column whose Arrow field metadata carries the initial-default.
+        let default_field = ArrowField::new("d", DataType::Int32, true).with_metadata(
+            [("lance-schema:initial-default".to_string(), "7".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        dataset
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![
+                    default_field.clone()
+                ]))),
+                None,
+                None,
+            )
+            .await?;
+
+        // Scan and verify that the absent-column rows read 7, not null.
+        let batches = dataset
+            .scan()
+            .project(&["d"])
+            .unwrap()
+            .try_into_stream()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let col = batches[0].column_by_name("d").unwrap();
+        let col = col.as_any().downcast_ref::<Arr>().unwrap();
+        assert_eq!(col.len(), 5);
+        for v in col.values() {
+            assert_eq!(*v, 7i32);
+        }
+        assert_eq!(col.null_count(), 0, "backfilled column must have no nulls");
+
+        Ok(())
+    }
+
+    /// A fragment that PHYSICALLY has the column (with stored NULL values) must
+    /// return those stored values verbatim; the default must NOT override them.
+    #[tokio::test]
+    async fn test_default_reader_stored_null_not_overridden() -> Result<()> {
+        use arrow_array::Int32Array as Arr;
+        use arrow_schema::DataType;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int32, true),
+            ArrowField::new("d", DataType::Int32, true),
+        ]));
+        // Row 0: d=42, Row 1: d=NULL, Row 2: d=99
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Arr::from_iter_values(0..3)),
+                Arc::new(Arr::from(vec![Some(42), None, Some(99)])),
+            ],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let dataset = Dataset::write(
+            reader,
+            "memory://default_reader_stored_null",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        let batches = dataset
+            .scan()
+            .project(&["d"])
+            .unwrap()
+            .try_into_stream()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let col = batches[0].column_by_name("d").unwrap();
+        let col = col.as_any().downcast_ref::<Arr>().unwrap();
+        assert_eq!(col.value(0), 42);
+        assert!(col.is_null(1), "stored NULL must remain NULL");
+        assert_eq!(col.value(2), 99);
+
+        Ok(())
+    }
+
+    /// Defaulted Timestamp(Microsecond, Some("UTC")) column must backfill without
+    /// panicking and with the exact DataType preserved.
+    #[tokio::test]
+    async fn test_default_reader_timestamp_backfill() -> Result<()> {
+        use arrow_array::TimestampMicrosecondArray;
+        use arrow_schema::{DataType, TimeUnit};
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..3))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://default_reader_ts",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        let ts_field = ArrowField::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            true,
+        )
+        .with_metadata(
+            [(
+                "lance-schema:initial-default".to_string(),
+                "\"2024-01-01T00:00:00+00:00\"".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        dataset
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![ts_field]))),
+                None,
+                None,
+            )
+            .await?;
+
+        let batches = dataset
+            .scan()
+            .project(&["ts"])
+            .unwrap()
+            .try_into_stream()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let col = batches[0].column_by_name("ts").unwrap();
+        // Verify exact DataType preserved (timezone must not be stripped).
+        assert_eq!(
+            col.data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        let col = col
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("must be TimestampMicrosecondArray");
+        // 2024-01-01T00:00:00 UTC in microseconds since epoch
+        let expected_us: i64 = 1_704_067_200_000_000;
+        assert_eq!(col.len(), 3);
+        for v in col.values() {
+            assert_eq!(*v, expected_us);
+        }
+        assert_eq!(col.null_count(), 0);
+
+        Ok(())
+    }
+
+    /// Defaulted Decimal128(10, 2) column must backfill without panic and with
+    /// exact DataType (precision + scale) preserved.
+    #[tokio::test]
+    async fn test_default_reader_decimal128_backfill() -> Result<()> {
+        use arrow_array::Decimal128Array;
+        use arrow_schema::DataType;
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..3))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://default_reader_dec128",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        let dec_field = ArrowField::new("price", DataType::Decimal128(10, 2), true).with_metadata(
+            [(
+                "lance-schema:initial-default".to_string(),
+                "\"1.23\"".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        dataset
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![dec_field]))),
+                None,
+                None,
+            )
+            .await?;
+
+        let batches = dataset
+            .scan()
+            .project(&["price"])
+            .unwrap()
+            .try_into_stream()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let col = batches[0].column_by_name("price").unwrap();
+        assert_eq!(col.data_type(), &DataType::Decimal128(10, 2));
+        let col = col
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("must be Decimal128Array");
+        assert_eq!(col.len(), 3);
+        // 1.23 with scale 2 → stored as 123
+        for v in col.values() {
+            assert_eq!(*v, 123i128);
+        }
+        assert_eq!(col.null_count(), 0);
+
+        Ok(())
+    }
+
+    /// Defaulted FixedSizeBinary(4) column must backfill without panic and with
+    /// the exact DataType (width) preserved.
+    #[tokio::test]
+    async fn test_default_reader_fixed_size_binary_backfill() -> Result<()> {
+        use arrow_array::FixedSizeBinaryArray;
+        use arrow_schema::DataType;
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..3))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://default_reader_fsb",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        // 4 bytes = 8 hex chars: "DEADBEEF"
+        let fsb_field = ArrowField::new("tag", DataType::FixedSizeBinary(4), true).with_metadata(
+            [(
+                "lance-schema:initial-default".to_string(),
+                "\"DEADBEEF\"".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        dataset
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![fsb_field]))),
+                None,
+                None,
+            )
+            .await?;
+
+        let batches = dataset
+            .scan()
+            .project(&["tag"])
+            .unwrap()
+            .try_into_stream()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let col = batches[0].column_by_name("tag").unwrap();
+        assert_eq!(col.data_type(), &DataType::FixedSizeBinary(4));
+        let col = col
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("must be FixedSizeBinaryArray");
+        assert_eq!(col.len(), 3);
+        let expected = [0xDE_u8, 0xAD, 0xBE, 0xEF];
+        for i in 0..col.len() {
+            assert_eq!(col.value(i), &expected);
+        }
+        assert_eq!(col.null_count(), 0);
+
+        Ok(())
+    }
+
+    /// A malformed initial-default literal must produce a recoverable `Err`,
+    /// NOT a panic.  We inject bad metadata by-passing normal validation and
+    /// assert that scanning returns an error rather than crashing.
+    #[tokio::test]
+    async fn test_default_reader_malformed_literal_recoverable() -> Result<()> {
+        use arrow_schema::DataType;
+
+        // Write a base dataset.
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..3))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://default_reader_malformed",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        // Add an absent column with a well-formed literal so the `add_columns` call
+        // succeeds (validation at add-time uses `decode_default` and would reject a
+        // bad literal).  Then we directly call `DefaultReader::batch` with poisoned
+        // metadata to verify the recoverable-error path in isolation.
+        let good_field = ArrowField::new("d", DataType::Int32, true).with_metadata(
+            [("lance-schema:initial-default".to_string(), "7".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        dataset
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![good_field]))),
+                None,
+                None,
+            )
+            .await?;
+
+        // Now build an Arrow schema with a deliberately malformed literal and invoke
+        // `DefaultReader::batch` directly.  This simulates a corrupt manifest that
+        // bypassed set-time validation.
+        let bad_field = ArrowField::new("d", DataType::Int32, true).with_metadata(
+            [(
+                "lance-schema:initial-default".to_string(),
+                "not-valid-json-{{{".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let bad_projection = Arc::new(ArrowSchema::new(vec![bad_field]));
+        let result = DefaultReader::batch(bad_projection, 5);
+        assert!(
+            result.is_err(),
+            "malformed initial-default must produce Err, not panic"
+        );
+
+        Ok(())
+    }
+
+    /// Absent column with NO initial-default metadata must produce an all-null
+    /// array of the correct length and DataType.  This exercises the
+    /// `else { new_null_array(...) }` branch of `DefaultReader::make_column`
+    /// directly, without going through a full dataset scan.
+    #[test]
+    fn test_default_reader_no_metadata_yields_null_array() {
+        use arrow_array::Array;
+        use arrow_schema::DataType;
+
+        // A field with NO metadata at all — no LANCE_INITIAL_DEFAULT_META_KEY.
+        let field = ArrowField::new("absent", DataType::Int32, true);
+        let projection = Arc::new(ArrowSchema::new(vec![field]));
+
+        let batch = DefaultReader::batch(projection, 7).expect("null-fallback must not error");
+
+        assert_eq!(batch.num_rows(), 7);
+        assert_eq!(batch.num_columns(), 1);
+
+        let col = batch.column(0);
+        assert_eq!(col.data_type(), &DataType::Int32);
+        assert_eq!(col.null_count(), 7, "every value must be null");
+        assert_eq!(col.len(), 7);
+    }
+
+    // ── initial-default metadata-preservation invariant (design §1.4 step 3) ────
+    //
+    // INVARIANT: The `lance-schema:initial-default` metadata key must survive the
+    // full pipeline: `Schema::project_by_ids` → Lance→Arrow conversion →
+    // `DefaultReader::batch`.  Any step that strips field metadata (e.g. a
+    // `remove_metadata()` call upstream of the reader) would silently cause
+    // absent-column rows to be returned as NULL instead of the stored default.
+    // This end-to-end test must catch that regression by asserting that the
+    // values read back equal the default (7), not null.
+
+    /// End-to-end narrow-projection backfill: prove the full
+    /// projection→Arrow→DefaultReader chain preserves `lance-schema:initial-default`.
+    ///
+    /// A v2 `memory://` dataset is created, `add_columns` adds an all-null
+    /// nullable Int32 column with `initial-default = "7"` on the Arrow field
+    /// metadata, then a scan projecting ONLY that defaulted column exercises
+    /// `project_by_ids` on the absent field.  The values must read back as 7
+    /// (not null), proving the metadata was not stripped at any intermediate step.
+    #[tokio::test]
+    async fn test_narrow_projection_backfill_preserves_metadata_end_to_end() -> Result<()> {
+        use arrow_array::Int32Array as Arr;
+
+        // Create a base dataset with only the "i" column so that the "d" column
+        // is physically absent from the fragment files.
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            true,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Arr::from_iter_values(0..5))])?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://invariant_narrow_projection_backfill",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        // add_columns with AllNulls adds the column to the schema but does NOT
+        // write any data for pre-existing fragments — those fragments physically
+        // lack the column, so DefaultReader must backfill from the metadata.
+        let default_field = ArrowField::new("d", DataType::Int32, true).with_metadata(
+            [(LANCE_INITIAL_DEFAULT_META_KEY.to_string(), "7".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        dataset
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![
+                    default_field.clone()
+                ]))),
+                None,
+                None,
+            )
+            .await?;
+
+        // Scan projecting ONLY "d" — a narrow projection that exercises
+        // `project_by_ids` on the field that is absent from on-disk fragments.
+        // If `lance-schema:initial-default` were stripped at any step of the
+        // projection→Arrow chain, the values would come back as NULL here.
+        let batches = dataset
+            .scan()
+            .project(&["d"])
+            .unwrap()
+            .try_into_stream()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        assert!(!batches.is_empty(), "scan must return at least one batch");
+        let col = batches[0]
+            .column_by_name("d")
+            .expect("column 'd' must exist");
+        let col = col
+            .as_any()
+            .downcast_ref::<Arr>()
+            .expect("must be Int32Array");
+
+        assert_eq!(col.len(), 5, "must have 5 rows");
+        assert_eq!(
+            col.null_count(),
+            0,
+            "backfilled column must have no nulls — metadata was stripped if this fails"
+        );
+        for v in col.values() {
+            assert_eq!(
+                *v, 7i32,
+                "every row must equal the initial-default (7) — not 0 or null"
+            );
+        }
+
+        Ok(())
     }
 }

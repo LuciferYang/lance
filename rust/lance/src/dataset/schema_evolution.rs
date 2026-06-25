@@ -16,7 +16,10 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use datafusion::execution::SendableRecordBatchStream;
 use futures::stream::{StreamExt, TryStreamExt};
 use lance_arrow::SchemaExt;
-use lance_core::datatypes::{Field, Schema};
+use lance_core::datatypes::{
+    decode_default, validate_default_assignable, Field, Schema, LANCE_INITIAL_DEFAULT_META_KEY,
+    LANCE_WRITE_DEFAULT_META_KEY,
+};
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::constants::{PACKED_STRUCT_LEGACY_META_KEY, PACKED_STRUCT_META_KEY};
 use lance_encoding::version::LanceFileVersion;
@@ -327,13 +330,40 @@ pub(super) async fn add_columns_to_fragments(
         NewColumnTransform::AllNulls(output_schema) => {
             check_names(output_schema.as_ref())?;
 
-            // Check that the schema is compatible considering all the new columns must be nullable
             let schema = Schema::try_from(output_schema.as_ref())?;
-            if !schema.all_fields_nullable() {
-                return Err(Error::InvalidInput {
-                    source: "All-null columns must be nullable.".into(),
-                    location: location!(),
-                });
+            // A non-nullable column is allowed iff it carries an initial-default; without
+            // a default there is no value to backfill for pre-existing rows, which would
+            // violate the non-null contract.
+            for field in schema.fields_pre_order() {
+                if !field.nullable && !field.metadata.contains_key(LANCE_INITIAL_DEFAULT_META_KEY) {
+                    return Err(Error::InvalidInput {
+                        source: format!(
+                            "column '{}': non-nullable columns must carry an initial-default \
+                             value (lance-schema:initial-default) when added to an existing \
+                             dataset; provide a default or make the column nullable",
+                            field.name
+                        )
+                        .into(),
+                        location: location!(),
+                    });
+                }
+            }
+
+            // Validate any initial-default literals carried in the new field metadata.
+            // This must happen before commit so an invalid default is rejected early.
+            for field in schema.fields_pre_order() {
+                if let Some(literal) = field.metadata.get(LANCE_INITIAL_DEFAULT_META_KEY) {
+                    validate_default_assignable(field, literal).map_err(|e| {
+                        Error::InvalidInput {
+                            source: format!(
+                                "column '{}': invalid initial default value: {}",
+                                field.name, e
+                            )
+                            .into(),
+                            location: location!(),
+                        }
+                    })?;
+                }
             }
 
             let fragments = fragments
@@ -343,7 +373,7 @@ pub(super) async fn add_columns_to_fragments(
 
             // Check if any of the fragment's files are using the legacy dataset version if so, we
             // can't add all-null columns as a metadata-only operation. The reason is because we
-            // use the NullReader for fragments that have missing columns and we can't mix legacy
+            // use the DefaultReader for fragments that have missing columns and we can't mix legacy
             // and non-legacy readers when reading the fragment.
             if dataset.is_legacy_storage() {
                 return Err(Error::NotSupported {
@@ -586,6 +616,30 @@ pub(super) async fn alter_columns(
             );
             *field_dest = Field::try_from(&arrow_field)?;
             field_dest.set_id(field_src.parent_id, &mut next_field_id);
+
+            // Carry forward any column-default metadata. Rebuilding the field from a
+            // metadata-less Arrow field above would otherwise silently drop the
+            // initial/write-default keys, losing the stored default (so read-backfill
+            // would return NULL) and bypassing the Model B initial-default immutability
+            // guard (the rebuilt field gets a fresh id, so it looks newly-added).
+            for key in [LANCE_INITIAL_DEFAULT_META_KEY, LANCE_WRITE_DEFAULT_META_KEY] {
+                if let Some(literal) = field_src.metadata.get(key) {
+                    // The stored literal was encoded for the old type; it must still
+                    // decode under the new type or the default is no longer
+                    // representable and the cast must be rejected rather than dropped.
+                    decode_default(literal, data_type).map_err(|e| {
+                        Error::invalid_input(
+                            format!(
+                                "Cannot cast column \"{}\" to {:?}: its default value {:?} is not \
+                                 representable in the new type: {e}",
+                                alteration.path, data_type, literal
+                            ),
+                            location!(),
+                        )
+                    })?;
+                    field_dest.metadata.insert(key.to_string(), literal.clone());
+                }
+            }
 
             cast_fields.push((field_src.clone(), field_dest.clone()));
         }
@@ -1194,9 +1248,11 @@ mod test {
                 )
                 .await
                 .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("All-null columns must be nullable."));
+        assert!(
+            err.to_string()
+                .contains("non-nullable columns must carry an initial-default"),
+            "expected non-nullable-without-default error, got: {err}"
+        );
 
         let data = dataset.scan().try_into_batch().await?;
         let expected_schema = ArrowSchema::new(vec![
@@ -2088,6 +2144,183 @@ mod test {
         assert_eq!(ArrowSchema::from(dataset.schema()), expected_schema);
     }
 
+    // ── initial-default validation tests (Task 2.1) ──────────────────────────
+
+    /// Helper: create a v2 dataset with a single non-nullable Int32 "id" column
+    /// using the `memory://` URI (no temp directory needed).
+    async fn make_memory_dataset_v2() -> Result<Dataset> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1_i32, 2, 3]))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await
+    }
+
+    /// Task 2.1 — Test 1:
+    /// A valid initial-default (`"42"` for Int32) persists through the AllNulls
+    /// add-column path and is readable back from the committed schema.
+    #[tokio::test]
+    async fn test_add_column_all_nulls_valid_initial_default_persists() -> Result<()> {
+        let mut dataset = make_memory_dataset_v2().await?;
+        let version_before = dataset.version().version;
+
+        // Build an Arrow field that carries a valid initial-default literal.
+        let field_meta: HashMap<String, String> =
+            [(LANCE_INITIAL_DEFAULT_META_KEY.to_owned(), "42".to_owned())].into();
+        let new_field = ArrowField::new("score", DataType::Int32, true).with_metadata(field_meta);
+        let new_schema = Arc::new(ArrowSchema::new(vec![new_field]));
+
+        dataset
+            .add_columns(NewColumnTransform::AllNulls(new_schema), None, None)
+            .await?;
+
+        // Version must have advanced (commit happened).
+        assert!(
+            dataset.version().version > version_before,
+            "dataset version did not advance after valid default add"
+        );
+
+        // The committed Lance schema must carry the initial-default metadata on the new field.
+        let lance_schema = dataset.schema();
+        let committed_field = lance_schema
+            .field("score")
+            .expect("field 'score' must exist after add_columns");
+        let stored_literal = committed_field
+            .metadata
+            .get(LANCE_INITIAL_DEFAULT_META_KEY)
+            .cloned();
+        assert_eq!(
+            stored_literal.as_deref(),
+            Some("42"),
+            "initial-default literal must survive the AllNulls commit"
+        );
+
+        Ok(())
+    }
+
+    /// Task 2.1 — Test 2a:
+    /// An uncastable literal (e.g. `"not-an-int"` for Int32) must be rejected
+    /// at `add_columns` time with an error, and the dataset version must NOT advance.
+    #[tokio::test]
+    async fn test_add_column_all_nulls_invalid_literal_rejected() -> Result<()> {
+        let mut dataset = make_memory_dataset_v2().await?;
+        let version_before = dataset.version().version;
+
+        let field_meta: HashMap<String, String> = [(
+            LANCE_INITIAL_DEFAULT_META_KEY.to_owned(),
+            "not-an-int".to_owned(),
+        )]
+        .into();
+        let bad_field = ArrowField::new("score", DataType::Int32, true).with_metadata(field_meta);
+        let bad_schema = Arc::new(ArrowSchema::new(vec![bad_field]));
+
+        let err = dataset
+            .add_columns(NewColumnTransform::AllNulls(bad_schema), None, None)
+            .await
+            .expect_err("uncastable literal must be rejected");
+
+        assert!(
+            err.to_string().contains("invalid initial default value"),
+            "error message should mention 'invalid initial default value', got: {err}"
+        );
+        // Dataset version must NOT have advanced (no partial commit).
+        assert_eq!(
+            dataset.version().version,
+            version_before,
+            "dataset version must not advance on rejected default"
+        );
+
+        Ok(())
+    }
+
+    /// Task 2.1 — Test 2b:
+    /// A field carrying both an initial-default and the unenforced-PK metadata key must
+    /// be rejected.  In the AllNulls path, the Lance schema validator catches nullable PK
+    /// fields before our literal check fires; the test verifies the call errors out and
+    /// no partial commit is issued regardless of which guard fires first.
+    #[tokio::test]
+    async fn test_add_column_all_nulls_pk_field_with_default_rejected() -> Result<()> {
+        let mut dataset = make_memory_dataset_v2().await?;
+        let version_before = dataset.version().version;
+
+        // Carry both the initial-default AND the PK metadata key.
+        let field_meta: HashMap<String, String> = [
+            (LANCE_INITIAL_DEFAULT_META_KEY.to_owned(), "7".to_owned()),
+            // Use the raw string key rather than importing the constant to keep
+            // the test self-contained and easy to read.
+            (
+                "lance-schema:unenforced-primary-key".to_owned(),
+                "true".to_owned(),
+            ),
+        ]
+        .into();
+        let pk_field = ArrowField::new("pk_col", DataType::Int32, true).with_metadata(field_meta);
+        let pk_schema = Arc::new(ArrowSchema::new(vec![pk_field]));
+
+        let err = dataset
+            .add_columns(NewColumnTransform::AllNulls(pk_schema), None, None)
+            .await
+            .expect_err("PK field with initial-default must be rejected");
+
+        // The exact guard that fires depends on schema-layer ordering; the important
+        // invariant is that the call fails AND the dataset version does not advance.
+        // (Lance schema validation rejects nullable PK fields before our literal check
+        // fires, so the concrete error message is a schema error, not our validation one.)
+        assert!(
+            !err.to_string().is_empty(),
+            "expected a non-empty error for PK+default field, got empty string"
+        );
+        assert_eq!(
+            dataset.version().version,
+            version_before,
+            "dataset version must not advance when a PK+default column is rejected"
+        );
+
+        Ok(())
+    }
+
+    /// Task 2.1 — Test 3 (no-default field is unaffected):
+    /// A field without the initial-default key in its metadata must still be
+    /// accepted normally by the AllNulls path.
+    #[tokio::test]
+    async fn test_add_column_all_nulls_no_default_unaffected() -> Result<()> {
+        let mut dataset = make_memory_dataset_v2().await?;
+        let version_before = dataset.version().version;
+
+        // Plain nullable field — no default metadata at all.
+        let plain_field = ArrowField::new("extra", DataType::Int32, true);
+        let plain_schema = Arc::new(ArrowSchema::new(vec![plain_field]));
+
+        dataset
+            .add_columns(NewColumnTransform::AllNulls(plain_schema), None, None)
+            .await?;
+
+        assert!(
+            dataset.version().version > version_before,
+            "dataset version must advance for a plain all-null column"
+        );
+        assert!(
+            dataset.schema().field("extra").is_some(),
+            "field 'extra' must appear in the committed schema"
+        );
+
+        Ok(())
+    }
+
     #[test]
     fn test_check_field_conflict() {
         // same struct
@@ -2379,5 +2612,279 @@ mod test {
         .with_metadata(packed_meta);
         let field4 = ArrowField::new("test", DataType::Struct(vec![conflict_field].into()), false);
         assert!(check_field_conflict(&field1, &field4, &LanceFileVersion::V2_2).is_err());
+    }
+
+    // ── required (non-nullable) column with initial-default ──────────────────
+    // Tests for feat: support required (non-nullable) column with default.
+
+    /// Adding a non-nullable Int32 column with initial-default=42:
+    /// - commit succeeds
+    /// - existing rows read 42 (not null)
+    /// - null_count == 0
+    /// - the schema field is non-nullable
+    #[tokio::test]
+    async fn test_add_required_column_with_default_backfills_existing_rows() -> Result<()> {
+        use arrow_array::Int32Array as I32;
+        use arrow_schema::DataType;
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(I32::from(vec![1_i32, 2, 3]))])?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        let version_before = dataset.version().version;
+
+        // Build non-nullable field with initial-default = 42.
+        let field_meta: HashMap<String, String> =
+            [(LANCE_INITIAL_DEFAULT_META_KEY.to_owned(), "42".to_owned())].into();
+        let new_field = ArrowField::new("score", DataType::Int32, false).with_metadata(field_meta);
+        let new_schema = Arc::new(ArrowSchema::new(vec![new_field]));
+
+        dataset
+            .add_columns(NewColumnTransform::AllNulls(new_schema), None, None)
+            .await?;
+
+        // Version must advance.
+        assert!(
+            dataset.version().version > version_before,
+            "version must advance after adding required column with default"
+        );
+
+        // Schema field must be non-nullable.
+        let lance_schema = dataset.schema();
+        let committed_field = lance_schema
+            .field("score")
+            .expect("field 'score' must exist");
+        assert!(
+            !committed_field.nullable,
+            "committed field 'score' must be non-nullable"
+        );
+        assert_eq!(
+            committed_field
+                .metadata
+                .get(LANCE_INITIAL_DEFAULT_META_KEY)
+                .map(|s| s.as_str()),
+            Some("42"),
+            "initial-default must be preserved in committed schema"
+        );
+
+        // Read back: all existing rows must see 42, null_count == 0.
+        let batches = dataset
+            .scan()
+            .project(&["score"])
+            .unwrap()
+            .try_into_stream()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        assert!(!batches.is_empty(), "scan must return at least one batch");
+        let col_ref = batches[0]
+            .column_by_name("score")
+            .expect("column 'score' must be present");
+        assert_eq!(col_ref.len(), 3, "must have 3 rows");
+        assert_eq!(
+            col_ref.null_count(),
+            0,
+            "non-nullable column must have no nulls"
+        );
+        let col = col_ref
+            .as_any()
+            .downcast_ref::<I32>()
+            .expect("column must be Int32");
+        for v in col.values() {
+            assert_eq!(*v, 42_i32, "each existing row must read the default (42)");
+        }
+
+        Ok(())
+    }
+
+    /// Adding a non-nullable column WITHOUT a default must still be rejected.
+    #[tokio::test]
+    async fn test_add_required_column_without_default_rejected() -> Result<()> {
+        let mut dataset = make_memory_dataset_v2().await?;
+        let version_before = dataset.version().version;
+
+        // Non-nullable field, no metadata at all.
+        let new_field = ArrowField::new("score", DataType::Int32, false);
+        let new_schema = Arc::new(ArrowSchema::new(vec![new_field]));
+
+        let err = dataset
+            .add_columns(NewColumnTransform::AllNulls(new_schema), None, None)
+            .await
+            .expect_err("non-nullable column without default must be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("non-nullable columns must carry an initial-default"),
+            "error must mention initial-default requirement, got: {err}"
+        );
+        assert_eq!(
+            dataset.version().version,
+            version_before,
+            "version must not advance on rejection"
+        );
+
+        Ok(())
+    }
+
+    /// Appending rows that PROVIDE the non-nullable defaulted column works;
+    /// those rows read their provided values (not the default).
+    #[tokio::test]
+    async fn test_append_with_required_column_provided_values() -> Result<()> {
+        use arrow_array::Int32Array as I32;
+        use arrow_schema::DataType;
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(I32::from(vec![1_i32, 2]))])?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        let field_meta: HashMap<String, String> =
+            [(LANCE_INITIAL_DEFAULT_META_KEY.to_owned(), "42".to_owned())].into();
+        let new_field = ArrowField::new("score", DataType::Int32, false).with_metadata(field_meta);
+        let new_schema = Arc::new(ArrowSchema::new(vec![new_field]));
+        dataset
+            .add_columns(NewColumnTransform::AllNulls(new_schema), None, None)
+            .await?;
+
+        // Append rows providing explicit values for both columns.
+        let append_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("score", DataType::Int32, false),
+        ]));
+        let append_batch = RecordBatch::try_new(
+            append_schema.clone(),
+            vec![
+                Arc::new(I32::from(vec![3_i32, 4])),
+                Arc::new(I32::from(vec![99_i32, 100])),
+            ],
+        )?;
+        let append_reader = RecordBatchIterator::new(vec![Ok(append_batch)], append_schema);
+        dataset.append(append_reader, None).await?;
+
+        // Read all rows; first 2 get default (42), last 2 get their written values.
+        let batches = dataset
+            .scan()
+            .project(&["id", "score"])
+            .unwrap()
+            .try_into_stream()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let full = arrow_select::concat::concat_batches(&batches[0].schema(), batches.iter())?;
+        assert_eq!(full.num_rows(), 4);
+
+        let score_ref = full.column_by_name("score").unwrap();
+        assert_eq!(score_ref.null_count(), 0, "no nulls in non-nullable column");
+        let score_col = score_ref.as_any().downcast_ref::<I32>().unwrap();
+        let vals: Vec<i32> = score_col.values().to_vec();
+        assert_eq!(vals[0], 42, "row 0 (pre-existing) must read default 42");
+        assert_eq!(vals[1], 42, "row 1 (pre-existing) must read default 42");
+        assert_eq!(vals[2], 99, "row 2 (appended) must read written value 99");
+        assert_eq!(vals[3], 100, "row 3 (appended) must read written value 100");
+
+        Ok(())
+    }
+
+    /// Appending rows that OMIT a non-nullable column carrying only an initial-default
+    /// (Model A) is ALLOWED: the column is left structurally absent in the new fragment and the
+    /// read path (`DefaultReader`) backfills the non-null initial-default.  This matches the
+    /// Model A contract ("a column with no write-default is left structurally absent,
+    /// read-backfills initial") and "a required column with a default IS supported".
+    #[tokio::test]
+    async fn test_append_omitting_non_nullable_defaulted_column_is_allowed() -> Result<()> {
+        use arrow_array::Int32Array as I32;
+        use arrow_schema::DataType;
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(I32::from(vec![1_i32]))])?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        let field_meta: HashMap<String, String> =
+            [(LANCE_INITIAL_DEFAULT_META_KEY.to_owned(), "42".to_owned())].into();
+        let new_field = ArrowField::new("score", DataType::Int32, false).with_metadata(field_meta);
+        let new_schema = Arc::new(ArrowSchema::new(vec![new_field]));
+        dataset
+            .add_columns(NewColumnTransform::AllNulls(new_schema), None, None)
+            .await?;
+
+        // Append a batch that omits "score" — only provides "id".  The column carries only an
+        // initial-default (no write-default), so it is governed by Model A: the append succeeds
+        // and the omitted rows read the initial-default on subsequent reads.
+        let append_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let append_batch = RecordBatch::try_new(
+            append_schema.clone(),
+            vec![Arc::new(I32::from(vec![2_i32]))],
+        )?;
+        let append_reader = RecordBatchIterator::new(vec![Ok(append_batch)], append_schema);
+        dataset
+            .append(append_reader, None)
+            .await
+            .expect("appending without an initial-default-only column must succeed");
+
+        // Both the pre-existing absent row and the newly appended absent row read 42.
+        let batches = dataset
+            .scan()
+            .project(&["id", "score"])?
+            .scan_in_order(true)
+            .try_into_stream()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        let full = arrow_select::concat::concat_batches(&batches[0].schema(), batches.iter())?;
+        let score_ref = full.column_by_name("score").unwrap();
+        assert_eq!(
+            score_ref.null_count(),
+            0,
+            "non-null backfill must produce no nulls"
+        );
+        let score_col = score_ref.as_any().downcast_ref::<I32>().unwrap();
+        assert_eq!(score_col.values().to_vec(), vec![42, 42]);
+
+        Ok(())
     }
 }

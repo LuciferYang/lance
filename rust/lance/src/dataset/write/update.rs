@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -266,23 +266,169 @@ impl UpdateJob {
     }
 
     async fn execute_impl(self) -> Result<UpdateData> {
+        // Preserve structural absence for Model A columns (a mutable initial-default with no
+        // write-default).  Such a column is read-backfilled at scan time by `DefaultReader`, so a
+        // full-schema scan would materialise the *current* default into the rewritten data files,
+        // freezing the value and breaking the mutable-default contract (a later `set_column_default`
+        // would no longer affect the matched rows).  We therefore exclude any Model A column that is
+        // physically absent from a fragment from that fragment's rewrite, so it stays structurally
+        // absent and continues to be governed by the live read-time default.
+        //
+        // A column the update explicitly writes is never excluded (the update supplies new values).
+        // A column merely *referenced* by an update SET expression or the condition is also never
+        // excluded: those expressions are evaluated in `apply_updates` against the scanned batch, so
+        // the referenced column must be projected into the scan (it is materialised at its live
+        // default for these fragments, matching pre-feature behaviour) rather than being dropped,
+        // which would make the expression fail with a column-not-found error.
+        //
+        // Because a single rewritten fragment cannot represent a column with *mixed* presence
+        // (present in some source fragments, absent in others) without either freezing the absent
+        // rows or dropping the explicit values, we group the matched fragments by their Model A
+        // absent-set and rewrite each group independently — mirroring compaction's absent-set
+        // binning (see `optimize::model_a_absent_field_ids`).  Within a group every Model A column
+        // is uniformly present or absent, so a single write schema is valid.
+        let mut referenced_columns: HashSet<String> = HashSet::new();
+        for expr in self.updates.values() {
+            for col in datafusion::physical_expr::utils::collect_columns(expr) {
+                referenced_columns.insert(col.name().to_string());
+            }
+        }
+        if let Some(condition) = &self.condition {
+            for col in condition.column_refs() {
+                referenced_columns.insert(col.name.clone());
+            }
+        }
+
+        let model_a_fields: Vec<(i32, String)> = self
+            .dataset
+            .schema()
+            .fields
+            .iter()
+            .filter(|f| {
+                f.initial_default_raw().is_some()
+                    && f.write_default_raw().is_none()
+                    && !self.updates.contains_key(&f.name)
+                    && !referenced_columns.contains(&f.name)
+            })
+            .map(|f| (f.id, f.name.clone()))
+            .collect();
+
+        // Bin the dataset fragments by the set of Model A columns physically absent from them.
+        // The key is the sorted set of absent column names for that bin.
+        let mut groups: HashMap<Vec<String>, Vec<Fragment>> = HashMap::new();
+        for frag in self.dataset.get_fragments() {
+            let present: HashSet<i32> = frag
+                .metadata()
+                .files
+                .iter()
+                .flat_map(|file| file.fields.iter().copied())
+                .collect();
+            let mut absent: Vec<String> = model_a_fields
+                .iter()
+                .filter(|(id, _)| !present.contains(id))
+                .map(|(_, name)| name.clone())
+                .collect();
+            absent.sort();
+            groups
+                .entry(absent)
+                .or_default()
+                .push(frag.metadata().clone());
+        }
+
+        let version = self
+            .dataset
+            .manifest()
+            .data_storage_format
+            .lance_file_version()?;
+        let stable_row_ids = self.dataset.manifest.uses_stable_row_ids();
+        let row_id_index = get_row_id_index(&self.dataset).await?;
+
+        // Accumulate the new fragments produced across all groups and the union of all removed
+        // row addresses (used once at the end to apply deletions to the source fragments).
+        let mut new_fragments: Vec<Fragment> = Vec::new();
+        let mut all_removed_addrs = RoaringTreemap::new();
+
+        for (absent_default_columns, group_fragments) in groups {
+            let (group_new_fragments, removed_addrs) = self
+                .rewrite_group(
+                    group_fragments,
+                    &absent_default_columns,
+                    version,
+                    stable_row_ids,
+                    row_id_index.as_deref(),
+                )
+                .await?;
+            new_fragments.extend(group_new_fragments);
+            all_removed_addrs |= removed_addrs;
+        }
+
+        // Apply deletions for the union of all matched rows.
+        let row_addrs = Arc::new(all_removed_addrs);
+        let (old_fragments, removed_fragment_ids) = self.apply_deletions(&row_addrs).await?;
+        let affected_rows = RowAddrTreeMap::from(row_addrs.as_ref().clone());
+
+        let num_updated_rows = new_fragments
+            .iter()
+            .map(|f| f.physical_rows.unwrap() as u64)
+            .sum::<u64>();
+
+        Ok(UpdateData {
+            removed_fragment_ids,
+            old_fragments,
+            new_fragments,
+            affected_rows,
+            num_updated_rows,
+        })
+    }
+
+    /// Rewrite the matched rows of a single absent-set group into new fragments.
+    ///
+    /// `absent_default_columns` are the Model A columns (sorted by name) that are structurally
+    /// absent from *every* fragment in this group; they are projected out of both the scan and the
+    /// write schema so they remain structurally absent (and read-backfilled by the live default) in
+    /// the rewritten fragments.  Returns the new fragments and the set of source row addresses that
+    /// were rewritten (to be deleted from the source fragments).
+    async fn rewrite_group(
+        &self,
+        group_fragments: Vec<Fragment>,
+        absent_default_columns: &[String],
+        version: lance_file::version::LanceFileVersion,
+        stable_row_ids: bool,
+        row_id_index: Option<&lance_table::rowids::RowIdIndex>,
+    ) -> Result<(Vec<Fragment>, RoaringTreemap)> {
         let mut scanner = self.dataset.scan();
         scanner.with_row_id();
+        scanner.with_fragments(group_fragments);
 
         if let Some(expr) = &self.condition {
             scanner.filter_expr(expr.clone());
         }
 
+        let absent_set: HashSet<&str> = absent_default_columns.iter().map(|s| s.as_str()).collect();
+        let write_schema = if absent_set.is_empty() {
+            self.dataset.schema().clone()
+        } else {
+            let kept_columns: Vec<&str> = self
+                .dataset
+                .schema()
+                .fields
+                .iter()
+                .map(|f| f.name.as_str())
+                .filter(|name| !absent_set.contains(name))
+                .collect();
+            scanner.project(&kept_columns)?;
+            self.dataset.schema().project(&kept_columns)?
+        };
+
         let stream = scanner.try_into_stream().await?.into();
 
         // We keep track of seen row ids so we can delete them from the existing
         // fragments and then set the row id segments in the new fragments.
-        let (stream, row_id_rx) =
-            make_rowid_capture_stream(stream, self.dataset.manifest.uses_stable_row_ids())?;
+        let (stream, row_id_rx) = make_rowid_capture_stream(stream, stable_row_ids)?;
 
         let schema = stream.schema();
 
-        let expected_schema = self.dataset.schema().into();
+        let expected_schema = (&write_schema).into();
         if schema.as_ref() != &expected_schema {
             return Err(Error::Internal {
                 message: format!("Expected schema {:?} but got {:?}", expected_schema, schema),
@@ -304,16 +450,11 @@ impl UpdateJob {
             });
         let stream = RecordBatchStreamAdapter::new(schema, stream);
 
-        let version = self
-            .dataset
-            .manifest()
-            .data_storage_format
-            .lance_file_version()?;
         let (mut new_fragments, _) = write_fragments_internal(
             Some(&self.dataset),
             self.dataset.object_store.clone(),
             &self.dataset.base,
-            self.dataset.schema().clone(),
+            write_schema,
             Box::pin(stream),
             WriteParams::with_storage_version(version),
             None, // TODO: support multiple bases for update
@@ -347,24 +488,8 @@ impl UpdateJob {
             }
         }
 
-        // Apply deletions
-        let row_id_index = get_row_id_index(&self.dataset).await?;
-        let row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref());
-        let (old_fragments, removed_fragment_ids) = self.apply_deletions(&row_addrs).await?;
-        let affected_rows = RowAddrTreeMap::from(row_addrs.as_ref().clone());
-
-        let num_updated_rows = new_fragments
-            .iter()
-            .map(|f| f.physical_rows.unwrap() as u64)
-            .sum::<u64>();
-
-        Ok(UpdateData {
-            removed_fragment_ids,
-            old_fragments,
-            new_fragments,
-            affected_rows,
-            num_updated_rows,
-        })
+        let removed_addrs = removed_row_ids.row_addrs(row_id_index).into_owned();
+        Ok((new_fragments, removed_addrs))
     }
 
     async fn commit_impl(
@@ -1348,6 +1473,333 @@ mod tests {
             assert!(fragment_id < 2,
                     "vec index bitmap should not contain fragments with unindexed data, found fragment {}",
                     fragment_id);
+        }
+    }
+
+    /// Regression: updating one column must NOT freeze the live initial-default of a *different*
+    /// Model A column (a mutable initial-default with no write-default) for the rewritten rows.
+    /// Such a column is structurally absent and read-backfilled at scan time; the update rewrite
+    /// path must keep it structurally absent so a later `set_column_default` still updates the
+    /// matched rows retroactively.
+    #[tokio::test]
+    async fn test_update_preserves_mutable_initial_default_for_absent_column() {
+        use crate::dataset::schema_evolution::NewColumnTransform;
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Int32Type;
+        use arrow_array::Array;
+        use lance_core::datatypes::LANCE_INITIAL_DEFAULT_META_KEY;
+
+        // Single fragment with an updatable column `id` only, v2 storage.
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(0..4))],
+        )
+        .unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+        let batches = RecordBatchIterator::new([Ok(batch)], arrow_schema.clone());
+        let mut dataset = Dataset::write(
+            batches,
+            test_uri,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Add Model A column `c` (initial-default only, no write-default), absent in all rows.
+        let c_field =
+            Field::new("c", DataType::Int32, true).with_metadata(std::collections::HashMap::from(
+                [(LANCE_INITIAL_DEFAULT_META_KEY.to_string(), "42".to_string())],
+            ));
+        dataset
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![c_field]))),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        dataset.checkout_latest().await.unwrap();
+
+        // Update a DIFFERENT column (`id`) on a subset of rows, leaving `c` untouched.
+        let result = UpdateBuilder::new(Arc::new(dataset.clone()))
+            .update_where("id < 2")
+            .unwrap()
+            .set("id", "id + 100")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        dataset = Arc::try_unwrap(result.new_dataset).unwrap_or_else(|ds| (*ds).clone());
+
+        // Changing the default must retroactively affect ALL rows, including the rewritten ones,
+        // because `c` stayed structurally absent.
+        dataset.set_column_default("c", "77").await.unwrap();
+        dataset.checkout_latest().await.unwrap();
+
+        let batch = dataset
+            .scan()
+            .project(&["id", "c"])
+            .unwrap()
+            .scan_in_order(true)
+            .try_into_batch()
+            .await
+            .unwrap();
+        let c = batch
+            .column_by_name("c")
+            .unwrap()
+            .as_primitive::<Int32Type>();
+        assert_eq!(c.null_count(), 0, "update must not introduce nulls in `c`");
+        assert!(
+            (0..c.len()).all(|i| c.value(i) == 77),
+            "all rows (including rewritten ones) must reflect the new default 77, got {c:?}"
+        );
+    }
+
+    /// Regression: an Update whose SET expression *references* a structurally-absent Model A column
+    /// (added later with an initial-default only) must succeed.  The referenced column is projected
+    /// out of the scan only when it is neither a target nor a reference; here it is a reference, so
+    /// it must be kept in the scan projection and materialised at its live default so the expression
+    /// can evaluate.  Before the fix this failed with a column-not-found error.
+    #[tokio::test]
+    async fn test_update_set_expr_references_absent_model_a_column() {
+        use crate::dataset::schema_evolution::NewColumnTransform;
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Int64Type;
+        use lance_core::datatypes::LANCE_INITIAL_DEFAULT_META_KEY;
+
+        // Single fragment with `id` and `total`, v2 storage.
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("total", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..4)),
+                Arc::new(Int64Array::from(vec![0_i64; 4])),
+            ],
+        )
+        .unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+        let batches = RecordBatchIterator::new([Ok(batch)], arrow_schema.clone());
+        let mut dataset = Dataset::write(
+            batches,
+            test_uri,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Add Model A column `base` (initial-default 10, no write-default), structurally absent.
+        let base_field = Field::new("base", DataType::Int64, true).with_metadata(
+            std::collections::HashMap::from([(
+                LANCE_INITIAL_DEFAULT_META_KEY.to_string(),
+                "10".to_string(),
+            )]),
+        );
+        dataset
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![base_field]))),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        dataset.checkout_latest().await.unwrap();
+
+        // UPDATE SET total = base + 1, where `base` is the absent Model A column. This must not
+        // error: `base` is read-backfilled at its live default (10) for the matched fragment.
+        let result = UpdateBuilder::new(Arc::new(dataset.clone()))
+            .update_where("id < 2")
+            .unwrap()
+            .set("total", "base + 1")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        dataset = Arc::try_unwrap(result.new_dataset).unwrap_or_else(|ds| (*ds).clone());
+
+        let batch = dataset
+            .scan()
+            .project(&["id", "total"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let id = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_primitive::<Int64Type>();
+        let total = batch
+            .column_by_name("total")
+            .unwrap()
+            .as_primitive::<Int64Type>();
+        // Build an id -> total map so the assertion is independent of physical row order
+        // (matched rows are rewritten and appended).
+        let mut by_id: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+        for i in 0..batch.num_rows() {
+            by_id.insert(id.value(i), total.value(i));
+        }
+        // Matched rows (id 0,1) become base(10) + 1 = 11; untouched rows (id 2,3) stay 0.
+        assert_eq!(by_id.get(&0), Some(&11), "row id=0 must be base(10)+1=11");
+        assert_eq!(by_id.get(&1), Some(&11), "row id=1 must be base(10)+1=11");
+        assert_eq!(by_id.get(&2), Some(&0), "row id=2 untouched");
+        assert_eq!(by_id.get(&3), Some(&0), "row id=3 untouched");
+    }
+
+    /// Regression: an Update that rewrites rows must NOT freeze the live initial-default of a
+    /// Model A column with MIXED physical presence across fragments — absent in some source
+    /// fragments (added via `add_columns(AllNulls)`) and present in others (an append that
+    /// explicitly carried the column).  The originally-absent rows that get rewritten must stay
+    /// structurally absent so a later `set_column_default` still updates them, while
+    /// explicitly-written values are preserved.  Mirrors
+    /// `optimize::test_compaction_preserves_mutable_initial_default_mixed_presence`.
+    #[tokio::test]
+    async fn test_update_preserves_mutable_initial_default_mixed_presence() {
+        use crate::dataset::schema_evolution::NewColumnTransform;
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Int32Type;
+        use arrow_array::{Array, Int32Array};
+        use lance_core::datatypes::LANCE_INITIAL_DEFAULT_META_KEY;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        // Old fragment of column `a` only (will be absent in `c`).
+        let schema_a = Arc::new(ArrowSchema::new(vec![Field::new(
+            "a",
+            DataType::Int32,
+            true,
+        )]));
+        let batch_a = RecordBatch::try_new(
+            schema_a.clone(),
+            vec![Arc::new(Int32Array::from(vec![1_i32, 2]))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch_a)], schema_a.clone()),
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 1024,
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Add Model A column `c` (initial-default only, no write-default).  Absent in the old
+        // fragment (metadata-only AllNulls).
+        let c_field =
+            Field::new("c", DataType::Int32, true).with_metadata(std::collections::HashMap::from(
+                [(LANCE_INITIAL_DEFAULT_META_KEY.to_string(), "42".to_string())],
+            ));
+        dataset
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![c_field]))),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Append a batch that explicitly includes `c` → present in the new fragment, absent in the
+        // old one (mixed presence).
+        let schema_ac = Arc::new(ArrowSchema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("c", DataType::Int32, true),
+        ]));
+        let batch_ac = RecordBatch::try_new(
+            schema_ac.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![3_i32, 4])),
+                Arc::new(Int32Array::from(vec![100_i32, 200])),
+            ],
+        )
+        .unwrap();
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch_ac)], schema_ac),
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 1024,
+                mode: WriteMode::Append,
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.checkout_latest().await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        // Update `a` for rows spanning BOTH fragments (a=1 from the absent fragment, a=3 from the
+        // present fragment), leaving `c` untouched.  This rewrites matched rows from a
+        // mixed-presence set; the absent-fragment row must remain structurally absent in `c`.
+        let result = UpdateBuilder::new(Arc::new(dataset.clone()))
+            .update_where("a = 1 OR a = 3")
+            .unwrap()
+            .set("a", "a + 1000")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        dataset = Arc::try_unwrap(result.new_dataset).unwrap_or_else(|ds| (*ds).clone());
+
+        // Change the default → originally-absent rows (a was 1 and 2) must reflect it; explicitly
+        // written `c` values (rows where a was 3 and 4) must be preserved, not frozen-to-default.
+        dataset.set_column_default("c", "77").await.unwrap();
+        dataset.checkout_latest().await.unwrap();
+
+        let batch = dataset
+            .scan()
+            .project(&["a", "c"])
+            .unwrap()
+            .scan_in_order(true)
+            .try_into_batch()
+            .await
+            .unwrap();
+        let a = batch
+            .column_by_name("a")
+            .unwrap()
+            .as_primitive::<Int32Type>();
+        let c = batch
+            .column_by_name("c")
+            .unwrap()
+            .as_primitive::<Int32Type>();
+        assert_eq!(c.null_count(), 0, "update must not introduce nulls in `c`");
+        for i in 0..a.len() {
+            let expected = match a.value(i) {
+                1001 | 2 => 77, // originally absent (a was 1, 2) → follows the new live default
+                1003 => 100,    // explicitly written → preserved
+                4 => 200,       // explicitly written → preserved
+                other => panic!("unexpected a value {other}"),
+            };
+            assert_eq!(
+                c.value(i),
+                expected,
+                "row a={} must read c={expected}, got {}",
+                a.value(i),
+                c.value(i)
+            );
         }
     }
 }

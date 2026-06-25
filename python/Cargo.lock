@@ -3979,6 +3979,7 @@ version = "2.0.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
+ "arrow-cast",
  "arrow-schema",
  "async-trait",
  "byteorder",

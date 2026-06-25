@@ -23,6 +23,7 @@ use arrow_array::{cast::AsArray, Array, FixedSizeListArray, Float32Array, UInt32
 use arrow_data::ArrayData;
 use arrow_schema::DataType;
 use lance::datatypes::Schema;
+use lance_core::datatypes::{decode_default, encode_default};
 use lance::Result;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_file::previous::writer::FileWriter as PreviousFileWriter;
@@ -311,4 +312,71 @@ impl<'py> IntoPyObject<'py> for PyLance<&i32> {
     fn into_pyobject(self, py: Python<'py>) -> PyResult<Self::Output> {
         self.0.into_bound_py_any(py)
     }
+}
+
+/// Decode a canonical JSON single-value string back into a length-1 pyarrow Array.
+///
+/// This is the inverse of :func:`_encode_default_value`. It parses the JSON
+/// literal and materialises a one-element Arrow array whose data type matches
+/// *datatype*.
+///
+/// Parameters
+/// ----------
+/// json : str
+///     The JSON-encoded default value string produced by ``_encode_default_value``
+///     or stored under the ``lance-schema:initial-default`` metadata key.
+/// datatype : pyarrow.DataType
+///     The Arrow data type to use for the resulting array. Must be a supported
+///     primitive type (integers, floats, bool, utf8, binary, decimal, timestamp,
+///     date32).
+///
+/// Returns
+/// -------
+/// pyarrow.Array
+///     A length-1 Arrow array containing the decoded value.
+///
+/// Raises
+/// ------
+/// ValueError
+///     If *json* is not valid JSON, the type is unsupported, or the value
+///     cannot be represented in *datatype* (e.g. out-of-range integer).
+#[pyfunction(name = "_decode_default_value")]
+pub fn decode_default_value<'py>(
+    py: Python<'py>,
+    json: &str,
+    datatype: arrow::pyarrow::PyArrowType<DataType>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let arr = decode_default(json, &datatype.0)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    arr.to_data().to_pyarrow(py)
+}
+
+/// Encode element 0 of a length-1 pyarrow Array as a canonical JSON single-value
+/// string suitable for storage as the ``lance-schema:initial-default`` field
+/// metadata value.
+///
+/// Parameters
+/// ----------
+/// array : pyarrow.Array
+///     A length-1 pyarrow array containing the default value to encode.
+///     The array must have exactly one element; its Arrow data type determines
+///     the JSON encoding (see :func:`lance_core::datatypes::encode_default`).
+///
+/// Returns
+/// -------
+/// str
+///     The JSON-encoded default value string, e.g. ``"42"`` for an int32
+///     or ``'"hello"'`` for a utf8 string.
+///
+/// Raises
+/// ------
+/// ValueError
+///     If the array is empty, the type is unsupported (nested types,
+///     dictionary, run-end-encoded), or the value cannot be represented
+///     in JSON (e.g. NaN / Infinity for floats).
+#[pyfunction(name = "_encode_default_value")]
+pub fn encode_default_value(array: &Bound<'_, PyAny>) -> PyResult<String> {
+    let data = ArrayData::from_pyarrow_bound(array)?;
+    let arr = arrow_array::make_array(data);
+    encode_default(&arr).map_err(|e| PyValueError::new_err(e.to_string()))
 }

@@ -51,7 +51,13 @@ use crate::dataset::transaction::UpdateMode::RewriteRows;
 use crate::index::mem_wal::update_mem_wal_index_merged_generations;
 use crate::utils::temporal::timestamp_to_nanos;
 use deepsize::DeepSizeOf;
-use lance_core::{datatypes::BlobVersion, datatypes::Schema, Error, Result};
+use lance_core::{
+    datatypes::{
+        decode_default, BlobVersion, Schema, LANCE_INITIAL_DEFAULT_META_KEY,
+        LANCE_WRITE_DEFAULT_META_KEY,
+    },
+    Error, Result,
+};
 use lance_file::{datatypes::Fields, version::LanceFileVersion};
 use lance_index::mem_wal::MergedGeneration;
 use lance_index::{frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index};
@@ -1544,6 +1550,161 @@ impl Transaction {
         Ok((manifest, indices))
     }
 
+    /// Enforce column-default constraints on the post-commit schema.
+    ///
+    /// Two invariants are checked (at the single point where both the prior
+    /// manifest and the post-commit schema are in scope):
+    ///
+    /// 1. **`initial-default` immutability** (gated on Model B + `apply_immutability`):
+    ///    If `column_defaults_model_b_enabled(prior_manifest)` is true AND
+    ///    `apply_immutability` is true, any field id that existed in the prior
+    ///    schema and carried an `initial-default` must carry the *same decoded
+    ///    scalar* in the post-commit schema.  Dropping or changing the value is
+    ///    rejected.  Newly added field ids may set `initial-default` freely.
+    ///
+    ///    Pass `apply_immutability = false` for operations that replace the schema
+    ///    wholesale (`Overwrite`, `Restore`) rather than evolving existing column
+    ///    identities in place.  `Overwrite` assigns fresh field ids from 0, so a
+    ///    coincident id is not semantically the same column; the immutability
+    ///    guarantee does not cross an `Overwrite`/`Restore` boundary.
+    ///
+    /// 2. **PK + default co-presence** (always-on, both models):
+    ///    Any field in the post-commit schema that simultaneously carries a
+    ///    default key (`initial-default` or `write-default`) AND is an
+    ///    unenforced primary key (`is_unenforced_pk_raw()`) is rejected,
+    ///    regardless of `apply_immutability`.
+    fn enforce_default_constraints(
+        prior_manifest: &Manifest,
+        post_schema: &Schema,
+        apply_immutability: bool,
+    ) -> Result<()> {
+        let model_b = super::default_values::column_defaults_model_b_enabled(prior_manifest);
+        let prior_schema = &prior_manifest.schema;
+
+        // ── (1) initial-default immutability — gated on Model B ───────────────
+        // Only applies to in-place schema-evolution operations (UpdateConfig,
+        // Merge, Project) where column identity (field id) is preserved across
+        // the commit.  Overwrite and Restore are full replacements and are
+        // exempt (`apply_immutability == false`).
+        if model_b && apply_immutability {
+            for post_field in post_schema.fields_pre_order() {
+                let Some(prior_field) = prior_schema.field_by_id(post_field.id) else {
+                    // Newly added field — allowed to set initial-default freely.
+                    continue;
+                };
+                let prior_initial = prior_field
+                    .metadata
+                    .get(LANCE_INITIAL_DEFAULT_META_KEY)
+                    .cloned();
+                let post_initial = post_field
+                    .metadata
+                    .get(LANCE_INITIAL_DEFAULT_META_KEY)
+                    .cloned();
+
+                match (prior_initial, post_initial) {
+                    // Prior had no initial-default → no constraint on the post state.
+                    (None, _) => {}
+                    // Prior had initial-default, post drops it → rejected.
+                    (Some(prior_json), None) => {
+                        return Err(Error::invalid_input(
+                            format!(
+                                "field '{}' (id={}) had an initial-default ({prior_json:?}) but \
+                                 it was dropped in this transaction; \
+                                 initial-default is immutable once set (Model B active)",
+                                post_field.name, post_field.id,
+                            ),
+                            location!(),
+                        ));
+                    }
+                    // Both present — compare decoded scalars; forbid a different value.
+                    (Some(prior_json), Some(post_json)) => {
+                        // Same string → definitely the same value (fast path).
+                        if prior_json == post_json {
+                            continue;
+                        }
+                        // Different strings — decode and compare scalars to allow
+                        // equivalent re-encodings (e.g. "42" vs "42.0").
+                        let dt = post_field.data_type();
+                        let prior_arr = decode_default(&prior_json, &dt).map_err(|e| {
+                            Error::invalid_input(
+                                format!(
+                                    "field '{}' (id={}): could not decode prior initial-default \
+                                     {prior_json:?}: {e}",
+                                    post_field.name, post_field.id,
+                                ),
+                                location!(),
+                            )
+                        })?;
+                        let post_arr = decode_default(&post_json, &dt).map_err(|e| {
+                            Error::invalid_input(
+                                format!(
+                                    "field '{}' (id={}): could not decode new initial-default \
+                                     {post_json:?}: {e}",
+                                    post_field.name, post_field.id,
+                                ),
+                                location!(),
+                            )
+                        })?;
+                        if prior_arr.as_ref() != post_arr.as_ref() {
+                            return Err(Error::invalid_input(
+                                format!(
+                                    "field '{}' (id={}) initial-default changed from \
+                                     {prior_json:?} to {post_json:?}; \
+                                     initial-default is immutable once set (Model B active)",
+                                    post_field.name, post_field.id,
+                                ),
+                                location!(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── (2) PK + default co-presence — always-on ──────────────────────────
+        Self::enforce_pk_default_co_presence(post_schema)?;
+
+        Ok(())
+    }
+
+    /// Reject any field that is simultaneously an unenforced primary key and
+    /// carries a column default (`initial-default` or `write-default`).
+    ///
+    /// This invariant is always-on and independent of any prior manifest, so it
+    /// must run for brand-new dataset `Create` as well as in-place evolution.
+    fn enforce_pk_default_co_presence(post_schema: &Schema) -> Result<()> {
+        for post_field in post_schema.fields_pre_order() {
+            let has_initial = post_field
+                .metadata
+                .contains_key(LANCE_INITIAL_DEFAULT_META_KEY);
+            let has_write = post_field
+                .metadata
+                .contains_key(LANCE_WRITE_DEFAULT_META_KEY);
+            if (has_initial || has_write) && post_field.is_unenforced_pk_raw() {
+                let which = if has_initial && has_write {
+                    format!(
+                        "both '{LANCE_INITIAL_DEFAULT_META_KEY}' and '{LANCE_WRITE_DEFAULT_META_KEY}'"
+                    )
+                } else if has_initial {
+                    format!("'{LANCE_INITIAL_DEFAULT_META_KEY}'")
+                } else {
+                    format!("'{LANCE_WRITE_DEFAULT_META_KEY}'")
+                };
+                return Err(Error::invalid_input(
+                    format!(
+                        "field '{}' (id={}) is an unenforced primary-key column and cannot \
+                         also carry a column default ({}); \
+                         remove the default or the primary-key designation before committing",
+                        post_field.name, post_field.id, which,
+                    ),
+                    location!(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Create a new manifest from the current manifest and the transaction.
     ///
     /// `current_manifest` should only be None if the dataset does not yet exist.
@@ -2288,6 +2449,28 @@ impl Transaction {
 
         if let Some(next_row_id) = next_row_id {
             manifest.next_row_id = next_row_id;
+        }
+
+        // ── Column-default enforcement ─────────────────────────────────────────
+        // Run after all schema mutations are finalized (including UpdateConfig
+        // field_metadata_updates applied above).
+        if let Some(prior) = current_manifest {
+            // The immutability check only applies to operations that evolve the
+            // schema in-place while preserving column identity (field ids are the
+            // same column as before).  Overwrite and Restore replace the schema
+            // wholesale — see enforce_default_constraints for the full rationale.
+            let apply_immutability = matches!(
+                self.operation,
+                Operation::UpdateConfig { .. }
+                    | Operation::Merge { .. }
+                    | Operation::Project { .. }
+            );
+            Self::enforce_default_constraints(prior, &manifest.schema, apply_immutability)?;
+        } else {
+            // Brand-new dataset (Create): there is no prior manifest to compare
+            // against, but the always-on PK + default co-presence invariant must
+            // still hold for the freshly committed schema.
+            Self::enforce_pk_default_co_presence(&manifest.schema)?;
         }
 
         Ok((manifest, final_indices))

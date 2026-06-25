@@ -2772,6 +2772,73 @@ impl Dataset {
         let builder = ds.delta();
         Ok(DatasetDeltaBuilder { builder })
     }
+
+    /// Set or update the ``lance-schema:initial-default`` metadata key for an
+    /// existing top-level column.
+    ///
+    /// Unlike :meth:`update_field_metadata`, this method applies the §1.4a
+    /// scalar-index guard (raises an error if the column is covered by a scalar
+    /// index) and validates *default_literal* against the column's type.
+    ///
+    /// Parameters
+    /// ----------
+    /// column : str
+    ///     The top-level column name (dotted paths are not supported).
+    /// default_literal : str
+    ///     The canonical JSON single-value string produced by
+    ///     :func:`_encode_default_value`.
+    ///
+    /// Raises
+    /// ------
+    /// IOError
+    ///     If the column does not exist, the value is invalid for the column's
+    ///     type, or the column has a covering scalar index (§1.4a guard).
+    fn set_column_default_json(
+        &mut self,
+        column: &str,
+        default_literal: &str,
+    ) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        let column = column.to_string();
+        let default_literal = default_literal.to_string();
+        rt().block_on(None, async move {
+            new_self.set_column_default(&column, &default_literal).await?;
+            Ok(new_self)
+        })?
+        .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))
+        .map(|new_self| {
+            self.ds = Arc::new(new_self);
+        })
+    }
+
+    /// Remove the ``lance-schema:initial-default`` metadata key from an existing
+    /// top-level column.
+    ///
+    /// Unlike :meth:`update_field_metadata`, this method applies the §1.4a
+    /// scalar-index guard (raises an error if the column is covered by a scalar
+    /// index).  No-ops gracefully if the key was not set.
+    ///
+    /// Parameters
+    /// ----------
+    /// column : str
+    ///     The top-level column name (dotted paths are not supported).
+    ///
+    /// Raises
+    /// ------
+    /// IOError
+    ///     If the column does not exist or it has a covering scalar index.
+    fn remove_column_default(&mut self, column: &str) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        let column = column.to_string();
+        rt().block_on(None, async move {
+            new_self.remove_column_default(&column).await?;
+            Ok(new_self)
+        })?
+        .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))
+        .map(|new_self| {
+            self.ds = Arc::new(new_self);
+        })
+    }
 }
 
 #[pyclass(name = "SqlQuery", module = "_lib", subclass)]
