@@ -34,6 +34,9 @@ use crate::system_index::mem_wal::{
     new_mem_wal_index_meta, update_mem_wal_index_compacted_sstables,
 };
 use crate::transaction::UpdateMode::{RewriteColumns, RewriteRows};
+use crate::transaction::column_defaults::{
+    enforce_default_constraints, enforce_pk_default_co_presence,
+};
 use crate::transaction::row_version::resolve_update_version_metadata;
 use crate::transaction::update_map::apply_update_map;
 use crate::transaction::validate::merge_fragment_physically_rewritten;
@@ -1708,6 +1711,30 @@ impl Transaction {
             manifest.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
             manifest.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
         }
+
+        // Column-default enforcement, after every schema mutation is finalized
+        // (including the UpdateConfig field_metadata_updates applied above).
+        match current_manifest {
+            Some(prior) => {
+                // The immutability check only applies to operations that evolve
+                // the schema in-place while preserving column identity (field
+                // ids are the same column as before).  Overwrite and Restore
+                // replace the schema wholesale — see
+                // enforce_default_constraints for the full rationale.
+                let apply_immutability = matches!(
+                    self.operation,
+                    Operation::UpdateConfig { .. }
+                        | Operation::Merge { .. }
+                        | Operation::Project { .. }
+                );
+                enforce_default_constraints(prior, &manifest.schema, apply_immutability)?;
+            }
+            // Brand-new dataset: there is no prior manifest to compare against,
+            // but the always-on PK + default co-presence invariant must still
+            // hold for the freshly committed schema.
+            None => enforce_pk_default_co_presence(&manifest.schema)?,
+        }
+
         Ok((manifest, final_indices))
     }
 

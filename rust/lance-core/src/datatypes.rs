@@ -13,13 +13,19 @@ use arrow_schema::{DataType, Field as ArrowField, Fields, TimeUnit};
 use lance_arrow::bfloat16::{BFLOAT16_EXT_NAME, is_bfloat16_field};
 use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
 
+pub mod default_value;
 mod field;
 mod schema;
 
 use crate::{Error, Result};
+pub use default_value::{
+    DefaultValueError, DefaultValueResult, decode_default, encode_default,
+    validate_default_assignable,
+};
 pub use field::{
-    BlobVersion, Encoding, Field, LANCE_UNENFORCED_CLUSTERING_KEY_POSITION,
-    LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION, NullabilityComparison,
+    BlobVersion, Encoding, Field, LANCE_INITIAL_DEFAULT_META_KEY,
+    LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, LANCE_UNENFORCED_PRIMARY_KEY,
+    LANCE_UNENFORCED_PRIMARY_KEY_POSITION, LANCE_WRITE_DEFAULT_META_KEY, NullabilityComparison,
     OnTypeMismatch, SchemaCompareOptions,
 };
 pub use schema::{

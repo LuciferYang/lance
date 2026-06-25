@@ -19,6 +19,7 @@
 //! operation          the vocabulary of changes an operation can describe
 //! update_map         incremental edits to the manifest's string maps
 //! validate           pre-commit checks against the manifest being replaced
+//! column_defaults    the column-default invariants the new manifest must hold
 //! manifest_build     applying an operation to produce the next manifest
 //! index_maintenance  how that narrows or drops index metadata
 //! row_version        how it assigns row ids and per-row version metadata
@@ -27,6 +28,7 @@
 //! ```
 
 mod builder;
+mod column_defaults;
 mod conflicts;
 mod index_maintenance;
 mod manifest_build;
@@ -40,6 +42,7 @@ mod validate;
 pub(crate) mod test_support;
 
 pub use builder::{Transaction, TransactionBuilder};
+pub use column_defaults::{COLUMN_DEFAULTS_MODEL_CONFIG_KEY, column_defaults_model_b_enabled};
 pub use manifest_build::RANGE_SEGMENTS_CONFIG_KEY;
 pub use operation::{
     DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, UpdateMode,

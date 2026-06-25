@@ -64,6 +64,7 @@ use std::ptr::NonNull;
 pub(crate) mod arrow;
 pub(crate) mod bitmap;
 pub(crate) mod blob;
+pub(crate) mod capabilities;
 #[cfg(feature = "datagen")]
 pub(crate) mod datagen;
 pub(crate) mod dataset;
@@ -95,6 +96,8 @@ use crate::tracing::{PyTraceEvent, capture_trace_events, shutdown_tracing};
 pub use crate::tracing::{TraceGuard, trace_to_chrome};
 use crate::utils::Hnsw;
 use crate::utils::KMeans;
+use crate::utils::{decode_default_value, encode_default_value};
+pub use capabilities::register_capabilities;
 pub use dataset::Dataset;
 pub use dataset::serialize_row_addrs;
 pub use dataset::write_dataset;
@@ -325,6 +328,8 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<mem_wal::PyLsmVectorSearchPlanner>()?;
     m.add_wrapped(wrap_pyfunction!(mem_wal::py_evaluate_sharding_spec))?;
     m.add_wrapped(wrap_pyfunction!(mem_wal::py_write_pk_sidecar))?;
+    m.add_wrapped(wrap_pyfunction!(encode_default_value))?;
+    m.add_wrapped(wrap_pyfunction!(decode_default_value))?;
     m.add_wrapped(wrap_pyfunction!(bfloat16_array))?;
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
     m.add_wrapped(wrap_pyfunction!(serialize_row_addrs))?;
@@ -357,6 +362,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(debug::list_transactions))?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
 
+    register_capabilities(py, m)?;
     register_datagen(py, m)?;
     register_indices(py, m)?;
     Ok(())
