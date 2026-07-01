@@ -116,6 +116,7 @@ impl DataTypeExt for DataType {
                 | FixedSizeList(_, _)
                 | FixedSizeBinary(_)
                 | Duration(_)
+                | Interval(_)
                 | Timestamp(_, _)
                 | Date32
                 | Date64
@@ -1562,6 +1563,7 @@ mod tests {
     use arrow_array::{Float32Array, Int32Array, NullArray, StructArray};
     use arrow_array::{ListArray, StringArray, new_empty_array, new_null_array};
     use arrow_buffer::OffsetBuffer;
+    use arrow_schema::{TimeUnit, UnionFields, UnionMode};
 
     #[test]
     fn test_merge_recursive() {
@@ -1802,11 +1804,285 @@ mod tests {
                 .byte_width_opt(),
             Some(16)
         );
+        // FixedSizeList<Utf8> -> None is anchored by
+        // `test_byte_width_opt_anchors_for_skip_list_exceptions`, which
+        // documents why this case matters for the skip-list in
+        // `test_byte_width_agrees_with_byte_width_opt`.
+    }
+
+    /// Build the truth table for `is_fixed_stride`. Iterated by
+    /// `test_is_fixed_stride`, `test_byte_width_agrees_with_byte_width_opt`,
+    /// and `test_byte_width_opt_implies_is_fixed_stride`; a new variant
+    /// added here is automatically exercised by all three.
+    fn is_fixed_stride_cases() -> Vec<(DataType, bool)> {
+        vec![
+            // Boolean and integer primitives (every signed/unsigned width).
+            (DataType::Boolean, true),
+            (DataType::UInt8, true),
+            (DataType::UInt16, true),
+            (DataType::UInt32, true),
+            (DataType::UInt64, true),
+            (DataType::Int8, true),
+            (DataType::Int16, true),
+            (DataType::Int32, true),
+            (DataType::Int64, true),
+            // Floats.
+            (DataType::Float16, true),
+            (DataType::Float32, true),
+            (DataType::Float64, true),
+            // Decimals.
+            (DataType::Decimal128(10, 2), true),
+            (DataType::Decimal256(30, 5), true),
+            // Temporal: Date / Time / Timestamp / Duration / Interval all have
+            // a fixed per-element byte width.
+            (DataType::Date32, true),
+            (DataType::Date64, true),
+            (DataType::Time32(TimeUnit::Second), true),
+            (DataType::Time64(TimeUnit::Nanosecond), true),
+            (DataType::Timestamp(TimeUnit::Microsecond, None), true),
+            (DataType::Duration(TimeUnit::Millisecond), true),
+            (DataType::Interval(IntervalUnit::YearMonth), true),
+            (DataType::Interval(IntervalUnit::DayTime), true),
+            (DataType::Interval(IntervalUnit::MonthDayNano), true),
+            // Fixed-stride opaque bytes.
+            (DataType::FixedSizeBinary(8), true),
+            // FixedSizeList: top-level shape is fixed regardless of inner type.
+            (
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, true)), 4),
+                true,
+            ),
+            // `FixedSizeList<variable-width inner>` is intentionally true here:
+            // `is_fixed_stride` answers a shape question, not a byte question.
+            // The corresponding `byte_width_opt -> None` is asserted explicitly
+            // in `test_byte_width_opt_anchors_for_skip_list_exceptions`.
+            (
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Utf8, true)), 4),
+                true,
+            ),
+            // Variable-width primitives.
+            (DataType::Utf8, false),
+            (DataType::LargeUtf8, false),
+            (DataType::Utf8View, false),
+            (DataType::Binary, false),
+            (DataType::LargeBinary, false),
+            (DataType::BinaryView, false),
+            // Variable-shape and nested non-fixed types.
+            (DataType::Null, false),
+            (
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                false,
+            ),
+            (
+                DataType::LargeList(Arc::new(Field::new("item", DataType::Int32, true))),
+                false,
+            ),
+            (
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        DataType::Struct(Fields::from(vec![
+                            Field::new("key", DataType::Utf8, false),
+                            Field::new("value", DataType::Int32, true),
+                        ])),
+                        false,
+                    )),
+                    false,
+                ),
+                false,
+            ),
+            (DataType::Struct(Fields::empty()), false),
+            (
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                false,
+            ),
+            // Variants that intentionally fall to the `_` arm in `is_fixed_stride`.
+            // Anchoring them here ensures an accidental future addition to the
+            // `matches!` list breaks the test instead of silently changing
+            // downstream encoder/reader behavior.
+            (
+                DataType::Union(UnionFields::empty(), UnionMode::Dense),
+                false,
+            ),
+            (
+                DataType::Union(UnionFields::empty(), UnionMode::Sparse),
+                false,
+            ),
+            (
+                DataType::RunEndEncoded(
+                    Arc::new(Field::new("run_ends", DataType::Int32, false)),
+                    Arc::new(Field::new("values", DataType::Int32, true)),
+                ),
+                false,
+            ),
+            (
+                DataType::ListView(Arc::new(Field::new("item", DataType::Int32, true))),
+                false,
+            ),
+            (
+                DataType::LargeListView(Arc::new(Field::new("item", DataType::Int32, true))),
+                false,
+            ),
+            // Arrow exposes Decimal32 / Decimal64 (byte widths 4 / 8 in
+            // arrow-schema), but Lance's `is_fixed_stride` / `byte_width_opt`
+            // do not list them yet. Anchoring them as `false` pins the
+            // current behavior so the next person who adds them to either
+            // `is_fixed_stride`'s `matches!` arm or `byte_width_opt` is
+            // forced to update this table.
+            (DataType::Decimal32(5, 2), false),
+            (DataType::Decimal64(10, 2), false),
+        ]
+    }
+
+    #[test]
+    fn test_is_fixed_stride() {
+        // Truth table for `is_fixed_stride`. Every variant currently matched
+        // by the `matches!` arm appears as `true`; common non-matching variants
+        // (including `_`-arm fall-throughs like Union / RunEndEncoded /
+        // ListView / LargeListView) appear as `false`. A future variant that
+        // is anchored here but later added to the `matches!` arm — or removed
+        // from it — will flip the expected value and fail this test.
+        // (A brand-new arm with no row in `is_fixed_stride_cases()` simply
+        // goes uncovered; add a row for it.)
+        for (dt, expected) in is_fixed_stride_cases() {
+            assert_eq!(
+                dt.is_fixed_stride(),
+                expected,
+                "is_fixed_stride({:?}) expected {}",
+                dt,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_byte_width_agrees_with_byte_width_opt() {
+        // Whenever `is_fixed_stride() == true`, `byte_width()` must not panic
+        // and must agree with `byte_width_opt()` — with two intentional
+        // exceptions:
+        //
+        //  1. `DataType::Boolean`. Arrow bit-packs booleans, so the per-row
+        //     stride is 1 bit, not a whole byte. `byte_width_opt` returns
+        //     `None` to signal "byte-width doesn't apply". See the comment
+        //     at `scalar::decode_scalar_from_inline_value` for the same
+        //     special-case treatment in the scalar codec.
+        //  2. `FixedSizeList(inner_field, _)` where `inner_field.data_type()
+        //     .byte_width_opt()` is `None` (e.g. `FixedSizeList<Utf8>`).
+        //     `is_fixed_stride` answers a shape question and returns `true`
+        //     regardless of inner type, while `byte_width_opt` recurses and
+        //     returns `None` whenever the inner type has no byte width. See
+        //     the `FixedSizeList<Utf8>.byte_width_opt() == None` anchor in
+        //     `test_byte_width_opt_anchors_for_skip_list_exceptions`.
+        //
+        // `test_byte_width_opt_anchors_for_skip_list_exceptions` pins the
+        // exception values to keep this skip-list honest if either function
+        // changes.
+        for (dt, expected) in is_fixed_stride_cases() {
+            if !expected {
+                continue;
+            }
+            // Skip variants where `byte_width_opt` is legitimately `None`
+            // despite `is_fixed_stride` being `true`. See the comment block
+            // above for the rationale.
+            let skip = match &dt {
+                DataType::Boolean => true,
+                DataType::FixedSizeList(inner, _) => inner.data_type().byte_width_opt().is_none(),
+                _ => false,
+            };
+            if skip {
+                continue;
+            }
+            assert_eq!(
+                Some(dt.byte_width()),
+                dt.byte_width_opt(),
+                "byte_width / byte_width_opt disagree for {:?}",
+                dt
+            );
+        }
+    }
+
+    #[test]
+    fn test_byte_width_opt_implies_is_fixed_stride() {
+        // The Interval bug that this test exists to catch was exactly the
+        // asymmetric case where `byte_width_opt` returned `Some(_)` but
+        // `is_fixed_stride` returned `false`. Lock the invariant:
+        // `byte_width_opt().is_some()` implies `is_fixed_stride() == true`.
+        // A variant covered by `is_fixed_stride_cases()` that is later added
+        // to one function without the other will trip here; a brand-new arm
+        // with no row in the table simply goes uncovered (add a row for it).
+        for (dt, _) in is_fixed_stride_cases() {
+            if dt.byte_width_opt().is_some() {
+                assert!(
+                    dt.is_fixed_stride(),
+                    "byte_width_opt returned Some for {:?}, so is_fixed_stride must be true",
+                    dt
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_byte_width_opt_anchors_for_skip_list_exceptions() {
+        // The exceptions skipped by `test_byte_width_agrees_with_byte_width_opt`
+        // are only justified if `byte_width_opt` still returns `None` for them.
+        // Pin both so the skip-list there stays honest.
         assert_eq!(
-            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Utf8, true)), 5)
-                .byte_width_opt(),
-            None
+            DataType::Boolean.byte_width_opt(),
+            None,
+            "Boolean.byte_width_opt must remain None (bit-packed)"
         );
+        assert_eq!(
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Utf8, true)), 4)
+                .byte_width_opt(),
+            None,
+            "FixedSizeList<Utf8>.byte_width_opt must remain None"
+        );
+    }
+
+    #[test]
+    fn test_byte_width_opt_concrete_values() {
+        // Regression anchors for every `byte_width_opt` arm not already
+        // pinned by `test_byte_width_opt` (Int32/Int64/Float32/Float64/
+        // Utf8/Binary/List/FixedSizeList<Int32>). The cross-check loop in
+        // `test_byte_width_agrees_with_byte_width_opt` would NOT catch a
+        // concrete-value regression (it asserts `Some(byte_width()) ==
+        // byte_width_opt()`, which is tautological because `byte_width()`
+        // is defined as `byte_width_opt().unwrap()`), so each arm needs a
+        // direct anchor here.
+        let anchors = vec![
+            // Smaller integer widths (test_byte_width_opt only pins Int32/Int64).
+            (DataType::Int8, 1),
+            (DataType::Int16, 2),
+            (DataType::UInt8, 1),
+            (DataType::UInt16, 2),
+            (DataType::UInt32, 4),
+            (DataType::UInt64, 8),
+            // Float16 (test_byte_width_opt only pins Float32/Float64).
+            (DataType::Float16, 2),
+            // Interval — the bug this PR fixes.
+            (DataType::Interval(IntervalUnit::YearMonth), 4),
+            (DataType::Interval(IntervalUnit::DayTime), 8),
+            (DataType::Interval(IntervalUnit::MonthDayNano), 16),
+            // Fixed-size binary + decimals.
+            (DataType::FixedSizeBinary(8), 8),
+            (DataType::Decimal128(10, 2), 16),
+            (DataType::Decimal256(30, 5), 32),
+            // Temporal arms.
+            (DataType::Date32, 4),
+            (DataType::Date64, 8),
+            (DataType::Time32(TimeUnit::Second), 4),
+            (DataType::Time64(TimeUnit::Nanosecond), 8),
+            (DataType::Timestamp(TimeUnit::Microsecond, None), 8),
+            (DataType::Duration(TimeUnit::Millisecond), 8),
+        ];
+        for (dt, expected) in anchors {
+            assert_eq!(
+                dt.byte_width_opt(),
+                Some(expected),
+                "byte_width_opt({:?}) expected Some({})",
+                dt,
+                expected
+            );
+        }
     }
 
     #[test]
