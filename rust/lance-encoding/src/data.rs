@@ -1834,6 +1834,39 @@ mod tests {
         );
     }
 
+    // Repro for the >2GB `Binary` (i32-offset) column corruption.
+    //
+    // When multiple input arrays are concatenated by `stitch_offsets::<i32>`, the running
+    // offset is accumulated in `i32` with no `checked_add` and no promotion to 64-bit offsets
+    // (see `stitch_offsets` and `arrow_binary_to_data_block`, which hardcodes 32-bit offsets
+    // for `DataType::Binary`/`Utf8`). Once the accumulated data crosses `i32::MAX` bytes the
+    // offset overflows: in debug builds this panics ("attempt to add with overflow"); in
+    // release builds it silently wraps, writing a corrupt offset buffer that later fails on
+    // read with an Arrow "Offset overflow" error.
+    //
+    // This test constructs offsets numerically near `i32::MAX` WITHOUT allocating multi-GB
+    // buffers, isolating the overflow to the offset arithmetic itself.
+    #[test]
+    #[should_panic(expected = "overflow")]
+    fn test_stitch_offsets_i32_overflows_past_2gb() {
+        // First array: a single value whose offset already sits just below i32::MAX.
+        // Offset buffer = [0, i32::MAX - 16], i.e. one value of length (i32::MAX - 16).
+        let near_max = i32::MAX - 16;
+        let first: Vec<i32> = vec![0, near_max];
+        // Second array: a single value of length 32. Stitching adds 32 to the running
+        // offset (i32::MAX - 16), overflowing i32.
+        let second: Vec<i32> = vec![0, 32];
+
+        let offsets = vec![
+            LanceBuffer::reinterpret_vec(first),
+            LanceBuffer::reinterpret_vec(second),
+        ];
+
+        // In debug builds this panics on the overflowing `x + last_offset - start`.
+        // In release builds it would instead silently produce a wrapped (negative) offset.
+        let _ = super::stitch_offsets::<i32>(offsets);
+    }
+
     #[test]
     fn test_dictionary_indices_normalized() {
         let arr1 = DictionaryArray::<Int8Type>::from_iter([Some("a"), Some("a"), Some("b")]);
