@@ -785,6 +785,67 @@ mod test {
         assert_nested_arrow_json_schema(&empty);
     }
 
+    // Reproduction for the customer's "Offset overflow error: <N>".
+    //
+    // Root cause: `take` on a `Binary` (i32-offset) column. arrow's `take_bytes`
+    // accumulates the total bytes of the taken rows into an i32 offset; when the
+    // cumulative bytes cross i32::MAX (~2GB) arrow returns
+    // ArrowError::OffsetOverflowError, printed as "Offset overflow error: <N>".
+    // This is the read path (dataset.take -> take_struct_array -> arrow take at
+    // take.rs), the on-disk data is intact.
+    //
+    // Confirmed present on Lance v2.0.0; this test verifies whether the latest
+    // code still has it. We keep memory low by storing one ~128MB value and
+    // taking it 17 times via duplicate indices, so the cumulative take output
+    // crosses 2GB while the source array stays ~128MB. arrow checks the offset
+    // overflow BEFORE allocating the (would-be 2GB) output buffer, so peak RSS
+    // stays under a GB.
+    //
+    // #[ignore]: allocates a ~128MB value plus decode buffers; run manually:
+    //   cargo test -p lance --lib dataset::take::test::repro_binary_take_offset_overflow_2gb -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "allocates ~128MB value; run manually with --ignored"]
+    async fn repro_binary_take_offset_overflow_2gb() {
+        use arrow_array::BinaryArray;
+
+        const MB: usize = 1024 * 1024;
+        const VALUE_SIZE: usize = 128 * MB; // one 128MB binary value
+        const TAKE_REPEATS: usize = 17; // 17 * 128MB = 2.125GB > i32::MAX
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "blob",
+            DataType::Binary,
+            false,
+        )]));
+        let big_value = vec![0xABu8; VALUE_SIZE];
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(BinaryArray::from(vec![Some(big_value.as_slice())]))],
+        )
+        .unwrap();
+
+        let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
+        let dataset = Dataset::write(batches, "memory://", None).await.unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 1);
+
+        // take row 0 seventeen times: cumulative taken bytes = 17 * 128MB > 2GB.
+        let indices = vec![0u64; TAKE_REPEATS];
+        let projection = Schema::try_from(data.schema().as_ref()).unwrap();
+        let result = dataset.take(&indices, projection).await;
+
+        match result {
+            Ok(_) => panic!("expected Offset overflow error, but take succeeded"),
+            Err(e) => {
+                let msg = e.to_string();
+                println!("[repro] take error: {msg}");
+                assert!(
+                    msg.contains("Offset overflow"),
+                    "expected 'Offset overflow' error, got: {msg}"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_take_with_deletion() {
         let data = test_batch(0..120);
