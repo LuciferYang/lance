@@ -1826,9 +1826,12 @@ mod tests {
         )
         .unwrap();
 
-        // Batch 1: a tiny residual value. Well under 8MB, so it should NOT trigger a
-        // flush on its own and stays buffered in the accumulation queue.
-        let small = BinaryArray::from(vec![Some(b"residual".as_slice())]);
+        // Batch 1: a residual value of 4MB. Under the 8MB cache, so it does NOT
+        // trigger a flush on its own and stays buffered in the accumulation queue.
+        // Its length R becomes the running `last_offset` when the next array is
+        // stitched on top of it.
+        let residual_len: usize = 4 * 1024 * 1024; // 4MB (< 8MB cache => no self-flush)
+        let small = BinaryArray::from(vec![Some(vec![0xABu8; residual_len].as_slice())]);
         writer
             .write_batch(
                 &RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(small)]).unwrap(),
@@ -1836,10 +1839,13 @@ mod tests {
             .await
             .unwrap();
 
-        // Batch 2: one value close to (but below) the i32 single-array limit.
-        // ~1.99GB. Combined with the residual above, the stitched offsets exceed
-        // i32::MAX. 0xFF fill so the value is not all-zero (avoids constant-encoding).
-        let big_len: usize = (i32::MAX as usize) - (16 * 1024 * 1024); // ~2GB - 16MB
+        // Batch 2: one value at (i32::MAX - 1MB), i.e. a valid single i32 array
+        // (offset <= i32::MAX). Batch 2 far exceeds 8MB so it flushes together with
+        // the buffered 4MB residual. stitch_offsets::<i32> then computes the big
+        // value's final offset as L + R = (i32::MAX - 1MB) + 4MB = i32::MAX + 3MB,
+        // which overflows i32 by ~3MB. 0xFF fill (single, non-repeated value) avoids
+        // constant-encoding.
+        let big_len: usize = (i32::MAX as usize) - (1024 * 1024); // i32::MAX - 1MB (~2.146GB)
         let big_value = vec![0xFFu8; big_len];
         let big = BinaryArray::from(vec![Some(big_value.as_slice())]);
         writer
