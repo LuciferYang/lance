@@ -1867,6 +1867,56 @@ mod tests {
         let _ = super::stitch_offsets::<i32>(offsets);
     }
 
+    // Read-side counterpart to the write-side overflow repro.
+    //
+    // In release builds `stitch_offsets::<i32>` silently wraps on overflow, producing a
+    // corrupt i32 offset buffer that is written to disk. This test reconstructs what such a
+    // corrupt block looks like WITHOUT allocating >2GB, hands it to the same read path
+    // (`DataBlock::into_arrow` with validate=true, i.e. `data.rs:592`), and records exactly
+    // what arrow-rs reports. The goal is to see whether the failure matches the customer's
+    //   "Offset overflow error: 2163262965"
+    // or is a different validation error (e.g. non-monotonic offsets), which would tell us
+    // whether the customer's file came from this stitch path or another offset-building site.
+    #[test]
+    fn test_corrupt_i32_offsets_into_arrow_error() {
+        use super::VariableWidthBlock;
+
+        // Small backing data buffer; the offsets below are the corrupt part.
+        let data = LanceBuffer::copy_slice(&[0u8; 64]);
+
+        // Pattern 1: an offset that wrapped past i32::MAX into a negative value, which is
+        // what `x + last_offset` produces in release for the (residual + ~2GB) case.
+        let wrapped: i32 = ((i32::MAX as i64) + 3 * 1024 * 1024 - (1i64 << 32)) as i32;
+        let offsets_neg: Vec<i32> = vec![0, wrapped];
+
+        let block = DataBlock::VariableWidth(VariableWidthBlock {
+            data: data.clone(),
+            offsets: LanceBuffer::reinterpret_vec(offsets_neg),
+            bits_per_offset: 32,
+            num_values: 1,
+            block_info: super::BlockInfo::new(),
+        });
+        let err1 = block
+            .into_arrow(DataType::Binary, true)
+            .expect_err("corrupt (negative/wrapped) offsets must fail validation");
+        println!("[pattern1 wrapped-negative] arrow error: {err1}");
+
+        // Pattern 2: a monotonic offset that simply exceeds the (small) data buffer length,
+        // i.e. the last offset points past the end of the data.
+        let offsets_big: Vec<i32> = vec![0, i32::MAX];
+        let block = DataBlock::VariableWidth(VariableWidthBlock {
+            data,
+            offsets: LanceBuffer::reinterpret_vec(offsets_big),
+            bits_per_offset: 32,
+            num_values: 1,
+            block_info: super::BlockInfo::new(),
+        });
+        let err2 = block
+            .into_arrow(DataType::Binary, true)
+            .expect_err("offset past end of data buffer must fail validation");
+        println!("[pattern2 offset-past-data] arrow error: {err2}");
+    }
+
     #[test]
     fn test_dictionary_indices_normalized() {
         let arr1 = DictionaryArray::<Int8Type>::from_iter([Some("a"), Some("a"), Some("b")]);
