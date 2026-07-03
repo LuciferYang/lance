@@ -1771,6 +1771,130 @@ mod tests {
         assert_eq!(reader.column_num_rows(1).unwrap(), 3);
     }
 
+    // End-to-end repro attempt for the >2GB `Binary` (i32-offset) column corruption,
+    // exercising the FULL writer path (not just `stitch_offsets` in isolation).
+    //
+    // Goal: determine whether scenario (b) is reachable under the DEFAULT
+    // `data_cache_bytes` (8MB). The theory: a small residual array (<8MB, does not
+    // trigger a flush) followed by a large binary array close to the 2GB i32 limit
+    // gets flushed together, so `stitch_offsets::<i32>` receives [residual, large]
+    // whose concatenated offsets cross i32::MAX and overflow.
+    //
+    // Write path: FileWriter::try_new -> write_batch(small) -> write_batch(large) ->
+    // finish, then read back.
+    //
+    // Expected outcomes (both are informative):
+    //   * If it errors on write/read (debug: overflow panic; release: Arrow
+    //     "Offset overflow") -> scenario (b) IS reachable under default config.
+    //   * If it completes and reads back correctly -> the default 8MB cache flushed
+    //     early enough to keep each page's stitched data below 2GB, i.e. scenario (b)
+    //     is NOT reachable at default settings.
+    //
+    // MEMORY: this allocates a binary array near 2GB. Intermediate steps
+    // (accumulation deep-copy when keep_original_array=false, and concat_into_one
+    // during stitching) each hold another ~2GB, so peak RSS is several GB. Exact
+    // peak is NOT measured. Run only on a machine with ample free memory:
+    //     cargo test -p lance-file --release writer::tests::repro -- --ignored --nocapture
+    // Marked #[ignore] so it never runs in normal `cargo test` / CI.
+    #[tokio::test]
+    #[ignore = "allocates ~2GB+ (several GB peak); run manually with --ignored on a high-memory machine"]
+    async fn repro_binary_i32_offset_overflow_default_cache() {
+        use arrow_array::BinaryArray;
+        use futures::TryStreamExt;
+        use lance_encoding::decoder::FilterExpression;
+        use lance_io::ReadBatchParams;
+
+        // Column is `binary` (32-bit offsets), NOT `large_binary`.
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "blob",
+            DataType::Binary,
+            false,
+        )]));
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+
+        let path = TempObjFile::default();
+        let object_store = ObjectStore::local();
+        // DEFAULT options => default data_cache_bytes (8MB). This is the crux of
+        // scenario (b): we do NOT enlarge the cache.
+        let mut writer = FileWriter::try_new(
+            object_store.create(&path).await.unwrap(),
+            lance_schema.clone(),
+            FileWriterOptions {
+                format_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Batch 1: a tiny residual value. Well under 8MB, so it should NOT trigger a
+        // flush on its own and stays buffered in the accumulation queue.
+        let small = BinaryArray::from(vec![Some(b"residual".as_slice())]);
+        writer
+            .write_batch(
+                &RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(small)]).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Batch 2: one value close to (but below) the i32 single-array limit.
+        // ~1.99GB. Combined with the residual above, the stitched offsets exceed
+        // i32::MAX. 0xFF fill so the value is not all-zero (avoids constant-encoding).
+        let big_len: usize = (i32::MAX as usize) - (16 * 1024 * 1024); // ~2GB - 16MB
+        let big_value = vec![0xFFu8; big_len];
+        let big = BinaryArray::from(vec![Some(big_value.as_slice())]);
+        writer
+            .write_batch(
+                &RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(big)]).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // If we get here without panicking, the write side did not overflow (or
+        // silently wrapped). finish() flushes any remaining buffered data.
+        writer.finish().await.unwrap();
+
+        // Read back. A silently-wrapped offset buffer surfaces here as an Arrow
+        // "Offset overflow" error.
+        let fs = FsFixture::default();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let projection =
+            ReaderProjection::from_column_names(LanceFileVersion::V2_1, &lance_schema, &["blob"])
+                .unwrap();
+        let batches: Vec<RecordBatch> = file_reader
+            .read_stream_projected(
+                ReadBatchParams::RangeFull,
+                1,
+                16,
+                projection,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total_rows, 2,
+            "expected 2 rows if the write/read round-trip survived >2GB"
+        );
+    }
+
     #[tokio::test]
     async fn test_max_page_bytes_enforced() {
         let arrow_field = Field::new("data", DataType::UInt64, false);
