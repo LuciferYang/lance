@@ -26,7 +26,9 @@ use std::time::Instant;
 
 use conflict_resolver::TransactionRebase;
 use lance_core::utils::backoff::{Backoff, SlotBackoff};
-use lance_core::utils::tracing::{AUDIT_MODE_DELETE, AUDIT_TYPE_TRANSACTION, TRACE_FILE_AUDIT};
+use lance_core::utils::tracing::{
+    AUDIT_MODE_DELETE, AUDIT_TYPE_INDEX, AUDIT_TYPE_TRANSACTION, TRACE_FILE_AUDIT,
+};
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_io::utils::CachedFileSize;
@@ -40,6 +42,7 @@ use lance_table::io::commit::{
 };
 use lance_table::io::manifest::read_manifest;
 use rand::{Rng, rng};
+use uuid::Uuid;
 
 use super::ObjectStore;
 use crate::Dataset;
@@ -47,8 +50,8 @@ use crate::dataset::cleanup::auto_cleanup_hook;
 use crate::dataset::fragment::FileFragment;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{
-    ManifestWriteConfig, NewTransactionResult, TRANSACTIONS_DIR, load_new_transactions,
-    write_manifest_file,
+    INDICES_DIR, ManifestWriteConfig, NewTransactionResult, TRANSACTIONS_DIR,
+    load_new_transactions, write_manifest_file,
 };
 use crate::index::DatasetIndexExt;
 use crate::index::DatasetIndexInternalExt;
@@ -130,6 +133,64 @@ async fn cleanup_transaction_file(
                 e
             );
         }
+    }
+}
+
+/// Best-effort delete of the index directories a transaction wrote before its
+/// commit attempt.
+///
+/// `remap_indices` and the fragment-reuse index build flush `_indices/{uuid}/`
+/// while assembling the transaction, so an attempt that does not land leaves
+/// them referenced by no version. A conservative
+/// [`cleanup_old_versions`](crate::dataset::cleanup::cleanup_old_versions) will
+/// not reclaim them until they age past its unverified-file threshold, which
+/// lets a workload that repeatedly loses the commit race accumulate them.
+///
+/// Like [`cleanup_transaction_file`], callers must only invoke this for attempts
+/// whose commit is confirmed to have NOT landed. Unlike the rewritten data
+/// files, these ids are safe to delete once that is established: they are minted
+/// fresh per attempt and are absent from the serialized `RewriteResult`, so a
+/// caller replaying that result cannot be referencing them.
+async fn cleanup_index_dirs(object_store: &ObjectStore, base_path: &Path, index_ids: &[Uuid]) {
+    for id in index_ids {
+        let dir = base_path.clone().join(INDICES_DIR).join(id.to_string());
+        match object_store.remove_dir_all(dir.clone()).await {
+            Ok(()) => {
+                tracing::info!(
+                    target: TRACE_FILE_AUDIT,
+                    mode = AUDIT_MODE_DELETE,
+                    r#type = AUDIT_TYPE_INDEX,
+                    path = dir.to_string(),
+                );
+            }
+            // A fragment-reuse index that inlines its details writes no
+            // directory, so a missing one is expected rather than a problem.
+            Err(e) if e.is_not_found() => {}
+            Err(e) => {
+                log::warn!("Failed to clean up orphaned index directory '{dir}': {e}");
+            }
+        }
+    }
+}
+
+/// The index directories a transaction wrote before attempting to commit.
+///
+/// Only `Rewrite` writes index files ahead of its commit today. An index the
+/// remap left alone comes back as `new_id == old_id`, still referenced by the
+/// version the remap planned against, so those ids are excluded.
+fn index_dirs_written_by(transaction: &Transaction) -> Vec<Uuid> {
+    match &transaction.operation {
+        Operation::Rewrite {
+            rewritten_indices,
+            frag_reuse_index,
+            ..
+        } => rewritten_indices
+            .iter()
+            .filter(|rewritten| rewritten.new_id != rewritten.old_id)
+            .map(|rewritten| rewritten.new_id)
+            .chain(frag_reuse_index.as_ref().map(|index| index.uuid))
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -1525,12 +1586,18 @@ pub(crate) async fn commit_transaction(
                         return Ok((committed_manifest, location));
                     }
                     CommitOutcome::Foreign | CommitOutcome::Absent => {
-                        // The attempt certainly did not land; its
-                        // transaction file is orphaned.
+                        // The attempt certainly did not land; its transaction
+                        // file and any index directories it wrote are orphaned.
                         cleanup_transaction_file(
                             object_store,
                             &dataset.base,
                             &current_transaction_file,
+                        )
+                        .await;
+                        cleanup_index_dirs(
+                            object_store,
+                            &dataset.base,
+                            &index_dirs_written_by(&transaction),
                         )
                         .await;
                         return Err(err);
@@ -1547,6 +1614,12 @@ pub(crate) async fn commit_transaction(
     }
 
     cleanup_transaction_file(object_store, &dataset.base, &current_transaction_file).await;
+    cleanup_index_dirs(
+        object_store,
+        &dataset.base,
+        &index_dirs_written_by(&transaction),
+    )
+    .await;
     Err(crate::Error::commit_conflict_source(
         target_version,
         format!(

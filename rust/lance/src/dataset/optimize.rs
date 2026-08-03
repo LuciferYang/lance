@@ -2619,6 +2619,42 @@ mod tests {
         assert_eq!(plan.tasks().len(), 0);
     }
 
+    /// Names of the `_indices/{uuid}/` directories on disk.
+    fn list_index_dirs(uri: &str) -> std::collections::BTreeSet<String> {
+        std::fs::read_dir(std::path::Path::new(uri).join("_indices"))
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| e.path().is_dir())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A dataset with one scalar index and address-style row ids, so compaction
+    /// has to remap the index and writes a new `_indices/{uuid}/` directory.
+    async fn dataset_with_index_for_remap(
+        uri: &str,
+        handler: Arc<crate::utils::test::AmbiguousCommitHandler>,
+    ) -> Dataset {
+        let data = sample_data();
+        let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 200))], data.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            uri,
+            Some(WriteParams {
+                max_rows_per_file: 100,
+                enable_stable_row_ids: false,
+                commit_handler: Some(handler),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        create_scalar_index(&mut dataset, "a", false).await;
+        dataset
+    }
+
     fn list_data_files(uri: &str) -> std::collections::BTreeSet<String> {
         std::fs::read_dir(std::path::Path::new(uri).join("data"))
             .map(|rd| {
@@ -2627,6 +2663,110 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// A commit verified to have NOT landed leaves the `_indices/{uuid}/`
+    /// directory the remap wrote referenced by no version, so it is reclaimed
+    /// immediately rather than waiting out the unverified-file threshold.
+    #[tokio::test]
+    async fn test_commit_loss_cleans_up_remapped_index_dir() {
+        use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure};
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let handler = Arc::new(AmbiguousCommitHandler::default());
+        let mut dataset = dataset_with_index_for_remap(test_uri, handler.clone()).await;
+        let dirs_before = list_index_dirs(test_uri);
+        assert_eq!(dirs_before.len(), 1, "the scalar index must be on disk");
+
+        handler.fail_next_rewrite(AmbiguousFailure::FailOutright);
+        let options = CompactionOptions::default();
+        compact_files(&mut dataset, options, None)
+            .await
+            .expect_err("the injected failure must surface");
+
+        assert_eq!(
+            list_index_dirs(test_uri),
+            dirs_before,
+            "a verified commit loss must reclaim the directory it wrote"
+        );
+        let ds = Dataset::open(test_uri).await.unwrap();
+        ds.scan()
+            .project(&["a"])
+            .unwrap()
+            .filter("a >= 0")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .expect("the committed index must still be usable");
+    }
+
+    /// A handler that reports its error even after verification proves the
+    /// commit landed. The manifest now references the remapped index, so the
+    /// directory must survive.
+    #[tokio::test]
+    async fn test_landed_commit_reported_as_error_keeps_index_dir() {
+        use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure};
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let handler = Arc::new(AmbiguousCommitHandler::default());
+        handler.propagate_error_after_success();
+        let mut dataset = dataset_with_index_for_remap(test_uri, handler.clone()).await;
+        let dirs_before = list_index_dirs(test_uri);
+
+        handler.fail_next_rewrite(AmbiguousFailure::LandAndError);
+        let options = CompactionOptions::default();
+        compact_files(&mut dataset, options, None)
+            .await
+            .expect_err("the handler propagates the error after a landed commit");
+
+        let dirs_after = list_index_dirs(test_uri);
+        assert!(
+            dirs_after.len() > dirs_before.len(),
+            "the landed commit's index directory must survive, got {dirs_after:?}"
+        );
+        let ds = Dataset::open(test_uri).await.unwrap();
+        ds.scan()
+            .project(&["a"])
+            .unwrap()
+            .filter("a >= 0")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .expect("the landed index must be readable");
+    }
+
+    /// Verification unavailable: the commit may or may not have landed, so
+    /// nothing is deleted.
+    #[tokio::test]
+    async fn test_unknown_commit_status_keeps_index_dir() {
+        use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure};
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let handler = Arc::new(AmbiguousCommitHandler::default());
+        let mut dataset = dataset_with_index_for_remap(test_uri, handler.clone()).await;
+        let dirs_before = list_index_dirs(test_uri);
+
+        handler.fail_next_rewrite(AmbiguousFailure::LandAndError);
+        handler
+            .fail_resolve
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let options = CompactionOptions::default();
+        let err = compact_files(&mut dataset, options, None)
+            .await
+            .expect_err("unknown commit status must surface as an error");
+        assert!(
+            err.is_commit_status_unknown(),
+            "expected CommitStatusUnknown, got {err:?}"
+        );
+
+        let dirs_after = list_index_dirs(test_uri);
+        assert!(
+            dirs_after.len() > dirs_before.len(),
+            "an unknown commit status must not delete anything, got {dirs_after:?}"
+        );
     }
 
     async fn execute_compaction_plan(

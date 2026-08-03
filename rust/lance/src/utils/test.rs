@@ -778,6 +778,9 @@ pub struct AmbiguousCommitHandler {
     /// Number of version resolutions requested (a proxy for how often commit
     /// verification ran).
     resolve_calls: AtomicUsize,
+    /// Whether a verified-landed commit still surfaces its error, as the
+    /// external-manifest and commit-lock handlers do.
+    propagate_error_after_success: AtomicBool,
 }
 
 impl Default for AmbiguousCommitHandler {
@@ -788,6 +791,7 @@ impl Default for AmbiguousCommitHandler {
             resolve_not_found_remaining: AtomicUsize::new(0),
             not_found_is_definitive: AtomicBool::new(true),
             resolve_calls: AtomicUsize::new(0),
+            propagate_error_after_success: AtomicBool::new(false),
         }
     }
 }
@@ -795,6 +799,14 @@ impl Default for AmbiguousCommitHandler {
 impl AmbiguousCommitHandler {
     pub fn fail_next(&self, failure: AmbiguousFailure) {
         *self.fail_next_commit.lock().unwrap() = Some((failure, AmbiguousFailureTarget::Any));
+    }
+
+    /// Report the commit error even when verification proves the commit landed,
+    /// matching the trait default that `ExternalManifestCommitHandler` and the
+    /// `CommitLock` handlers inherit.
+    pub fn propagate_error_after_success(&self) {
+        self.propagate_error_after_success
+            .store(true, Ordering::SeqCst);
     }
 
     /// Arm the failure for the next Rewrite commit only.
@@ -826,7 +838,7 @@ impl CommitHandler for AmbiguousCommitHandler {
     }
 
     fn propagate_commit_error_after_success(&self) -> bool {
-        false
+        self.propagate_error_after_success.load(Ordering::SeqCst)
     }
 
     async fn commit(
