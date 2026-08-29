@@ -4529,6 +4529,7 @@ dependencies = [
  "jsonb",
  "num-traits",
  "rand 0.9.5",
+ "rstest",
 ]
 
 [[package]]

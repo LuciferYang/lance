@@ -3403,6 +3403,11 @@ mod test {
         )
         .await?;
 
+        // Deleting a row makes the rewrite splice a blank into its slot, so the
+        // cast runs through the real write path with a blank in it. One row, so
+        // every dictionary key still has a surviving row to decode.
+        dataset.delete("d = 'gamma'").await?;
+
         dataset
             .alter_columns(&[ColumnAlteration::new("d".into()).cast_to(DataType::Utf8)])
             .await?;
@@ -3413,7 +3418,7 @@ mod test {
         );
         let scanned = dataset.scan().try_into_batch().await?;
         let decoded = scanned.column_by_name("d").unwrap();
-        let expected_decoded = StringArray::from(values.to_vec());
+        let expected_decoded = StringArray::from(vec!["alpha", "beta", "alpha", "beta"]);
         assert_eq!(
             decoded.as_ref(),
             &expected_decoded as &dyn arrow_array::Array

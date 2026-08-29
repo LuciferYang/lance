@@ -1120,8 +1120,14 @@ impl BlobPreprocessor {
 
             if has_data {
                 blob_writer.push_inline(Bytes::copy_from_slice(data_col.value(i)))?;
-            } else {
+            } else if field.is_nullable() {
                 blob_writer.push_null()?;
+            } else {
+                // The descriptor is present — a null one returned above — but
+                // names no data and no uri, and the column cannot hold a null,
+                // so the only reading left is an empty blob. A blank row for a
+                // deleted row arrives here.
+                blob_writer.push_inline(Bytes::new())?;
             }
         }
 
@@ -7445,6 +7451,80 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("Blob v2 requires file version >= 2.2")
+        );
+    }
+
+    /// The updater's blank row for a deleted row is a present descriptor with
+    /// every child null. In a column that cannot hold a null, a null descriptor
+    /// would then fail `RecordBatch::try_new`, so it has to become an empty blob.
+    #[tokio::test]
+    async fn preprocess_reads_an_empty_non_nullable_descriptor_as_an_empty_blob() {
+        let (object_store, base_path) = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            "memory://blob_blank",
+            &ObjectStoreParams::default(),
+        )
+        .await
+        .unwrap();
+        let object_store = object_store.as_ref().clone();
+        let data_dir = base_path.clone().join("data");
+
+        let field = blob_field("blob", false);
+        let writer_schema =
+            lance_core::datatypes::Schema::try_from(&Schema::new(vec![field.clone()])).unwrap();
+        let mut preprocessor = super::BlobPreprocessor::new(
+            object_store,
+            data_dir,
+            "data_file_key".to_string(),
+            &writer_schema,
+            None,
+            false,
+            ExternalBlobMode::Reference,
+            Arc::new(ObjectStoreRegistry::default()),
+            ObjectStoreParams::default(),
+            None,
+        )
+        .unwrap();
+
+        let DataType::Struct(children) = field.data_type().clone() else {
+            unreachable!("a blob field is a struct")
+        };
+        let descriptor = arrow_array::StructArray::try_new(
+            children.clone(),
+            children
+                .iter()
+                .map(|child| arrow_array::new_null_array(child.data_type(), 1))
+                .collect(),
+            None,
+        )
+        .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "blob",
+                field.data_type().clone(),
+                false,
+            )])),
+            vec![Arc::new(descriptor) as arrow_array::ArrayRef],
+        )
+        .unwrap();
+
+        let out = preprocessor.preprocess_batch(&batch).await.unwrap();
+        let prepared = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::StructArray>()
+            .unwrap();
+        assert!(
+            !prepared.is_null(0),
+            "a non-nullable column cannot carry a null descriptor"
+        );
+        assert_eq!(
+            prepared
+                .column_by_name("kind")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::UInt8Type>()
+                .value(0),
+            BlobKind::Inline as u8
         );
     }
 

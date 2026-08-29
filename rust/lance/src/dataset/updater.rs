@@ -1,13 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_array::{RecordBatch, UInt32Array};
+use arrow::array::{ArrayData, ArrayDataBuilder};
+use arrow_array::{Array, ArrayRef, RecordBatch, UInt32Array, cast::AsArray, make_array};
+use arrow_buffer::{ArrowNativeType, MutableBuffer};
+use arrow_schema::{DataType, Field};
 use futures::StreamExt;
+use lance_arrow::blank::minimal_value;
+use lance_arrow::interleave_batches;
 use lance_core::datatypes::{OnMissing, OnTypeMismatch};
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::{Error, Result, datatypes::Schema};
 use lance_table::format::{DataFile, Fragment};
 use lance_table::utils::stream::ReadBatchFutStream;
+use std::sync::Arc;
 
 use super::Dataset;
 use super::fragment::FragmentReader;
@@ -415,7 +421,39 @@ impl DeletionRestorer {
     }
 }
 
-/// Add blank rows where there are deleted rows
+/// Builds the one-row batch whose values fill the blank rows.
+///
+/// Each column gets the smallest value its field allows — a null where the field
+/// is nullable, and otherwise the smallest non-null value of its type, so a blank
+/// row costs no payload for a byte or list column and a zeroed value elsewhere.
+fn blank_row_for(batch: &RecordBatch) -> Result<RecordBatch> {
+    let columns = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| {
+            // Only a type no Lance schema can hold returns `None`, and copying the
+            // batch's first row instead — which is what every column used to get
+            // — would put back the payload duplication this avoids.
+            minimal_value(field).ok_or_else(|| {
+                Error::not_supported(format!(
+                    "Cannot add blank rows for column '{}' of type {}",
+                    field.name(),
+                    field.data_type()
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(RecordBatch::try_new(batch.schema(), columns)?)
+}
+
+/// The two `interleave` sources `add_blanks` splices together: the live batch,
+/// and the one-row batch of placeholders.
+const LIVE: usize = 0;
+const BLANK: usize = 1;
+
+/// Splices a blank row into `batch` at every offset in `batch_offsets`, which
+/// must be ascending and are the positions the deleted rows used to occupy.
 pub(crate) fn add_blanks(batch: RecordBatch, batch_offsets: &[u32]) -> Result<RecordBatch> {
     // Fast early return
     if batch_offsets.is_empty() {
@@ -424,47 +462,302 @@ pub(crate) fn add_blanks(batch: RecordBatch, batch_offsets: &[u32]) -> Result<Re
 
     if batch.num_rows() == 0 {
         // TODO: implement adding blanks for an empty batch.
-        // This is difficult because we need to create a batch for arbitrary schemas.
+        // There is no live row to take a dictionary's keys from.
         return Err(Error::not_supported_source(
             "Missing too many rows in merge, run compaction to materialize deletions first".into(),
         ));
     }
 
-    let mut selection_vector = Vec::<u32>::with_capacity(batch.num_rows() + batch_offsets.len());
-    let mut batch_pos = 0;
+    let blank_row = blank_row_for(&batch)?;
+
+    let mut indices = Vec::with_capacity(batch.num_rows() + batch_offsets.len());
+    let mut batch_pos = 0usize;
     let mut next_id = 0;
     for batch_offset in batch_offsets {
-        let num_rows = *batch_offset - next_id;
-        selection_vector.extend(batch_pos..batch_pos + num_rows);
-        // For simplicity, we just use the first value for deleted rows
-        // TODO: optimize this to use small value for each column.
-        selection_vector.push(0);
+        // `interleave` panics on a row index past the end of its source, so an
+        // offset that goes backwards, or that asks for more live rows than are
+        // left, has to be turned away here.
+        let live_rows_left = batch.num_rows() - batch_pos;
+        let num_rows = batch_offset
+            .checked_sub(next_id)
+            .map(|num_rows| num_rows as usize)
+            .filter(|num_rows| *num_rows <= live_rows_left)
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "add_blanks: batch offset {} is outside [{}, {}]; offsets must ascend and must not run past the {} rows of the batch",
+                    batch_offset,
+                    next_id,
+                    next_id as usize + live_rows_left,
+                    batch.num_rows()
+                ))
+            })?;
+        indices.extend((batch_pos..batch_pos + num_rows).map(|row| (LIVE, row)));
+        indices.push((BLANK, 0));
         next_id = *batch_offset + 1;
         batch_pos += num_rows;
     }
-    selection_vector.extend(batch_pos..batch.num_rows() as u32);
-    let selection_vector = UInt32Array::from(selection_vector);
+    indices.extend((batch_pos..batch.num_rows()).map(|row| (LIVE, row)));
 
-    let arrays = batch
+    let with_blanks = interleave_batches(&[stub_dictionaries(&batch)?, blank_row], &indices)
+        .map_err(|e| Error::arrow(format!("Failed to add blanks: {}", e)))?;
+    restore_dictionary_columns(with_blanks, &batch, &indices)
+        .map_err(|e| Error::arrow(format!("Failed to add blanks: {}", e)))
+}
+
+/// Rebuilds the dictionary parts of `with_blanks` from `batch` with `take`.
+///
+/// `interleave` merges the two sources' dictionaries and renumbers their keys,
+/// but the v1 writer persists a dictionary's values once from the schema and
+/// each batch's keys as they come, so renumbered keys would decode against the
+/// wrong values. `take` keeps the values array.
+///
+/// This goes leaf by leaf rather than column by column: what `take` duplicates
+/// for a blank row is everything under the node it is given, so handing it a
+/// whole `Struct<{Dictionary, Binary}>` would put the binary payload back on the
+/// blank rows and with it the offset overflow. Only dictionary leaves are taken,
+/// apart from the fallback arm below.
+fn restore_dictionary_columns(
+    with_blanks: RecordBatch,
+    batch: &RecordBatch,
+    indices: &[(usize, usize)],
+) -> Result<RecordBatch> {
+    let dictionary_columns = batch
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, field)| contains_dictionary(field.data_type()))
+        .map(|(idx, _)| idx)
+        .collect::<Vec<_>>();
+    if dictionary_columns.is_empty() {
+        return Ok(with_blanks);
+    }
+
+    let slots = indices
+        .iter()
+        .map(|(source, row)| (*source == LIVE).then_some(*row as u32))
+        .collect::<Vec<_>>();
+    let mut columns = with_blanks.columns().to_vec();
+    for idx in dictionary_columns {
+        columns[idx] = restore_dictionaries(&columns[idx], batch.column(idx), &slots)?;
+    }
+    Ok(RecordBatch::try_new(with_blanks.schema(), columns)?)
+}
+
+fn restore_dictionaries(
+    interleaved: &ArrayRef,
+    live: &ArrayRef,
+    slots: &[Option<u32>],
+) -> Result<ArrayRef> {
+    match interleaved.data_type() {
+        // A blank takes row 0's key, which is what makes rebuilding this leaf
+        // cheap enough to do instead of interleaving it.
+        DataType::Dictionary(_, _) => take_slots(live, slots),
+        DataType::Struct(fields) => {
+            let children = fields
+                .iter()
+                .enumerate()
+                .map(|(idx, field)| {
+                    let interleaved = interleaved.as_struct().column(idx).clone();
+                    if contains_dictionary(field.data_type()) {
+                        restore_dictionaries(&interleaved, live.as_struct().column(idx), slots)
+                    } else {
+                        Ok(interleaved)
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?;
+            with_children(interleaved, children)
+        }
+        DataType::List(_) => {
+            let slots = element_slots(live.as_list::<i32>().value_offsets(), slots);
+            let values = restore_dictionaries(
+                interleaved.as_list::<i32>().values(),
+                live.as_list::<i32>().values(),
+                &slots,
+            )?;
+            with_children(interleaved, vec![values])
+        }
+        DataType::LargeList(_) => {
+            let slots = element_slots(live.as_list::<i64>().value_offsets(), slots);
+            let values = restore_dictionaries(
+                interleaved.as_list::<i64>().values(),
+                live.as_list::<i64>().values(),
+                &slots,
+            )?;
+            with_children(interleaved, vec![values])
+        }
+        DataType::Map(_, _) => {
+            let slots = element_slots(live.as_map().value_offsets(), slots);
+            let entries = restore_dictionaries(
+                &(Arc::new(interleaved.as_map().entries().clone()) as ArrayRef),
+                &(Arc::new(live.as_map().entries().clone()) as ArrayRef),
+                &slots,
+            )?;
+            with_children(interleaved, vec![entries])
+        }
+        DataType::FixedSizeList(_, width) if *width > 0 => {
+            // Unlike a list, the placeholder occupies the full width here, so
+            // every row owns `width` child slots. A blank's stay blank: a leaf
+            // below turns one into row 0, but a list below owes `interleave`'s
+            // offsets an empty entry, not row 0's elements.
+            let stride = *width as u32;
+            let slots = slots
+                .iter()
+                .flat_map(|slot| {
+                    (0..stride).map(move |offset| slot.map(|row| row * stride + offset))
+                })
+                .collect::<Vec<_>>();
+            let values = restore_dictionaries(
+                interleaved.as_fixed_size_list().values(),
+                live.as_fixed_size_list().values(),
+                &slots,
+            )?;
+            with_children(interleaved, vec![values])
+        }
+        // Only a zero-width `FixedSizeList` reaches this: it owns no element, so
+        // there is no key to translate, and taking the node keeps the values
+        // array that `interleave` replaced with a stub. The other types
+        // `contains_dictionary` answers for — `Union`, `RunEndEncoded`, the view
+        // lists — are rejected by `blank_row_for` before the restore runs.
+        _ => take_slots(live, slots),
+    }
+}
+
+/// Puts `children` in place of `array`'s, keeping its length, offsets and
+/// validity.
+///
+/// This goes through `ArrayData` rather than the typed constructors because
+/// those reject more than arrow's own validation does — `ListArray::try_new`
+/// turns away a non-nullable item field whose dictionary child merely has an
+/// unreferenced null among its values, and the `take` this replaces never
+/// checked that.
+fn with_children(array: &ArrayRef, children: Vec<ArrayRef>) -> Result<ArrayRef> {
+    let children = children.iter().map(|child| child.to_data()).collect();
+    Ok(make_array(
+        ArrayDataBuilder::from(array.to_data())
+            .child_data(children)
+            .build()?,
+    ))
+}
+
+/// Replaces every dictionary in `batch` with a stub of the same shape: the same
+/// keys buffer length, all zero, against a single values entry.
+///
+/// `interleave` merges the dictionaries of its sources, and the merged values
+/// array has to stay indexable by the key type: a `UInt8` dictionary already
+/// using all 256 keys leaves no room for the placeholder's value, and the path
+/// that concatenates instead of merging fails once the two arrays together reach
+/// 256 entries. The first returns `DictionaryKeyOverflowError`; the second
+/// panics inside `MutableArrayData`. `restore_dictionary_columns` throws the merged
+/// result away regardless, so give `interleave` a dictionary that cannot
+/// overflow and keep the real one for the restore.
+fn stub_dictionaries(batch: &RecordBatch) -> Result<RecordBatch> {
+    let columns = batch
         .columns()
         .iter()
-        .map(|array| {
-            arrow::compute::take(array.as_ref(), &selection_vector, None)
-                .map_err(|e| Error::arrow(format!("Failed to add blanks: {}", e)))
+        .map(|column| {
+            if contains_dictionary(column.data_type()) {
+                Ok(make_array(stub_dictionary_data(&column.to_data())?))
+            } else {
+                Ok(column.clone())
+            }
         })
         .collect::<Result<Vec<_>>>()?;
+    Ok(RecordBatch::try_new(batch.schema(), columns)?)
+}
 
-    let batch = RecordBatch::try_new(batch.schema(), arrays)?;
+fn stub_dictionary_data(data: &ArrayData) -> Result<ArrayData> {
+    if let DataType::Dictionary(key_type, value_type) = data.data_type() {
+        let width = key_type.primitive_width().ok_or_else(|| {
+            Error::not_supported(format!("Dictionary key type {} has no width", key_type))
+        })?;
+        let values = minimal_value(&Field::new("item", value_type.as_ref().clone(), false))
+            .ok_or_else(|| {
+                Error::not_supported(format!(
+                    "Cannot build a placeholder for dictionary values of type {}",
+                    value_type
+                ))
+            })?;
+        return Ok(ArrayDataBuilder::new(data.data_type().clone())
+            .len(data.len())
+            .nulls(data.nulls().cloned())
+            .add_buffer(MutableBuffer::from_len_zeroed(data.len() * width).into())
+            .add_child_data(values.to_data())
+            .build()?);
+    }
+    let children = data
+        .child_data()
+        .iter()
+        .map(|child| {
+            if contains_dictionary(child.data_type()) {
+                stub_dictionary_data(child)
+            } else {
+                Ok(child.clone())
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ArrayDataBuilder::from(data.clone())
+        .child_data(children)
+        .build()?)
+}
 
-    Ok(batch)
+fn take_slots(live: &ArrayRef, slots: &[Option<u32>]) -> Result<ArrayRef> {
+    let indices = UInt32Array::from_iter_values(slots.iter().map(|slot| slot.unwrap_or(0)));
+    Ok(arrow::compute::take(live.as_ref(), &indices, None)?)
+}
+
+/// Translates a container's row slots into its child's element slots: a live row
+/// contributes its own elements and a blank contributes none, because the
+/// placeholder's list is empty. That keeps the child aligned with the offsets
+/// `interleave` produced.
+fn element_slots<O: ArrowNativeType>(offsets: &[O], slots: &[Option<u32>]) -> Vec<Option<u32>> {
+    slots
+        .iter()
+        .flatten()
+        .flat_map(|row| {
+            let row = *row as usize;
+            (offsets[row].as_usize() as u32..offsets[row + 1].as_usize() as u32).map(Some)
+        })
+        .collect()
+}
+
+/// Whether a dictionary sits anywhere in this type. Every type that can hold a
+/// child is listed, so the `false` below only ever answers for a leaf: a type
+/// missing from this match would keep `interleave`'s renumbered keys silently.
+fn contains_dictionary(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Dictionary(_, _) => true,
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field) => contains_dictionary(field.data_type()),
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| contains_dictionary(field.data_type())),
+        DataType::Union(fields, _) => fields
+            .iter()
+            .any(|(_, field)| contains_dictionary(field.data_type())),
+        DataType::RunEndEncoded(_, values) => contains_dictionary(values.data_type()),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use arrow::{array::AsArray, datatypes::Int32Type};
-    use lance_datagen::RowCount;
-
     use super::add_blanks;
+    use arrow::array::{ArrayDataBuilder, AsArray, make_array};
+    use arrow::datatypes::Int32Type;
+    use arrow_array::{
+        Array, ArrayRef, BinaryArray, DictionaryArray, FixedSizeListArray, Int8Array, Int32Array,
+        LargeBinaryArray, LargeListArray, ListArray, MapArray, NullArray, RecordBatch, StringArray,
+        StructArray, UInt8Array, types::UInt8Type,
+    };
+    use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer};
+    use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
+    use lance_datagen::RowCount;
+    use std::sync::Arc;
 
     #[test]
     fn test_restore_deletes() {
@@ -486,7 +779,7 @@ mod tests {
                 .col("x", lance_datagen::array::step::<Int32Type>())
                 .into_batch_rows(RowCount::from(7))
                 .unwrap();
-            // Next batch is rows ids 10..16 so we need to restore 11, 12
+            // Next batch is rows ids 10..18 so we need to restore 11, 12
             // 19, and maybe 20 (depends on batch size)
             let restored = restorer.restore(batch).unwrap();
             let values = restored.column(0).as_primitive::<Int32Type>();
@@ -511,8 +804,10 @@ mod tests {
 
     #[test]
     fn test_add_blanks() {
+        // Values start at 100 so a blank (0) cannot be mistaken for a copy of
+        // row 0, which is what this used to insert.
         let batch = lance_datagen::gen_batch()
-            .col("x", lance_datagen::array::step::<Int32Type>())
+            .col("x", lance_datagen::array::step_custom::<Int32Type>(100, 1))
             .into_batch_rows(RowCount::from(10))
             .unwrap();
 
@@ -521,21 +816,706 @@ mod tests {
         assert_eq!(with_blanks.num_rows(), 12);
         let values = with_blanks.column(0).as_primitive::<Int32Type>();
         for i in 0..5 {
-            assert_eq!(values.value(i), i as i32);
+            assert_eq!(values.value(i), 100 + i as i32);
         }
         assert_eq!(values.value(5), 0);
-        assert_eq!(values.value(6), 5);
+        assert_eq!(values.value(6), 105);
         assert_eq!(values.value(7), 0);
         for i in 8..12 {
-            assert_eq!(values.value(i), (i - 2) as i32);
+            assert_eq!(values.value(i), 100 + (i - 2) as i32);
         }
 
         let with_blanks = add_blanks(batch, &[0, 11]).unwrap();
         let values = with_blanks.column(0).as_primitive::<Int32Type>();
         assert_eq!(values.value(0), 0);
         for i in 1..11 {
-            assert_eq!(values.value(i), (i - 1) as i32);
+            assert_eq!(values.value(i), 100 + (i - 1) as i32);
         }
         assert_eq!(values.value(11), 0);
+    }
+
+    /// `interleave` panics rather than erroring on an out-of-range row index, so
+    /// `add_blanks` has to reject the offsets that would produce one.
+    #[test]
+    fn add_blanks_rejects_offsets_it_cannot_honor() {
+        let batch = lance_datagen::gen_batch()
+            .col("x", lance_datagen::array::step::<Int32Type>())
+            .into_batch_rows(RowCount::from(10))
+            .unwrap();
+
+        // Repeated, descending, and past the end. The last pair is the one that
+        // stops rejecting if `live_rows_left` forgets `batch_pos`.
+        for offsets in [vec![5, 5], vec![5, 3], vec![11], vec![0, 12], vec![3, 12]] {
+            let err = add_blanks(batch.clone(), &offsets).unwrap_err();
+            assert!(
+                matches!(err, lance_core::Error::InvalidInput { .. }),
+                "{offsets:?} gave {err}"
+            );
+            assert!(
+                err.to_string().contains("offsets must ascend"),
+                "{offsets:?} gave {err}"
+            );
+        }
+    }
+
+    /// Blank rows must carry each column's minimal value, not a copy of row 0.
+    /// The old implementation duplicated row 0, which for a large value made one
+    /// row pay for every blank.
+    #[test]
+    fn add_blanks_uses_minimal_values_not_row_zero() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("i", DataType::Int32, false),
+            Field::new("s", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![100, 200, 300])),
+                Arc::new(StringArray::from(vec!["alpha", "beta", "gamma"])),
+            ],
+        )
+        .unwrap();
+        let live_string_bytes = "alpha".len() + "beta".len() + "gamma".len();
+
+        let with_blanks = add_blanks(batch, &[1, 4]).unwrap();
+
+        assert_eq!(with_blanks.num_rows(), 5);
+        let ints = with_blanks.column(0).as_primitive::<Int32Type>();
+        assert_eq!(ints.values(), &[100, 0, 200, 300, 0]);
+
+        let strings = with_blanks.column(1).as_string::<i32>();
+        assert_eq!(strings.value(0), "alpha");
+        assert_eq!(strings.value(1), "", "a blank must not copy row 0's value");
+        assert_eq!(strings.value(2), "beta");
+        assert_eq!(strings.value(3), "gamma");
+        assert_eq!(strings.value(4), "");
+        assert_eq!(
+            arrow_array::Array::null_count(strings),
+            0,
+            "the column is not nullable"
+        );
+        assert_eq!(
+            strings.value_offsets().last().copied().unwrap() as usize,
+            live_string_bytes,
+            "blanks must not consume offset space"
+        );
+    }
+
+    /// The payload of a variable-width column must not grow with the number of
+    /// blanks. Under the old implementation each blank copied row 0, so this
+    /// batch's value bytes grew by `blanks * len(row 0)`.
+    #[test]
+    fn add_blanks_does_not_grow_binary_payload() {
+        const VALUE_SIZE: usize = 1024 * 1024;
+        let big = vec![0xABu8; VALUE_SIZE];
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "blob",
+            DataType::Binary,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(BinaryArray::from(vec![
+                Some(big.as_slice()),
+                Some(&b"small"[..]),
+            ]))],
+        )
+        .unwrap();
+
+        // Eight blanks around two live rows: the old code would have copied the
+        // 1 MiB value eight more times.
+        let with_blanks = add_blanks(batch, &[0, 1, 2, 3, 6, 7, 8, 9]).unwrap();
+
+        assert_eq!(with_blanks.num_rows(), 10);
+        let blobs = with_blanks.column(0).as_binary::<i32>();
+        assert_eq!(
+            blobs.value_offsets().last().copied().unwrap() as usize,
+            VALUE_SIZE + b"small".len(),
+            "blanks must contribute no bytes"
+        );
+        assert_eq!(blobs.value(4).len(), VALUE_SIZE);
+        assert_eq!(blobs.value(5), b"small");
+        for blank in [0, 1, 2, 3, 6, 7, 8, 9] {
+            assert!(blobs.value(blank).is_empty(), "row {blank} should be blank");
+        }
+    }
+
+    /// A `Binary` column whose live bytes plus duplicated blanks would cross
+    /// `i32::MAX` used to fail with `Offset overflow error`, which is what the
+    /// `Failed to add blanks` reports in production.
+    #[test]
+    #[ignore = "allocates ~384MiB; run manually with --ignored"]
+    fn add_blanks_survives_binary_offset_overflow() {
+        const VALUE_SIZE: usize = 128 * 1024 * 1024;
+        // 17 copies of a 128 MiB value is 2.125 GiB, past `i32::MAX`.
+        const BLANKS: u32 = 17;
+
+        let big = vec![0xABu8; VALUE_SIZE];
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "blob",
+            DataType::Binary,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(BinaryArray::from(vec![Some(big.as_slice())]))],
+        )
+        .unwrap();
+
+        let offsets: Vec<u32> = (1..=BLANKS).collect();
+        let with_blanks = add_blanks(batch, &offsets).unwrap();
+
+        assert_eq!(with_blanks.num_rows(), 1 + BLANKS as usize);
+        let blobs = with_blanks.column(0).as_binary::<i32>();
+        assert_eq!(
+            blobs.value_offsets().last().copied().unwrap() as usize,
+            VALUE_SIZE,
+            "only the live row contributes bytes"
+        );
+    }
+
+    /// The v1 writer persists a dictionary's values once from the schema and
+    /// each batch's keys as they come, so `add_blanks` must leave the keys
+    /// indexing the values array it was handed.
+    #[test]
+    fn add_blanks_keeps_dictionary_keys_valid() {
+        let entries = ["alpha", "beta", "gamma", "delta"];
+        let dictionary = || {
+            Arc::new(
+                DictionaryArray::<UInt8Type>::try_new(
+                    UInt8Array::from(vec![3u8, 1, 0]),
+                    Arc::new(StringArray::from(entries.to_vec())),
+                )
+                .unwrap(),
+            ) as ArrayRef
+        };
+        let nested = Arc::new(StructArray::from(vec![(
+            Arc::new(Field::new(
+                "d",
+                DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8)),
+                false,
+            )),
+            dictionary(),
+        )])) as ArrayRef;
+        let batch =
+            RecordBatch::try_from_iter(vec![("flat", dictionary()), ("nested", nested)]).unwrap();
+
+        let with_blanks = add_blanks(batch, &[1]).unwrap();
+
+        for column in [
+            with_blanks.column(0).clone(),
+            with_blanks.column(1).as_struct().column(0).clone(),
+        ] {
+            let dict = column.as_dictionary::<UInt8Type>();
+            // The blank at position 1 copies row 0's key, which costs a key and
+            // not a payload; the live rows keep the keys they came with.
+            assert_eq!(dict.keys().values(), &[3, 3, 1, 0]);
+            assert_eq!(
+                dict.values().as_string::<i32>(),
+                &StringArray::from(entries.to_vec()),
+                "the values array must survive untouched"
+            );
+        }
+    }
+
+    /// A blank row must leave a nullable child null: the blob writer dispatches
+    /// on `uri` being present, and an empty string there is an external
+    /// reference to `""`, not an absent one.
+    #[test]
+    fn add_blanks_leaves_a_nullable_child_null() {
+        let fields = Fields::from(vec![
+            Field::new("data", DataType::LargeBinary, true),
+            Field::new("uri", DataType::Utf8, true),
+        ]);
+        let descriptor = StructArray::new(
+            fields,
+            vec![
+                Arc::new(LargeBinaryArray::from(vec![Some(b"payload".as_slice())])) as ArrayRef,
+                Arc::new(StringArray::new_null(1)) as ArrayRef,
+            ],
+            None,
+        );
+        let batch = RecordBatch::try_from_iter_with_nullable(vec![(
+            "blob",
+            Arc::new(descriptor) as ArrayRef,
+            false,
+        )])
+        .unwrap();
+
+        let with_blanks = add_blanks(batch, &[1]).unwrap();
+
+        let blob = with_blanks.column(0).as_struct();
+        assert_eq!(blob.null_count(), 0, "the column itself is not nullable");
+        assert!(blob.column(1).is_null(0), "the live row had no uri");
+        assert!(blob.column(1).is_null(1), "and neither has the blank");
+        assert!(
+            blob.column(0).is_null(1),
+            "an absent payload, not an empty one"
+        );
+    }
+
+    /// A dictionary sibling must not drag a large payload back onto the blank
+    /// rows. `take` duplicates everything under the node it is handed, so the
+    /// restore has to reach the dictionary leaf and leave the binary child as
+    /// `interleave` built it.
+    #[test]
+    fn add_blanks_does_not_grow_a_dictionary_siblings_payload() {
+        const VALUE_SIZE: usize = 1024 * 1024;
+        const BLANKS: u32 = 8;
+
+        let tag = DictionaryArray::<UInt8Type>::try_new(
+            UInt8Array::from(vec![1u8]),
+            Arc::new(StringArray::from(vec!["x", "y"])),
+        )
+        .unwrap();
+        let blob = BinaryArray::from(vec![Some(vec![7u8; VALUE_SIZE].as_slice())]);
+        let fields = Fields::from(vec![
+            Field::new(
+                "tag",
+                DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8)),
+                false,
+            ),
+            Field::new("blob", DataType::Binary, false),
+        ]);
+        let batch = RecordBatch::try_from_iter_with_nullable(vec![(
+            "s",
+            Arc::new(StructArray::new(
+                fields,
+                vec![Arc::new(tag) as ArrayRef, Arc::new(blob) as ArrayRef],
+                None,
+            )) as ArrayRef,
+            false,
+        )])
+        .unwrap();
+
+        let with_blanks = add_blanks(batch, &(1..=BLANKS).collect::<Vec<_>>()).unwrap();
+
+        let out = with_blanks.column(0).as_struct();
+        assert_eq!(out.len(), 1 + BLANKS as usize);
+        assert_eq!(
+            out.column(1)
+                .as_binary::<i32>()
+                .value_offsets()
+                .last()
+                .copied()
+                .unwrap() as usize,
+            VALUE_SIZE,
+            "only the live row contributes bytes"
+        );
+        let tag = out.column(0).as_dictionary::<UInt8Type>();
+        assert_eq!(tag.keys().values(), &[1, 1, 1, 1, 1, 1, 1, 1, 1]);
+        assert_eq!(
+            tag.values().as_string::<i32>(),
+            &StringArray::from(vec!["x", "y"]),
+            "the values array must survive untouched"
+        );
+    }
+
+    /// A dictionary under a list keeps the keys and values it came with, and the
+    /// blank contributes no element at all.
+    #[test]
+    fn add_blanks_keeps_a_listed_dictionary_valid() {
+        // The fourth value is a null no key points at. `ListArray::try_new`
+        // rejects that under a non-nullable item field while `ArrayData` accepts
+        // it, which is why the restore rebuilds through `ArrayData` — and why
+        // this fixture has to be built the way a reader builds one.
+        let values = DictionaryArray::<UInt8Type>::try_new(
+            UInt8Array::from(vec![2u8, 0, 1]),
+            Arc::new(StringArray::from(vec![
+                Some("a"),
+                Some("b"),
+                Some("c"),
+                None,
+            ])),
+        )
+        .unwrap();
+        let item = Arc::new(Field::new(
+            "item",
+            DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8)),
+            false,
+        ));
+        let list = make_array(
+            ArrayDataBuilder::new(DataType::List(item))
+                .len(2)
+                .add_buffer(Buffer::from_slice_ref([0i32, 2, 3]))
+                .add_child_data(values.to_data())
+                .build()
+                .unwrap(),
+        );
+        let batch = RecordBatch::try_from_iter(vec![("l", list)]).unwrap();
+
+        let with_blanks = add_blanks(batch, &[1]).unwrap();
+
+        let out = with_blanks.column(0).as_list::<i32>();
+        assert_eq!(out.len(), 3);
+        let entries = out.values().as_dictionary::<UInt8Type>();
+        assert_eq!(
+            entries.values().as_string::<i32>(),
+            &StringArray::from(vec![Some("a"), Some("b"), Some("c"), None]),
+            "the values array must survive untouched"
+        );
+        // Row 0 is [c, a] and row 1 is [b]; the blank is an empty list, so no
+        // element is duplicated and no key is rewritten.
+        assert_eq!(entries.keys().values(), &[2, 0, 1]);
+        assert_eq!(out.value_length(0), 2);
+        assert_eq!(out.value_length(1), 0, "the blank");
+        assert_eq!(out.value_length(2), 1);
+    }
+
+    /// The same property one level down: a dictionary inside a list element must
+    /// not drag its element's payload onto the blank rows either.
+    #[test]
+    fn add_blanks_does_not_grow_a_listed_dictionary_siblings_payload() {
+        const VALUE_SIZE: usize = 1024 * 1024;
+        const BLANKS: u32 = 8;
+
+        let fields = Fields::from(vec![
+            Field::new(
+                "tag",
+                DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8)),
+                false,
+            ),
+            Field::new("blob", DataType::Binary, false),
+        ]);
+        let element = StructArray::new(
+            fields.clone(),
+            vec![
+                Arc::new(
+                    DictionaryArray::<UInt8Type>::try_new(
+                        UInt8Array::from(vec![1u8]),
+                        Arc::new(StringArray::from(vec!["x", "y"])),
+                    )
+                    .unwrap(),
+                ) as ArrayRef,
+                Arc::new(BinaryArray::from(vec![Some(
+                    vec![7u8; VALUE_SIZE].as_slice(),
+                )])) as ArrayRef,
+            ],
+            None,
+        );
+        let list = ListArray::new(
+            Arc::new(Field::new("item", DataType::Struct(fields), false)),
+            OffsetBuffer::new(vec![0, 1].into()),
+            Arc::new(element) as ArrayRef,
+            None,
+        );
+        let batch = RecordBatch::try_from_iter(vec![("l", Arc::new(list) as ArrayRef)]).unwrap();
+
+        let with_blanks = add_blanks(batch, &(1..=BLANKS).collect::<Vec<_>>()).unwrap();
+
+        let out = with_blanks.column(0).as_list::<i32>();
+        assert_eq!(out.len(), 1 + BLANKS as usize);
+        let element = out.values().as_struct();
+        assert_eq!(
+            element
+                .column(1)
+                .as_binary::<i32>()
+                .value_offsets()
+                .last()
+                .copied()
+                .unwrap() as usize,
+            VALUE_SIZE,
+            "only the live element contributes bytes"
+        );
+        let tag = element.column(0).as_dictionary::<UInt8Type>();
+        assert_eq!(tag.keys().values(), &[1]);
+        assert_eq!(
+            tag.values().as_string::<i32>(),
+            &StringArray::from(vec!["x", "y"])
+        );
+    }
+
+    /// The recursion has to reach a dictionary nested two structs deep, and the
+    /// rebuild has to keep the live rows' own nulls.
+    #[test]
+    fn add_blanks_keeps_a_twice_nested_dictionary_and_its_nulls() {
+        let dictionary_type =
+            DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8));
+        let inner_fields = Fields::from(vec![Field::new("d", dictionary_type, false)]);
+        let inner = StructArray::new(
+            inner_fields.clone(),
+            vec![Arc::new(
+                DictionaryArray::<UInt8Type>::try_new(
+                    UInt8Array::from(vec![2u8, 0]),
+                    Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                )
+                .unwrap(),
+            ) as ArrayRef],
+            None,
+        );
+        let outer_fields = Fields::from(vec![Field::new(
+            "inner",
+            DataType::Struct(inner_fields),
+            true,
+        )]);
+        let outer = StructArray::new(
+            outer_fields,
+            vec![Arc::new(inner) as ArrayRef],
+            // The second live row is null.
+            Some(NullBuffer::from(vec![true, false])),
+        );
+        let batch = RecordBatch::try_from_iter(vec![("s", Arc::new(outer) as ArrayRef)]).unwrap();
+
+        let with_blanks = add_blanks(batch, &[1]).unwrap();
+
+        let out = with_blanks.column(0).as_struct();
+        assert_eq!(out.len(), 3);
+        assert!(!out.is_null(0), "the live row that had a value");
+        assert!(out.is_null(2), "the live row that was null stays null");
+        let dictionary = out
+            .column(0)
+            .as_struct()
+            .column(0)
+            .as_dictionary::<UInt8Type>();
+        assert_eq!(dictionary.keys().values(), &[2, 2, 0]);
+        assert_eq!(
+            dictionary.values().as_string::<i32>(),
+            &StringArray::from(vec!["a", "b", "c"]),
+            "the values array must survive untouched"
+        );
+    }
+
+    /// A blank under a `FixedSizeList` owes the width its slots, but a list below
+    /// that owes `interleave`'s offsets an empty entry — not row 0's elements.
+    #[test]
+    fn add_blanks_keeps_a_dictionary_under_a_fixed_size_list_aligned() {
+        let dictionary_type =
+            DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8));
+        let tags = ListArray::new(
+            Arc::new(Field::new("item", dictionary_type, false)),
+            OffsetBuffer::new(vec![0, 1, 2, 3, 3].into()),
+            Arc::new(
+                DictionaryArray::<UInt8Type>::try_new(
+                    UInt8Array::from(vec![0u8, 1, 2]),
+                    Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                )
+                .unwrap(),
+            ) as ArrayRef,
+            None,
+        );
+        let list_type = tags.data_type().clone();
+        let element_fields = Fields::from(vec![Field::new("tags", list_type, false)]);
+        let element = StructArray::new(
+            element_fields.clone(),
+            vec![Arc::new(tags) as ArrayRef],
+            None,
+        );
+        // Two rows of two elements each: [[a], [b]] and [[c], []].
+        let outer = FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Struct(element_fields), false)),
+            2,
+            Arc::new(element) as ArrayRef,
+            None,
+        );
+        let batch = RecordBatch::try_from_iter(vec![("f", Arc::new(outer) as ArrayRef)]).unwrap();
+
+        let with_blanks = add_blanks(batch, &[1]).unwrap();
+
+        let out = with_blanks.column(0).as_fixed_size_list();
+        assert_eq!(out.len(), 3);
+        let tags = out.values().as_struct().column(0).as_list::<i32>();
+        let entries = tags.values().as_dictionary::<UInt8Type>();
+        assert_eq!(
+            entries.keys().values(),
+            &[0, 1, 2],
+            "a blank contributes no element, so no key moves"
+        );
+        assert_eq!(
+            entries.values().as_string::<i32>(),
+            &StringArray::from(vec!["a", "b", "c"])
+        );
+        assert_eq!(
+            (0..tags.len())
+                .map(|i| tags.value_length(i))
+                .collect::<Vec<_>>(),
+            vec![1, 1, 0, 0, 1, 0],
+            "the blank's two elements are empty lists"
+        );
+    }
+
+    /// The same for the two containers `List` does not cover.
+    #[test]
+    fn add_blanks_keeps_a_mapped_and_large_listed_dictionary_valid() {
+        let dictionary_type =
+            DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8));
+        let dictionary = || {
+            Arc::new(
+                DictionaryArray::<UInt8Type>::try_new(
+                    UInt8Array::from(vec![2u8, 0]),
+                    Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                )
+                .unwrap(),
+            ) as ArrayRef
+        };
+        let entry_fields = Fields::from(vec![
+            Field::new("keys", DataType::Utf8, false),
+            Field::new("values", dictionary_type.clone(), true),
+        ]);
+        let map = MapArray::new(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(entry_fields.clone()),
+                false,
+            )),
+            OffsetBuffer::new(vec![0, 2].into()),
+            StructArray::new(
+                entry_fields,
+                vec![
+                    Arc::new(StringArray::from(vec!["k0", "k1"])) as ArrayRef,
+                    dictionary(),
+                ],
+                None,
+            ),
+            None,
+            false,
+        );
+        let large = LargeListArray::new(
+            Arc::new(Field::new("item", dictionary_type, false)),
+            OffsetBuffer::new(vec![0i64, 2].into()),
+            dictionary(),
+            None,
+        );
+        let batch = RecordBatch::try_from_iter(vec![
+            ("m", Arc::new(map) as ArrayRef),
+            ("l", Arc::new(large) as ArrayRef),
+        ])
+        .unwrap();
+
+        let with_blanks = add_blanks(batch, &[1]).unwrap();
+
+        let map = with_blanks.column(0).as_map();
+        assert_eq!(map.value_length(1), 0, "the blank is an empty map");
+        let large = with_blanks.column(1).as_list::<i64>();
+        assert_eq!(large.value_length(1), 0, "the blank is an empty list");
+        for entries in [
+            map.entries().column(1).as_dictionary::<UInt8Type>(),
+            large.values().as_dictionary::<UInt8Type>(),
+        ] {
+            assert_eq!(entries.keys().values(), &[2, 0]);
+            assert_eq!(
+                entries.values().as_string::<i32>(),
+                &StringArray::from(vec!["a", "b", "c"]),
+                "the values array must survive untouched"
+            );
+        }
+    }
+
+    /// The offsets a sliced batch reports are absolute, and a null row keeps its
+    /// null: both are properties the element translation has to respect.
+    #[test]
+    fn add_blanks_keeps_a_sliced_list_and_its_nulls() {
+        let list = ListArray::new(
+            Arc::new(Field::new(
+                "item",
+                DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8)),
+                false,
+            )),
+            OffsetBuffer::new(vec![0, 1, 2, 3].into()),
+            Arc::new(
+                DictionaryArray::<UInt8Type>::try_new(
+                    UInt8Array::from(vec![0u8, 1, 2]),
+                    Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                )
+                .unwrap(),
+            ) as ArrayRef,
+            Some(NullBuffer::from(vec![true, true, false])),
+        );
+        let batch = RecordBatch::try_from_iter(vec![("l", Arc::new(list) as ArrayRef)]).unwrap();
+        // Drop row 0, so the remaining rows' offsets start at 1.
+        let batch = batch.slice(1, 2);
+
+        let with_blanks = add_blanks(batch, &[1]).unwrap();
+
+        let out = with_blanks.column(0).as_list::<i32>();
+        assert_eq!(out.len(), 3);
+        assert!(out.is_null(1), "the blank of a nullable column is a null");
+        assert!(out.is_null(2), "the live row that was null stays null");
+        let entries = out.values().as_dictionary::<UInt8Type>();
+        assert_eq!(
+            entries.keys().values(),
+            &[1, 2],
+            "the sliced rows own elements 1 and 2"
+        );
+    }
+
+    /// A dictionary that fills its key type cannot be merged with a second one,
+    /// so `interleave` must never be handed the real values array: the flat case
+    /// errors inside `merge_dictionary_values`, and the `FixedSizeList` case
+    /// panics inside `MutableArrayData`.
+    #[test]
+    fn add_blanks_survives_a_saturated_dictionary() {
+        // Every key of a `UInt8` dictionary, all referenced.
+        let entries = (0..=255u16).map(|i| i.to_string()).collect::<Vec<_>>();
+        let values = Arc::new(StringArray::from(entries.clone()));
+        let dictionary = || {
+            Arc::new(
+                DictionaryArray::<UInt8Type>::try_new(
+                    UInt8Array::from((0..=255u8).collect::<Vec<_>>()),
+                    values.clone(),
+                )
+                .unwrap(),
+            ) as ArrayRef
+        };
+        // Two elements per row, so its child references every key twice.
+        let listed = FixedSizeListArray::new(
+            Arc::new(Field::new(
+                "item",
+                DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8)),
+                false,
+            )),
+            2,
+            Arc::new(
+                DictionaryArray::<UInt8Type>::try_new(
+                    UInt8Array::from((0..=255u8).chain(0..=255u8).collect::<Vec<_>>()),
+                    values.clone(),
+                )
+                .unwrap(),
+            ) as ArrayRef,
+            None,
+        );
+        let batch = RecordBatch::try_from_iter(vec![
+            ("flat", dictionary()),
+            ("listed", Arc::new(listed) as ArrayRef),
+        ])
+        .unwrap();
+
+        let with_blanks = add_blanks(batch, &[1]).unwrap();
+
+        assert_eq!(with_blanks.num_rows(), 257);
+        let flat = with_blanks.column(0).as_dictionary::<UInt8Type>();
+        assert_eq!(
+            flat.values().as_string::<i32>(),
+            &StringArray::from(entries),
+            "the values array must survive untouched"
+        );
+        // Row 0 keeps key 0, and the blank at position 1 copies it.
+        assert_eq!(&flat.keys().values()[..3], &[0, 0, 1]);
+    }
+
+    /// A dictionary of nulls never reaches the merge — its values type is neither
+    /// byte nor primitive, so `interleave` concatenates instead, and that
+    /// overflows on the values count alone. The stub has to cover it too.
+    #[test]
+    fn add_blanks_survives_a_saturated_dictionary_of_nulls() {
+        let dictionary = DictionaryArray::<arrow_array::types::Int8Type>::try_new(
+            Int8Array::from(vec![0i8]),
+            Arc::new(NullArray::new(130)) as ArrayRef,
+        )
+        .unwrap();
+        let batch =
+            RecordBatch::try_from_iter(vec![("d", Arc::new(dictionary) as ArrayRef)]).unwrap();
+
+        let with_blanks = add_blanks(batch, &[1]).unwrap();
+
+        assert_eq!(with_blanks.num_rows(), 2);
+        let out = with_blanks
+            .column(0)
+            .as_dictionary::<arrow_array::types::Int8Type>();
+        assert_eq!(out.keys().values(), &[0, 0]);
+        assert_eq!(
+            out.values().len(),
+            130,
+            "the values array must survive untouched"
+        );
     }
 }
