@@ -235,7 +235,13 @@ impl TryFrom<PbIvf> for IvfModel {
                 .collect_vec(),
             _ => proto.offsets.iter().map(|x| *x as usize).collect(),
         };
-        assert_eq!(offsets.len(), proto.lengths.len());
+        if offsets.len() != proto.lengths.len() {
+            return Err(Error::index(format!(
+                "Corrupt IVF metadata: {} offsets do not match {} partition lengths",
+                offsets.len(),
+                proto.lengths.len()
+            )));
+        }
         Ok(Self {
             centroids,
             offsets,
@@ -294,6 +300,19 @@ mod tests {
         // from an absent one.
         ivf.add_partition(0);
         assert_eq!(ivf.row_range(1), 20..20);
+    }
+
+    #[test]
+    fn test_ivf_model_rejects_mismatched_proto_lengths() {
+        // A corrupt or foreign index file can carry mismatched offsets and
+        // lengths; the parse boundary must error instead of panicking.
+        let proto = pb::Ivf {
+            lengths: vec![1, 2, 3],
+            offsets: vec![0, 3],
+            ..Default::default()
+        };
+        let err = IvfModel::try_from(proto).unwrap_err();
+        assert!(err.to_string().contains("do not match"));
     }
 
     #[tokio::test]
