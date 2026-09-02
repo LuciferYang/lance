@@ -724,6 +724,37 @@ def test_index_with_pq_codebook_rejects_wrong_num_bits_shape(tmp_path):
         )
 
 
+def test_supplied_codebook_and_centroids_dimension_mismatch(dataset):
+    # A codebook whose sub-vector width disagrees with the column is sliced
+    # by the column-derived width downstream: a wider codebook silently
+    # trains on misaligned bytes (a garbage index), a narrower one panics
+    # out of bounds. Both must be rejected at the boundary with the widths.
+    bad_codebook = np.random.randn(8, 256, 32).astype(np.float32)
+    with pytest.raises(ValueError, match="PQ codebook has"):
+        dataset.create_index(
+            "vector",
+            index_type="IVF_PQ",
+            num_partitions=4,
+            num_sub_vectors=8,  # 128 / 8 = 16 expected, codebook carries 32
+            ivf_centroids=np.random.randn(4, 128).astype(np.float32),
+            pq_codebook=bad_codebook,
+        )
+
+    bad_centroids = pa.FixedSizeListArray.from_arrays(
+        pa.array(np.random.randn(4, 64).astype(np.float32).reshape(-1)), 64
+    )
+    with pytest.raises(
+        ValueError, match="Ivf centroids dimension 64 does not match the vector column"
+    ):
+        dataset.create_index(
+            "vector",
+            index_type="IVF_PQ",
+            num_partitions=4,
+            num_sub_vectors=8,
+            ivf_centroids=bad_centroids,
+        )
+
+
 @pytest.mark.cuda
 @pytest.mark.parametrize("nullify", [False, True])
 def test_create_index_using_cuda(tmp_path, nullify):
