@@ -519,7 +519,13 @@ async fn prepare_vector_segment_build(
     mode: &str,
     require_precomputed_ivf: bool,
     fragment_ids: Option<&[u32]>,
-) -> Result<(DataType, IndexType, IvfBuildParams, Box<dyn Shuffler>)> {
+) -> Result<(
+    DataType,
+    IndexType,
+    IvfBuildParams,
+    Box<dyn Shuffler>,
+    TempStdDir,
+)> {
     let stages = &params.stages;
 
     if stages.is_empty() {
@@ -596,7 +602,10 @@ async fn prepare_vector_segment_build(
         Some(progress),
     );
 
-    Ok((element_type, index_type, ivf_params, shuffler))
+    // The shuffler only carries the directory path, so the guard must
+    // outlive it: handed back to the caller, it removes the scratch
+    // directory once the build that uses the shuffler finishes.
+    Ok((element_type, index_type, ivf_params, shuffler, temp_dir))
 }
 
 /// Build a Distributed Vector Index for specific fragments
@@ -612,16 +621,20 @@ pub(crate) async fn build_distributed_vector_index(
     fragment_ids: &[u32],
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<(Uuid, Vec<IndexFile>)> {
-    let (element_type, index_type, ivf_params, shuffler) = prepare_vector_segment_build(
-        dataset,
-        column,
-        params,
-        progress.clone(),
-        "Build Distributed Vector Index",
-        true,
-        Some(fragment_ids),
-    )
-    .await?;
+    // The scratch-dir guard must stay a named binding in this scope: the
+    // shuffler only carries the directory path, and dropping the guard
+    // before the build finishes would remove the directory under it.
+    let (element_type, index_type, ivf_params, shuffler, _shuffle_temp_dir) =
+        prepare_vector_segment_build(
+            dataset,
+            column,
+            params,
+            progress.clone(),
+            "Build Distributed Vector Index",
+            true,
+            Some(fragment_ids),
+        )
+        .await?;
     let stages = &params.stages;
 
     let ivf_centroids = ivf_params
@@ -1013,16 +1026,19 @@ async fn build_vector_index_impl(
     progress: Arc<dyn IndexBuildProgress>,
     fragment_ids: Option<&[u32]>,
 ) -> Result<Vec<IndexFile>> {
-    let (element_type, index_type, ivf_params, shuffler) = prepare_vector_segment_build(
-        dataset,
-        column,
-        params,
-        progress.clone(),
-        "Build Vector Index",
-        false,
-        fragment_ids,
-    )
-    .await?;
+    // Keep the scratch-dir guard named and alive for the whole build (see
+    // the distributed call site above).
+    let (element_type, index_type, ivf_params, shuffler, _shuffle_temp_dir) =
+        prepare_vector_segment_build(
+            dataset,
+            column,
+            params,
+            progress.clone(),
+            "Build Vector Index",
+            false,
+            fragment_ids,
+        )
+        .await?;
     let stages = &params.stages;
 
     match index_type {
@@ -2523,6 +2539,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results.num_rows(), 10, "Should return 10 nearest neighbors");
+    }
+
+    /// The shuffler carries only the scratch-directory path, so the
+    /// TempStdDir guard must be handed back to the caller: dropping it inside
+    /// `prepare_vector_segment_build` removed the directory before the build
+    /// wrote into it (the writer recreated it), and nothing ever cleaned it
+    /// up afterwards - one leaked scratch directory per index build.
+    #[tokio::test]
+    async fn test_prepare_vector_segment_build_keeps_scratch_dir_alive() {
+        use lance_index::progress::NoopIndexBuildProgress;
+
+        let test_dir = TempStrDir::default();
+        let uri = format!("{}/ds", test_dir.as_str());
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("vector", array::rand_vec::<Float32Type>(8.into()))
+            .into_reader_rows(RowCount::from(64), BatchCount::from(1));
+        let dataset = Dataset::write(reader, &uri, None).await.unwrap();
+
+        let params = VectorIndexParams::ivf_flat(2, MetricType::L2);
+        let (_, _, _, _shuffler, scratch_dir) = prepare_vector_segment_build(
+            &dataset,
+            "vector",
+            &params,
+            Arc::new(NoopIndexBuildProgress),
+            "test",
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let scratch_path = std::path::PathBuf::from(scratch_dir.as_ref());
+        assert!(scratch_path.exists());
+        drop(scratch_dir);
+        assert!(!scratch_path.exists());
     }
 
     #[tokio::test]
