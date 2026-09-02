@@ -269,8 +269,10 @@ impl<'a> CreateIndexBuilder<'a> {
             .dataset
             .open_frag_reuse_index(&NoOpMetricsCollector)
             .await?;
-        let index_name = if let Some(name) = self.name.take() {
-            name
+        // Read without consuming: a failed build must leave the requested name in
+        // place so a retry commits under it instead of an auto-generated one.
+        let index_name = if let Some(name) = self.name.as_deref() {
+            name.to_string()
         } else {
             // Generate default name with collision handling.
             // A name is available when there is no existing index with:
@@ -711,8 +713,10 @@ impl<'a> CreateIndexBuilder<'a> {
         };
 
         let indices = load_all_indices(self.dataset).await?;
-        let index_name = if let Some(name) = self.name.take() {
-            name
+        // Read without consuming: a failed build must leave the requested name in
+        // place so a retry commits under it instead of an auto-generated one.
+        let index_name = if let Some(name) = self.name.as_deref() {
+            name.to_string()
         } else {
             let column_path = default_index_name(&names);
             let base_name = format!("{column_path}_idx");
@@ -1480,6 +1484,39 @@ mod tests {
         assert_eq!(resolved[1].as_ref().unwrap().id() as u32, first);
         assert_eq!(resolved[2].as_ref().unwrap().id() as u32, second);
         assert!(resolved[3].is_none());
+    }
+
+    /// A failed `execute_uncommitted` must not consume the requested index
+    /// name: a caller that retries the build after a transient failure would
+    /// otherwise commit under an auto-generated name.
+    #[tokio::test]
+    async fn test_failed_execute_uncommitted_preserves_name() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+        let batch = create_text_batch(0, 10);
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], create_text_batch(0, 1).schema());
+        let mut dataset = Dataset::write(batches, &dataset_uri, None).await.unwrap();
+
+        let params = InvertedIndexParams::default();
+        dataset
+            .create_index_builder(&["text"], IndexType::Inverted, &params)
+            .name("retry_idx".to_string())
+            .execute()
+            .await
+            .unwrap();
+
+        dataset
+            .create_index_builder(&["text"], IndexType::Inverted, &params)
+            .name("retry_idx".to_string()) // replace=false: duplicate name errors
+            .execute()
+            .await
+            .unwrap_err();
+
+        let mut builder = dataset
+            .create_index_builder(&["text"], IndexType::Inverted, &params)
+            .name("retry_idx".to_string());
+        builder.execute_uncommitted().await.unwrap_err();
+        assert_eq!(builder.name.as_deref(), Some("retry_idx"));
     }
 
     #[tokio::test]
