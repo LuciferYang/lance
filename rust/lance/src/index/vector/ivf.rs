@@ -3679,6 +3679,44 @@ fn update_refined_centroids(
     f32_fsl_from_values(next, dimension)
 }
 
+/// The streaming trainers accumulate and re-dispatch in f32, so training
+/// chunks must arrive as Float32. `convert_to_floating_point` cannot do this
+/// on its own: it returns f16/f64 inputs unchanged and widens 64-bit and
+/// unsigned integers to Float64, and downstream f32-only kernels hit both
+/// as a downcast panic.
+fn cast_training_data_to_f32(training_data: FixedSizeListArray) -> Result<FixedSizeListArray> {
+    match training_data.value_type() {
+        DataType::Float32 => Ok(training_data),
+        DataType::Float16
+        | DataType::Float64
+        | DataType::Int8
+        | DataType::Int16
+        | DataType::Int32 => {
+            let values = arrow::compute::cast(training_data.values(), &DataType::Float32)?;
+            let DataType::FixedSizeList(field, _) = training_data.data_type().clone() else {
+                return Err(Error::invalid_input(format!(
+                    "expected a fixed size list of vectors, got {}",
+                    training_data.data_type()
+                )));
+            };
+            let field = Arc::new(arrow_schema::Field::new(
+                field.name(),
+                DataType::Float32,
+                field.is_nullable(),
+            ));
+            Ok(FixedSizeListArray::new(
+                field,
+                training_data.value_length(),
+                values,
+                training_data.nulls().cloned(),
+            ))
+        }
+        value_type => Err(Error::invalid_input(format!(
+            "streaming IVF training supports f16/f32/f64 and i8/i16/i32 vector columns, got {value_type}"
+        ))),
+    }
+}
+
 async fn refine_streaming_f32_kmeans_with_sampler(
     sampler: &FixedIvfTrainingSampler<'_>,
     metric_type: MetricType,
@@ -3699,11 +3737,7 @@ async fn refine_streaming_f32_kmeans_with_sampler(
             let ranges = sample_ranges.chunk(row_offset, streaming_sample_size.max(1));
             row_offset += ranges.iter().map(range_len).sum::<usize>();
             let (training_data, mt) = sampler.sample_ranges(&ranges, metric_type).await?;
-            let training_data = if training_data.value_type() == DataType::Float32 {
-                training_data
-            } else {
-                training_data.convert_to_floating_point()?
-            };
+            let training_data = cast_training_data_to_f32(training_data)?;
             if mt != DistanceType::L2 {
                 return Err(Error::invalid_input(format!(
                     "streaming IVF refinement currently supports L2/Cosine training, got {}",
@@ -3761,11 +3795,7 @@ async fn refine_streaming_f32_kmeans_with_resampling(
                 fragment_ids,
             )
             .await?;
-            let training_data = if training_data.value_type() == DataType::Float32 {
-                training_data
-            } else {
-                training_data.convert_to_floating_point()?
-            };
+            let training_data = cast_training_data_to_f32(training_data)?;
             if mt != DistanceType::L2 {
                 return Err(Error::invalid_input(format!(
                     "streaming IVF refinement currently supports L2/Cosine training, got {}",
@@ -4519,11 +4549,7 @@ async fn train_streaming_coreset_ivf_model(
             sample_ivf_training_chunk(dataset, column, step_sample_size, metric_type, fragment_ids)
                 .await?
         };
-        let training_data = if training_data.value_type() == DataType::Float32 {
-            training_data
-        } else {
-            training_data.convert_to_floating_point()?
-        };
+        let training_data = cast_training_data_to_f32(training_data)?;
         if mt != DistanceType::L2 {
             return Err(Error::invalid_input(format!(
                 "streaming coreset IVF currently supports L2/Cosine training, got {}",
@@ -6241,6 +6267,81 @@ mod tests {
             progress.progress_calls.load(Ordering::Relaxed) > 0,
             "expected the progress worker to receive at least one report"
         );
+    }
+
+    /// f16/f64 columns used to survive the streaming trainer's dtype
+    /// normalization unchanged (`convert_to_floating_point` only converts
+    /// integer types) and then hit the unconditional Float32 downcast in the
+    /// coreset path, panicking the build instead of training.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_streaming_coreset_ivf_training_float16() {
+        let values = generate_random_array_with_seed::<Float16Type>(2048 * 8, [22; 32]);
+        streaming_coreset_training_completes(values, 8).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_streaming_coreset_ivf_training_float64() {
+        let values = generate_random_array_with_seed::<Float64Type>(2048 * 8, [22; 32]);
+        streaming_coreset_training_completes(values, 8).await;
+    }
+
+    async fn streaming_coreset_training_completes<T: arrow_array::Array + 'static>(
+        values: T,
+        dimension: usize,
+    ) {
+        use lance_index::progress::IndexBuildProgress;
+
+        #[derive(Debug, Default)]
+        struct NoOpProgress;
+
+        #[async_trait::async_trait]
+        impl IndexBuildProgress for NoOpProgress {
+            async fn stage_start(&self, _: &str, _: Option<u64>, _: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn stage_progress(&self, _: &str, _: u64) -> Result<()> {
+                Ok(())
+            }
+            async fn stage_complete(&self, _: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let test_dir = TempStrDir::default();
+        let uri = format!("{}/ds", test_dir.as_str());
+        let fsl = FixedSizeListArray::try_new_from_values(values, dimension as i32).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            fsl.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        let dataset = Dataset::write(reader, &uri, None).await.unwrap();
+
+        let mut params = IvfBuildParams::new(257);
+        params.sample_rate = 8;
+        params.streaming_sample_rate = Some(4);
+        params.streaming_refine_passes = 1;
+        params.max_iters = 2;
+
+        let ivf_model = build_ivf_model(
+            &dataset,
+            "vector",
+            dimension,
+            MetricType::L2,
+            &params,
+            None,
+            Arc::new(NoOpProgress),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ivf_model.num_partitions(), 257);
+        assert_eq!(ivf_model.dimension(), dimension);
+        let centroids = ivf_model.centroids_array().expect("trained model");
+        assert_eq!(centroids.value_type(), DataType::Float32);
+        let centroid_values = centroids.values().as_primitive::<Float32Type>();
+        assert!(centroid_values.values().iter().all(|v| v.is_finite()));
     }
 
     #[test]
