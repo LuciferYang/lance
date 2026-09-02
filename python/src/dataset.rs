@@ -36,6 +36,7 @@ use pyo3::{
 };
 use uuid::Uuid;
 
+use arrow_array::FixedSizeListArray;
 use lance::dataset::AutoCleanupParams;
 use lance::dataset::cleanup::{CleanupFileKind, CleanupPolicyBuilder};
 use lance::dataset::refs::{Ref, TagContents};
@@ -5010,6 +5011,21 @@ fn prepare_vector_index_params(
                 }
                 _ => column_type,
             };
+            if let (DataType::FixedSizeList(_, expected_dim), Some(supplied)) = (
+                centroid_type,
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<FixedSizeListArray>(),
+            ) {
+                if supplied.value_length() != *expected_dim {
+                    return Err(PyValueError::new_err(format!(
+                        "Ivf centroids dimension {} does not match the vector column dimension {}",
+                        supplied.value_length(),
+                        expected_dim
+                    )));
+                }
+            }
 
             // It's important that the centroids are the same data type
             // as the vectors that will be indexed.
@@ -5091,6 +5107,52 @@ fn prepare_vector_index_params(
                 ));
             }
             let codebook = as_fixed_size_list_array(batch.column(0));
+            // The codebook buffer is sliced by column-derived arithmetic
+            // downstream, so a wrong size would silently train on misaligned
+            // bytes (oversized) or slice out of bounds (undersized).
+            let codebook_column_type = match column_type {
+                DataType::List(field)
+                    if matches!(field.data_type(), DataType::FixedSizeList(_, _)) =>
+                {
+                    field.data_type()
+                }
+                _ => column_type,
+            };
+            if let DataType::FixedSizeList(_, column_dim) = codebook_column_type {
+                let column_dim = *column_dim as usize;
+                if column_dim % pq_params.num_sub_vectors != 0 {
+                    return Err(PyValueError::new_err(format!(
+                        "PQ codebook requires the vector dimension {} to be divisible by \
+                         num_sub_vectors {}",
+                        column_dim, pq_params.num_sub_vectors
+                    )));
+                }
+                // The size arithmetic below shifts by num_bits; core PQ only
+                // supports 4 or 8 anyway (validated later, at transform
+                // time), so reject other values before they overflow here.
+                if !matches!(pq_params.num_bits, 4 | 8) {
+                    return Err(PyValueError::new_err(format!(
+                        "PQ codebook requires num_bits 4 or 8, got {}",
+                        pq_params.num_bits
+                    )));
+                }
+                let num_centroids = 1usize << pq_params.num_bits;
+                let expected = pq_params.num_sub_vectors
+                    * num_centroids
+                    * (column_dim / pq_params.num_sub_vectors);
+                if codebook.values().len() != expected {
+                    return Err(PyValueError::new_err(format!(
+                        "PQ codebook has {} values, but the vector column requires {} \
+                         (num_sub_vectors {} x {} centroids x dimension {} / num_sub_vectors {})",
+                        codebook.values().len(),
+                        expected,
+                        pq_params.num_sub_vectors,
+                        num_centroids,
+                        column_dim,
+                        pq_params.num_sub_vectors
+                    )));
+                }
+            }
             pq_params.codebook = Some(codebook.values().clone())
         };
 
