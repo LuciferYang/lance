@@ -81,10 +81,26 @@ where
 
     let vectors_slice = vectors.values();
     let centroids_slice = centroids.values();
+    let num_centroids = centroids_slice.len() / dimension;
     let mut residuals = Vec::with_capacity(vectors.len());
     for (idx, vector) in vectors_slice.chunks_exact(dimension).enumerate() {
         let part_id = part_ids[idx] as usize;
-        let c = &centroids_slice[part_id * dimension..(part_id + 1) * dimension];
+        let centroid_start = part_id.checked_mul(dimension).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Compute residual vector: partition id {part_id} overflows dimension {dimension}"
+            ))
+        })?;
+        let centroid_end = centroid_start.checked_add(dimension).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Compute residual vector: partition id {part_id} plus dimension {dimension} overflows"
+            ))
+        })?;
+        if centroid_end > centroids_slice.len() {
+            return Err(Error::invalid_input(format!(
+                "Compute residual vector: partition id {part_id} out of range for {num_centroids} centroids"
+            )));
+        }
+        let c = &centroids_slice[centroid_start..centroid_end];
         residuals.extend(iter::zip(vector, c).map(|(v, cent)| *v - *cent));
     }
     debug_assert_eq!(residuals.len(), vectors.len());
@@ -188,5 +204,35 @@ impl Transformer for ResidualTransform {
         };
 
         Ok(batch)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::Float32Array;
+    use arrow_array::UInt32Array;
+
+    fn fsl(rows: &[[f32; 4]]) -> FixedSizeListArray {
+        let values: Vec<f32> = rows.iter().flat_map(|r| r.iter().copied()).collect();
+        FixedSizeListArray::try_new_from_values(Float32Array::from(values), 4).unwrap()
+    }
+
+    #[test]
+    fn test_compute_residual_rejects_out_of_range_partition() {
+        // Partition ids come from the shuffle output or a user-supplied
+        // precomputed partitions file; an id beyond the centroid count must
+        // surface as an error, not a slice panic.
+        let centroids = fsl(&[[0.0; 4], [1.0; 4]]);
+        let vectors = fsl(&[[0.5; 4]]);
+        let part_ids = UInt32Array::from(vec![5]);
+        let err = compute_residual(
+            &centroids,
+            &vectors,
+            Some(DistanceType::L2),
+            Some(&part_ids),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("out of range"));
     }
 }
