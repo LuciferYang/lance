@@ -141,9 +141,12 @@ impl IvfModel {
     }
 
     pub fn row_range(&self, partition: usize) -> Range<usize> {
-        let start = self.offsets[partition];
-        let end = start + self.lengths[partition] as usize;
-        start..end
+        // partition_size reports 0 for a partition this model does not carry,
+        // so match it rather than panicking on the slice index.
+        match (self.offsets.get(partition), self.lengths.get(partition)) {
+            (Some(&start), Some(&len)) => start..start + len as usize,
+            _ => 0..0,
+        }
     }
 
     pub async fn load(reader: &V1FileReader) -> Result<Self> {
@@ -272,6 +275,23 @@ mod tests {
 
         assert_eq!(ivf.row_range(0), 0..20);
         assert_eq!(ivf.row_range(1), 20..70);
+    }
+
+    /// `row_range` and `partition_size` disagreed for a partition the model
+    /// does not carry: one panicked on the slice index, the other reported 0.
+    #[test]
+    fn test_row_range_out_of_range_is_empty() {
+        let mut ivf = IvfModel::empty();
+        ivf.add_partition(20);
+
+        assert_eq!(ivf.row_range(1), 0..0);
+        assert_eq!(ivf.row_range(usize::MAX), 0..0);
+        assert_eq!(ivf.partition_size(1), 0);
+
+        // A present partition with zero rows keeps its own offset, distinct
+        // from an absent one.
+        ivf.add_partition(0);
+        assert_eq!(ivf.row_range(1), 20..20);
     }
 
     #[tokio::test]
