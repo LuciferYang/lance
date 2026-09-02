@@ -197,19 +197,29 @@ fn kmeans_random_init<T: ArrowPrimitiveType>(
 
 /// Split one big cluster into two smaller clusters. After split, each
 /// cluster has approximately half of the vectors.
-fn split_clusters<T: Float + MulAssign>(
-    n: usize,
-    cnts: &mut [usize],
-    centroids: &mut [T],
-    dim: usize,
-) {
+fn split_clusters<T: Float + MulAssign>(cnts: &mut [usize], centroids: &mut [T], dim: usize) {
     let eps = T::from(1.0 / 1024.0).unwrap();
     let mut rng = SmallRng::from_os_rng();
     for i in 0..cnts.len() {
         if cnts[i] == 0 {
+            // A donor must hold at least two vectors to spare one. Rows
+            // without a cluster assignment (e.g. all-NaN vectors) can leave
+            // every non-empty cluster with a single member, which makes the
+            // acceptance probability below <= 0 for every j and the loop
+            // would never terminate.
+            if !cnts.iter().any(|&cnt| cnt >= 2) {
+                break;
+            }
+            // Normalize by donor mass rather than the total row count: the
+            // old denominator (n - k) misestimates the spare-member pool by
+            // (u - e), where u is unassigned rows and e is empty clusters.
+            // On NaN-heavy data u is close to n, which inflates the
+            // denominator ~n-fold and leaves the sampler rejecting for
+            // ~k * n draws. The guard above ensures the mass is at least 1.
+            let donor_mass: usize = cnts.iter().map(|&cnt| cnt.saturating_sub(1)).sum();
             let mut j = 0;
             loop {
-                let p = (cnts[j] as f32 - 1.0) / (n - cnts.len()) as f32;
+                let p = (cnts[j] as f32 - 1.0) / donor_mass as f32;
                 if rng.random::<f32>() < p {
                     break;
                 }
@@ -587,12 +597,7 @@ where
             }
         }
 
-        split_clusters(
-            data.len() / dimension,
-            cluster_sizes,
-            &mut centroids,
-            dimension,
-        );
+        split_clusters(cluster_sizes, &mut centroids, dimension);
 
         KMeans {
             centroids: Arc::new(PrimitiveArray::<T>::from(centroids)),
@@ -1806,6 +1811,48 @@ mod tests {
                 assert!(e.to_string().contains("smaller than"));
             }
         }
+    }
+
+    #[test]
+    fn test_train_with_nan_rows_no_hang() {
+        // Most rows are NaN, so they get no cluster membership and any
+        // cluster holds at most one vector: split_clusters has no donor.
+        // Depending on the RNG the single finite row is chosen as a centroid
+        // or not, but in both layouts the donor probability is <= 0, so
+        // training must stop splitting instead of sampling forever.
+        let dimension = 8;
+        let finite_row: Vec<f32> = std::iter::repeat_n(0.5, dimension).collect();
+        let mut data = vec![f32::NAN; 8 * dimension];
+        data[..dimension].copy_from_slice(&finite_row);
+        let data =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(data), dimension as i32)
+                .unwrap();
+        let params = KMeansParams {
+            max_iters: 2,
+            ..KMeansParams::default()
+        };
+        let model = KMeans::new_with_params(&data, 4, &params).unwrap();
+        assert_eq!(model.centroids.len(), 4 * dimension);
+        assert!(model.loss.is_finite());
+        let centroids = model
+            .centroids
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        assert!(centroids.values().iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn test_split_clusters_donor_exhaustion() {
+        // [2, 1, 0, 0]: splitting the first empty cluster consumes the only
+        // donor (2 -> 1 + 1), so the second empty cluster must observe that
+        // no donor is left and stop instead of sampling forever.
+        let dim = 2;
+        let mut cluster_sizes = vec![2usize, 1, 0, 0];
+        let mut centroids = vec![1.0f32, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0];
+        split_clusters(&mut cluster_sizes, &mut centroids, dim);
+        assert_eq!(cluster_sizes.iter().sum::<usize>(), 3);
+        assert!(cluster_sizes.iter().all(|&cnt| cnt <= 1));
     }
 
     #[test]
