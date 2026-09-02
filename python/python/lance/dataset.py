@@ -3976,6 +3976,14 @@ class LanceDataset(pa.dataset.Dataset):
                 fs, path = FileSystem.from_uri(ivf_centroids_file)
                 with fs.open_input_file(path) as f:
                     ivf_centroids = np.load(f)
+                if (
+                    num_partitions is not None
+                    and ivf_centroids.shape[0] != num_partitions
+                ):
+                    raise ValueError(
+                        f"Ivf centroids file has {ivf_centroids.shape[0]} clusters, "
+                        f"but num_partitions={num_partitions}"
+                    )
                 num_partitions = ivf_centroids.shape[0]
 
             if isinstance(num_partitions, float):

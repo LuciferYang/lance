@@ -1544,6 +1544,31 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     assert stats["indices"][0]["num_partitions"] == 5
 
 
+def test_ivf_centroids_file_num_partitions_mismatch(dataset, tmp_path: Path):
+    centroids = np.random.randn(4, 128).astype(np.float32)
+    centroids_file = tmp_path / "centroids.npy"
+    np.save(centroids_file, centroids)
+
+    with pytest.raises(ValueError, match="num_partitions=8"):
+        dataset.create_index(
+            ["vector"],
+            index_type="IVF_PQ",
+            ivf_centroids_file=str(centroids_file),
+            num_partitions=8,
+            num_sub_vectors=8,
+        )
+
+    indexed = dataset.create_index(
+        ["vector"],
+        index_type="IVF_PQ",
+        ivf_centroids_file=str(centroids_file),
+        num_partitions=4,
+        num_sub_vectors=8,
+    )
+    stats = indexed.stats.index_stats("vector_idx")
+    assert stats["indices"][0]["num_partitions"] == 4
+
+
 def test_create_ivf_pq_skip_transpose(dataset, tmp_path: Path):
     ds = lance.write_dataset(
         dataset.to_table(), tmp_path / "indexed_skip_transpose.lance"
