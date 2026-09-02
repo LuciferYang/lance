@@ -1521,6 +1521,28 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     partition_keys = {"size"}
     assert all([partition_keys == set(p.keys()) for p in partitions])
 
+    # num_partitions is deprecated in favor of target_partition_size; centroids
+    # supplied without num_partitions must not be rejected.
+    dataset_with_index = dataset.create_index(
+        ["vector"],
+        index_type="IVF_PQ",
+        metric="cosine",
+        ivf_centroids=centroids,
+        # Diverges from the centroid count on purpose (1000 rows / 250 = 4):
+        # the centroid count must win over target_partition_size.
+        target_partition_size=250,
+        num_sub_vectors=8,
+        replace=True,
+    )
+    actual = dataset_with_index.to_table(
+        columns=["id"],
+        nearest={"column": "vector", "q": q, "k": 10},
+    )["id"].to_numpy()
+    assert len(actual) == 10
+    # The centroid count wins over the diverging target_partition_size.
+    stats = dataset_with_index.stats.index_stats("vector_idx")
+    assert stats["indices"][0]["num_partitions"] == 5
+
 
 def test_create_ivf_pq_skip_transpose(dataset, tmp_path: Path):
     ds = lance.write_dataset(
