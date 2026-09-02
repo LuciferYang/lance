@@ -141,9 +141,12 @@ impl IvfModel {
     }
 
     pub fn row_range(&self, partition: usize) -> Range<usize> {
-        let start = self.offsets[partition];
-        let end = start + self.lengths[partition] as usize;
-        start..end
+        // Match partition_size, which reports 0 for a partition this model
+        // does not carry (e.g. a centroids-only model mid-build).
+        match (self.offsets.get(partition), self.lengths.get(partition)) {
+            (Some(&start), Some(&len)) => start..start + len as usize,
+            _ => 0..0,
+        }
     }
 
     pub async fn load(reader: &V1FileReader) -> Result<Self> {
@@ -272,6 +275,25 @@ mod tests {
 
         assert_eq!(ivf.row_range(0), 0..20);
         assert_eq!(ivf.row_range(1), 20..70);
+    }
+
+    #[test]
+    fn test_row_range_out_of_range_is_empty() {
+        // Partitions beyond the stored offsets can occur mid-build (e.g. a
+        // centroids-only model whose num_partitions comes from the
+        // centroids). They must behave like partition_size and yield an
+        // empty range instead of panicking on the slice index.
+        let mut ivf = IvfModel::empty();
+        ivf.add_partition(20);
+
+        assert_eq!(ivf.row_range(1), 0..0);
+        assert_eq!(ivf.row_range(usize::MAX), 0..0);
+        assert_eq!(ivf.partition_size(1), 0);
+
+        // A present partition with zero rows keeps its own offset, distinct
+        // from an absent one.
+        ivf.add_partition(0);
+        assert_eq!(ivf.row_range(1), 20..20);
     }
 
     #[tokio::test]
