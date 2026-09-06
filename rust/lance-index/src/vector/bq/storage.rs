@@ -2440,7 +2440,16 @@ impl QuantizerStorage for RabitQuantizationStorage {
         let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
         let codes = batch[RABIT_CODE_COLUMN].as_fixed_size_list().clone();
         let expected_code_bytes = metadata.binary_code_bytes();
-        if expected_code_bytes > 0 && codes.value_length() as usize != expected_code_bytes {
+        // code_dim=0 with no rotation matrix means the dimension was lost
+        // (e.g. malformed serialized metadata); without this guard the width check
+        // below is skipped entirely and any code width loads.
+        if expected_code_bytes == 0 {
+            return Err(Error::index(
+                "RabitQ metadata has no code dimension: code_dim=0 and no rotation matrix"
+                    .to_string(),
+            ));
+        }
+        if codes.value_length() as usize != expected_code_bytes {
             return Err(Error::invalid_input(format!(
                 "RabitQ code byte width mismatch: column {} has {} bytes, metadata rotated_dim={} requires {} bytes",
                 RABIT_CODE_COLUMN,
@@ -3003,6 +3012,25 @@ mod tests {
     fn test_new_rabit_metadata_uses_raw_query_estimator() {
         let metadata = make_test_metadata(64);
         assert_eq!(metadata.query_estimator, RabitQueryEstimator::RawQuery);
+    }
+
+    #[test]
+    fn test_degenerate_metadata_rejects_any_code_width() {
+        // Metadata missing the code dimension (code_dim defaults to 0 and no
+        // rotation matrix is present) used to skip the code-width check
+        // entirely, so a corrupt index loaded with arbitrary code widths and
+        // served garbage distances instead of failing at open time.
+        let metadata: RabitQuantizationMetadata =
+            serde_json::from_str(r#"{"num_bits":1,"packed":true}"#).unwrap();
+        assert_eq!(metadata.rotated_dim(), 0);
+
+        let codes =
+            FixedSizeListArray::try_new_from_values(UInt8Array::from(vec![0u8; 16]), 8).unwrap();
+        let batch = make_test_batch(codes);
+        let err =
+            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2, None)
+                .unwrap_err();
+        assert!(err.to_string().contains("no code dimension"), "got: {err}");
     }
 
     fn make_test_batch(codes: FixedSizeListArray) -> RecordBatch {
