@@ -68,23 +68,24 @@ impl BinaryQuantization {
 /// Use the sign bit of the float vector to represent the binary vector.
 fn binary_quantization<T: Float>(data: &[T]) -> impl Iterator<Item = u8> + '_ {
     let iter = data.chunks_exact(8);
-    iter.clone()
-        .map(|c| {
-            // Auto vectorized.
-            // Before changing this code, please check the assembly output.
-            let mut bits: u8 = 0;
-            c.iter().enumerate().for_each(|(idx, v)| {
-                bits |= (v.is_sign_positive() as u8) << idx;
-            });
-            bits
-        })
-        .chain(once(0).map(move |_| {
-            let mut bits: u8 = 0;
-            iter.remainder().iter().enumerate().for_each(|(idx, v)| {
-                bits |= (v.is_sign_positive() as u8) << idx;
-            });
-            bits
-        }))
+    // Only append a byte for the tail when a tail exists: an input whose
+    // length is a multiple of 8 must yield exactly ceil(len / 8) bytes.
+    let has_remainder = !iter.remainder().is_empty();
+    let mut remainder_bits: u8 = 0;
+    iter.remainder()
+        .iter()
+        .enumerate()
+        .for_each(|(idx, v)| remainder_bits |= (v.is_sign_positive() as u8) << idx);
+    iter.map(|c| {
+        // Auto vectorized.
+        // Before changing this code, please check the assembly output.
+        let mut bits: u8 = 0;
+        c.iter().enumerate().for_each(|(idx, v)| {
+            bits |= (v.is_sign_positive() as u8) << idx;
+        });
+        bits
+    })
+    .chain(once(remainder_bits).filter(move |_| has_remainder))
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,6 +226,20 @@ mod tests {
         test_bq::<f16>();
         test_bq::<f32>();
         test_bq::<f64>();
+    }
+
+    #[test]
+    fn test_binary_quantization_length_multiple_of_eight() {
+        // A full-chunk input must produce exactly ceil(len / 8) bytes; the
+        // remainder byte may only be appended when a remainder exists.
+        let data: Vec<f32> = [1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0]
+            .iter()
+            .cycle()
+            .take(16)
+            .copied()
+            .collect();
+        let result = binary_quantization(&data).collect::<Vec<_>>();
+        assert_eq!(result, vec![0b01010101, 0b01010101]);
     }
 
     #[test]
