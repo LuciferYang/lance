@@ -1699,6 +1699,26 @@ pub async fn build_ivf_model(
                 num_partitions * dim,
             )));
         }
+        // The flattened-length check alone accepts wrongly-shaped centroids
+        // (e.g. twice the rows at half the dimension), which then break the
+        // build far away from this boundary.
+        if centroids.value_length() as usize != dim {
+            return Err(Error::invalid_input(format!(
+                "IVF centroids dimension {} does not match the vector column dimension {}",
+                centroids.value_length(),
+                dim
+            )));
+        }
+        // Same-width centroids of a different dtype (e.g. f16 over an f32
+        // column) would later hit a blind downcast inside kmeans.
+        let (_, element_type) = get_vector_type(dataset.schema(), column)?;
+        if centroids.value_type() != element_type {
+            return Err(Error::invalid_input(format!(
+                "IVF centroids type {} does not match the vector column type {}",
+                centroids.value_type(),
+                element_type
+            )));
+        }
         return Ok(IvfModel::new(centroids.clone(), None));
     }
     let sample_size_hint = num_partitions * params.sample_rate;
@@ -6317,6 +6337,65 @@ mod tests {
             !is_callback_active.load(Ordering::SeqCst),
             "progress callback remained active after streaming IVF returned"
         );
+    }
+
+    /// Pre-computed centroids whose flattened length matches but whose
+    /// per-row width disagrees with the column used to pass validation and
+    /// break the build far away; reject them at this boundary instead.
+    #[tokio::test]
+    async fn test_build_ivf_model_rejects_wrong_width_centroids() {
+        use lance_index::progress::NoopIndexBuildProgress;
+
+        let test_dir = TempStrDir::default();
+        let uri = format!("{}/ds", test_dir.as_str());
+        let values = generate_random_array_with_seed::<Float32Type>(64 * 16, [22; 32]);
+        let fsl = FixedSizeListArray::try_new_from_values(values, 16).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            fsl.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let dataset = Dataset::write(reader, &uri, None).await.unwrap();
+
+        // 64 centroids of width 8 flatten to the same length as 32 rows of
+        // width 16, so the flattened check alone lets them through.
+        let values = generate_random_array_with_seed::<Float32Type>(64 * 8, [23; 32]);
+        let centroids = FixedSizeListArray::try_new_from_values(values, 8).unwrap();
+        let mut params = IvfBuildParams::new(32);
+        params.centroids = Some(Arc::new(centroids));
+
+        let err = build_ivf_model(
+            &dataset,
+            "vector",
+            16,
+            MetricType::L2,
+            &params,
+            None,
+            Arc::new(NoopIndexBuildProgress),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("does not match the vector column"));
+
+        // Same width, different dtype: also rejected at the boundary.
+        let values = generate_random_array_with_seed::<Float16Type>(32 * 16, [24; 32]);
+        let centroids = FixedSizeListArray::try_new_from_values(values, 16).unwrap();
+        let mut params = IvfBuildParams::new(32);
+        params.centroids = Some(Arc::new(centroids));
+        let err = build_ivf_model(
+            &dataset,
+            "vector",
+            16,
+            MetricType::L2,
+            &params,
+            None,
+            Arc::new(NoopIndexBuildProgress),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("centroids type"));
     }
 
     /// Regression test for a hang in the streaming *coreset* trainer
