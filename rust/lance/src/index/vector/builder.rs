@@ -614,6 +614,19 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         }
     }
 
+    /// The metric for choosing the nearest centroid while computing training
+    /// residuals. Index-time assignment rewrites cosine to normalize + L2
+    /// (see `new_ivf_transformer_with_quantizer`), and training normalizes
+    /// the same way before this point, so cosine maps to L2 here. Every
+    /// other metric — notably dot — must keep the requested metric so the
+    /// quantizer is trained on the same residual basis the encoder uses.
+    fn residual_training_metric(distance_type: DistanceType) -> DistanceType {
+        match distance_type {
+            DistanceType::Cosine => DistanceType::L2,
+            other => other,
+        }
+    }
+
     #[instrument(name = "load_or_build_quantizer", level = "debug", skip_all)]
     async fn load_or_build_quantizer(&self) -> Result<Q> {
         if self.quantizer.is_some() {
@@ -662,7 +675,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             (Some(ivf), true) => {
                 let ivf_transformer = lance_index::vector::ivf::new_ivf_transformer(
                     ivf.centroids.clone().unwrap(),
-                    DistanceType::L2,
+                    Self::residual_training_metric(self.distance_type),
                     vec![],
                 );
                 span!(Level::INFO, "compute residual for PQ training")
@@ -2681,6 +2694,57 @@ mod tests {
     use lance_index::vector::v3::shuffler::{
         ShufflePartition, ShufflePartitionWindow, ShufflePartitionWindowPlan,
     };
+
+    fn fsl_f32(rows: &[[f32; 2]]) -> arrow_array::FixedSizeListArray {
+        use lance_arrow::FixedSizeListArrayExt;
+        let values: Vec<f32> = rows.iter().flat_map(|r| r.iter().copied()).collect();
+        arrow_array::FixedSizeListArray::try_new_from_values(
+            arrow_array::Float32Array::from(values),
+            2,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_residual_training_metric_mapping() {
+        use lance_linalg::distance::DistanceType;
+        assert_eq!(
+            IvfIndexBuilder::<FlatIndex, FlatQuantizer>::residual_training_metric(DistanceType::L2),
+            DistanceType::L2
+        );
+        // Cosine data is normalized before residual computation and
+        // assigned by L2 downstream, matching index-time behavior.
+        assert_eq!(
+            IvfIndexBuilder::<FlatIndex, FlatQuantizer>::residual_training_metric(
+                DistanceType::Cosine
+            ),
+            DistanceType::L2
+        );
+        assert_eq!(
+            IvfIndexBuilder::<FlatIndex, FlatQuantizer>::residual_training_metric(
+                DistanceType::Dot
+            ),
+            DistanceType::Dot
+        );
+    }
+
+    #[test]
+    fn test_dot_residual_follows_dot_nearest_centroid() {
+        use lance_index::vector::ivf::new_ivf_transformer;
+        use lance_linalg::distance::DistanceType;
+
+        // v is nearer c0 under L2 but nearer c1 under dot; the residual
+        // must follow the dot-nearest centroid, matching the assignment
+        // the encoder uses at index time.
+        let centroids = fsl_f32(&[[0.1, 0.0], [3.0, 0.1]]);
+        let vectors = fsl_f32(&[[1.0, 0.0]]);
+        let transformer = new_ivf_transformer(centroids, DistanceType::Dot, vec![]);
+        let residual = transformer.compute_residual(&vectors).unwrap();
+        let values = residual
+            .values()
+            .as_primitive::<arrow_array::types::Float32Type>();
+        assert_eq!(values.values(), &[-2.0, -0.1]);
+    }
 
     struct SingleBatchReader {
         batch: RecordBatch,
