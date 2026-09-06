@@ -1315,7 +1315,8 @@ impl KMeans {
 
     /// Train a [`KMeans`] model with full parameters.
     ///
-    /// If the DistanceType is `Cosine`, the input vectors will be normalized with each iteration.
+    /// `Cosine` is not supported here: callers must normalize the input
+    /// vectors themselves and train with [`DistanceType::L2`].
     pub fn new_with_params(
         data: &FixedSizeListArray,
         k: usize,
@@ -1336,18 +1337,21 @@ impl KMeans {
         if k > 256 && params.hierarchical_k > 1 {
             log::debug!("Using hierarchical clustering for k={}", k);
             return match (data.value_type(), params.distance_type) {
-                (DataType::Float16, _) => Self::train_hierarchical_kmeans::<
-                    Float16Type,
-                    KMeansAlgoFloat<Float16Type>,
-                >(data, k, params),
-                (DataType::Float32, _) => Self::train_hierarchical_kmeans::<
-                    Float32Type,
-                    KMeansAlgoFloat<Float32Type>,
-                >(data, k, params),
-                (DataType::Float64, _) => Self::train_hierarchical_kmeans::<
-                    Float64Type,
-                    KMeansAlgoFloat<Float64Type>,
-                >(data, k, params),
+                (DataType::Float16, DistanceType::L2 | DistanceType::Dot) => {
+                    Self::train_hierarchical_kmeans::<Float16Type, KMeansAlgoFloat<Float16Type>>(
+                        data, k, params,
+                    )
+                }
+                (DataType::Float32, DistanceType::L2 | DistanceType::Dot) => {
+                    Self::train_hierarchical_kmeans::<Float32Type, KMeansAlgoFloat<Float32Type>>(
+                        data, k, params,
+                    )
+                }
+                (DataType::Float64, DistanceType::L2 | DistanceType::Dot) => {
+                    Self::train_hierarchical_kmeans::<Float64Type, KMeansAlgoFloat<Float64Type>>(
+                        data, k, params,
+                    )
+                }
                 (DataType::UInt8, DistanceType::Hamming) => {
                     Self::train_hierarchical_kmeans::<UInt8Type, KModeAlgo>(data, k, params)
                 }
@@ -1360,14 +1364,14 @@ impl KMeans {
         }
 
         match (data.value_type(), params.distance_type) {
-            (DataType::Float16, _) => {
+            (DataType::Float16, DistanceType::L2 | DistanceType::Dot) => {
                 Self::train_kmeans::<Float16Type, KMeansAlgoFloat<Float16Type>>(data, k, params)
             }
 
-            (DataType::Float32, _) => {
+            (DataType::Float32, DistanceType::L2 | DistanceType::Dot) => {
                 Self::train_kmeans::<Float32Type, KMeansAlgoFloat<Float32Type>>(data, k, params)
             }
-            (DataType::Float64, _) => {
+            (DataType::Float64, DistanceType::L2 | DistanceType::Dot) => {
                 Self::train_kmeans::<Float64Type, KMeansAlgoFloat<Float64Type>>(data, k, params)
             }
             (DataType::UInt8, DistanceType::Hamming) => {
@@ -1794,6 +1798,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_kmeans_rejects_cosine_and_hamming_for_floats() {
+        // Cosine/Hamming used to be accepted by the float dispatch arms and
+        // then hit a panic in the first membership pass; they must be
+        // rejected up front (callers normalize cosine input and train L2).
+        let dimension = 8;
+        let values: Vec<f32> = (0..16).map(|i| i as f32 * 0.5).collect();
+        let data =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(values), dimension).unwrap();
+        for distance_type in [DistanceType::Cosine, DistanceType::Hamming] {
+            let params = KMeansParams {
+                distance_type,
+                max_iters: 1,
+                ..KMeansParams::default()
+            };
+            let err = KMeans::new_with_params(&data, 2, &params).unwrap_err();
+            assert!(
+                err.to_string().contains("can not train"),
+                "expected rejection for {distance_type}, got: {err}"
+            );
+        }
+
+        // The hierarchical dispatch (k > 256 with default hierarchical_k)
+        // is a separate match that used to keep the wildcard arms.
+        let dimension = 8;
+        let values: Vec<f32> = (0..257 * dimension).map(|i| i as f32 * 0.5).collect();
+        let data =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(values), dimension).unwrap();
+        let params = KMeansParams {
+            distance_type: DistanceType::Cosine,
+            max_iters: 1,
+            ..KMeansParams::default()
+        };
+        let err = KMeans::new_with_params(&data, 257, &params).unwrap_err();
+        assert!(err.to_string().contains("can not train"), "got: {err}");
     }
 
     #[test]
