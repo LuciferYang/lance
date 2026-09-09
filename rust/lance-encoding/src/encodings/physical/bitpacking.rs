@@ -565,21 +565,6 @@ impl InlineBitpacking {
             )));
         }
 
-        // Short-circuit when the caller asked for zero rows from this chunk
-        // (e.g. a slice that does not intersect the chunk). Header + body
-        // length validation above is still useful (catches corruption), but
-        // we can skip the 1024-element scratch unpack + truncate. Mirrors the
-        // logical end-state of `decompressed.truncate(0)` while saving a
-        // 16 KiB stack/heap unpack and the kernel's per-value work.
-        if num_values == 0 {
-            return Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
-                data: LanceBuffer::empty(),
-                bits_per_value: 128,
-                num_values: 0,
-                block_info: BlockInfo::new(),
-            }));
-        }
-
         let mut decompressed = vec![0u128; ELEMS_PER_CHUNK as usize];
         unsafe { unpack_u128_chunk(bit_width, body, &mut decompressed) };
 
@@ -1350,6 +1335,7 @@ mod test {
     #[case::u16(16)]
     #[case::u32(32)]
     #[case::u64(64)]
+    #[case::u128(128)]
     fn test_inline_bitpacking_decompress_empty_miniblock(#[case] bit_width: u64) {
         let decompressor = InlineBitpacking::new(bit_width);
         let decompressed =
@@ -1372,6 +1358,7 @@ mod test {
     #[case::u16(16)]
     #[case::u32(32)]
     #[case::u64(64)]
+    #[case::u128(128)]
     fn test_inline_bitpacking_decompress_empty_block(#[case] bit_width: u64) {
         let decompressor = InlineBitpacking::new(bit_width);
         let decompressed =
@@ -1717,29 +1704,6 @@ mod test {
             matches!(err, Error::InvalidInput { .. }),
             "expected InvalidInput, got: {err:?}"
         );
-    }
-
-    #[test]
-    fn test_inline_bitpack_u128_num_values_zero_short_circuits_with_empty_block() {
-        // Positive-path coverage for the `num_values == 0` short-circuit at
-        // `unchunk_u128_dispatch:542` — must return an empty 128-bit
-        // `FixedWidthDataBlock` *after* the four malformed-header guards
-        // succeed, not as a side effect of one of those guards firing.
-        // Other tests that pass `num_values: 0` deliberately tripwire on
-        // an earlier validation branch (under-length buffer, unsupported
-        // width, etc.), so this short-circuit was previously only
-        // reachable in production.
-        let buf = make_u128_inline_buffer(24, (24 * ELEMS_PER_CHUNK) as usize / (8 * 16));
-
-        let decoder = InlineBitpacking::new(128);
-        let block = MiniBlockDecompressor::decompress(&decoder, vec![buf], 0)
-            .expect("valid header + body with num_values=0 must succeed");
-        let DataBlock::FixedWidth(fw) = block else {
-            panic!("expected FixedWidth, got: {block:?}");
-        };
-        assert_eq!(fw.num_values, 0);
-        assert_eq!(fw.bits_per_value, 128);
-        assert_eq!(fw.data.len(), 0);
     }
 
     #[test]
