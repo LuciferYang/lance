@@ -621,7 +621,7 @@ pub async fn build_pq_model_in_fragments(
             ivf.centroids.clone().unwrap(),
             MetricType::L2,
             vec![],
-        );
+        )?;
         span!(Level::INFO, "compute residual for PQ training")
             .in_scope(|| ivf2.compute_residual(&training_data))?
     } else {
@@ -862,7 +862,8 @@ mod tests {
             ivf.centroids.clone().unwrap(),
             MetricType::L2,
             vec![],
-        );
+        )
+        .unwrap();
 
         let residual_query = ivf2.compute_residual(&row).unwrap();
         let pq_code = pq.quantize(&residual_query).unwrap();

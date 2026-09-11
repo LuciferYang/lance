@@ -1045,7 +1045,7 @@ async fn optimize_ivf_pq_indices(
         vector_column,
         pq_index.pq.clone(),
         None,
-    );
+    )?;
 
     // Shuffled un-indexed data with partition.
     let shuffled = match unindexed {

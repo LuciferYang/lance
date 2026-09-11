@@ -48,22 +48,21 @@ impl PartitionTransformer {
         centroids: FixedSizeListArray,
         distance_type: DistanceType,
         input_column: impl AsRef<str>,
-    ) -> Self {
+    ) -> Result<Self> {
         let index = SimpleIndex::may_train_index(
             centroids.values().clone(),
             centroids.value_length() as usize,
             distance_type,
-        )
-        .unwrap();
+        )?;
 
-        Self {
+        Ok(Self {
             centroids,
             distance_type,
             input_column: input_column.as_ref().to_owned(),
             output_column: PART_ID_COLUMN.to_owned(),
             with_distance: false,
             index,
-        }
+        })
     }
 
     pub fn with_distance(mut self, with_distance: bool) -> Self {
@@ -231,7 +230,7 @@ mod tests {
     }
 
     fn transformer() -> PartitionTransformer {
-        PartitionTransformer::new(centroids(), DistanceType::L2, VECTOR_COLUMN)
+        PartitionTransformer::new(centroids(), DistanceType::L2, VECTOR_COLUMN).unwrap()
     }
 
     fn vector_batch(vectors: Vec<Vec<f32>>) -> RecordBatch {
