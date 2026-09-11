@@ -612,8 +612,8 @@ pub struct WriteParams {
     pub data_storage_version: Option<LanceFileVersion>,
 
     /// Experimental: if set to true, the writer will use stable row ids.
-    /// These row ids are stable after compaction operations, but not after updates.
-    /// This makes compaction more efficient, since with stable row ids no
+    /// These row ids persist across compaction and update operations. This
+    /// makes compaction more efficient, since with stable row ids no
     /// secondary indices need to be updated to point to new row ids.
     pub enable_stable_row_ids: bool,
 

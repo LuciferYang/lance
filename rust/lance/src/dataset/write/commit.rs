@@ -81,8 +81,8 @@ impl<'a> CommitBuilder<'a> {
         }
     }
 
-    /// Whether to use stable row ids. This makes the `_rowid` column stable
-    /// after compaction, but not updates.
+    /// Whether to use stable row ids. This makes the `_rowid` column persist
+    /// across compaction and update operations.
     ///
     /// This is only used for new datasets. Existing datasets will use their
     /// existing setting.

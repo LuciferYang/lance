@@ -8055,9 +8055,9 @@ def write_dataset(
         :meth:`LanceDataset.migrate_manifest_paths_v2` method. Default is True.
     enable_stable_row_ids : bool, optional
         Experimental parameter: if set to true, the writer will use stable row ids.
-        These row ids are stable after compaction operations, but not after updates.
-        This makes compaction more efficient, since with stable row ids no
-        secondary indices need to be updated to point to new row ids.
+        These row ids persist across compaction and update operations. This makes
+        compaction more efficient, since with stable row ids no secondary indices
+        need to be updated to point to new row ids.
     auto_cleanup_options: optional, AutoCleanupConfig
         Config options for automatic cleanup of the dataset.
         If set, and this is a new dataset, old dataset versions will be automatically

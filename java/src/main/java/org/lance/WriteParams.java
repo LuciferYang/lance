@@ -254,6 +254,14 @@ public class WriteParams {
       return this;
     }
 
+    /**
+     * Enable stable row ids. Experimental. Row ids persist across compaction and update operations,
+     * which makes compaction more efficient: with stable row ids, secondary indices do not need to
+     * be updated to point to new row ids.
+     *
+     * @param enableStableRowIds whether to enable stable row ids
+     * @return this builder
+     */
     public Builder withEnableStableRowIds(boolean enableStableRowIds) {
       this.enableStableRowIds = Optional.of(enableStableRowIds);
       return this;

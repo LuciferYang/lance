@@ -182,8 +182,8 @@ public class CommitBuilder {
   }
 
   /**
-   * Whether to use stable row ids. This makes the {@code _rowid} column stable after compaction,
-   * but not updates.
+   * Whether to use stable row ids. This makes the {@code _rowid} column persist across compaction
+   * and update operations.
    *
    * <p>This is only used for new datasets. Existing datasets will use their existing setting.
    * Default is false.
