@@ -124,6 +124,21 @@ impl Transformer for KeepFiniteVectors {
             }
         };
 
+        // Fast path: one flat-buffer finiteness check for the common case
+        // where every row is finite, avoiding the per-row iteration below
+        // that materializes an ArrayRef per vector.
+        let all_finite = data.null_count() == 0
+            && match data.value_type() {
+                DataType::Float16 => is_all_finite::<Float16Type>(data.values()),
+                DataType::Float32 => is_all_finite::<Float32Type>(data.values()),
+                DataType::Float64 => is_all_finite::<Float64Type>(data.values()),
+                DataType::UInt8 | DataType::Int8 => data.values().null_count() == 0,
+                _ => false,
+            };
+        if all_finite {
+            return Ok(batch.clone());
+        }
+
         let mut valid = Vec::with_capacity(batch.num_rows());
         data.iter().enumerate().for_each(|(idx, arr)| {
             if let Some(data) = arr {
