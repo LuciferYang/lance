@@ -275,6 +275,13 @@ fn split_clusters<T: Float + MulAssign>(cnts: &mut [usize], centroids: &mut [T],
     }
 }
 
+fn external_error(e: lance_core::Error) -> arrow_schema::ArrowError {
+    arrow_schema::ArrowError::ExternalError(Box::new(e))
+}
+
+type MembershipAndDists = (Vec<Option<u32>>, Vec<Option<f32>>);
+type MembershipAndLosses = (Vec<Option<u32>>, Vec<f32>, Vec<f64>);
+
 // compute the cluster sizes and return adjusted balance factor
 fn compute_cluster_sizes(
     membership: &[Option<u32>],
@@ -324,7 +331,7 @@ pub trait KMeansAlgo<T: Num> {
         balance_factor: f32,
         cluster_sizes: Option<&[usize]>,
         index: Option<&SimpleIndex>,
-    ) -> (Vec<Option<u32>>, Vec<f32>, Vec<f64>) {
+    ) -> Result<MembershipAndLosses> {
         let (membership, dists) = Self::compute_membership_and_dist(
             centroids,
             data,
@@ -333,7 +340,7 @@ pub trait KMeansAlgo<T: Num> {
             balance_factor,
             cluster_sizes,
             index,
-        );
+        )?;
 
         let k = centroids.len() / dimension;
         let mut cluster_radius = vec![0.0; k];
@@ -346,7 +353,7 @@ pub trait KMeansAlgo<T: Num> {
             }
         }
 
-        (membership, cluster_radius, losses)
+        Ok((membership, cluster_radius, losses))
     }
 
     fn compute_membership_and_dist(
@@ -357,7 +364,7 @@ pub trait KMeansAlgo<T: Num> {
         balance_factor: f32,
         cluster_sizes: Option<&[usize]>,
         index: Option<&SimpleIndex>,
-    ) -> (Vec<Option<u32>>, Vec<Option<f32>>);
+    ) -> Result<MembershipAndDists>;
 
     /// Construct a new KMeans model.
     fn to_kmeans(
@@ -497,7 +504,7 @@ where
         balance_factor: f32,
         cluster_sizes: Option<&[usize]>,
         index: Option<&SimpleIndex>,
-    ) -> (Vec<Option<u32>>, Vec<Option<f32>>) {
+    ) -> Result<MembershipAndDists> {
         let cluster_and_dists = match index {
             Some(index) => data
                 .par_chunks(dimension)
@@ -507,9 +514,8 @@ where
                     index
                         .search(Arc::new(query))
                         .map(|(id, dist)| Some((id, dist)))
-                        .unwrap()
                 })
-                .collect::<Vec<_>>(),
+                .collect::<core::result::Result<Vec<_>, _>>()?,
             None => match distance_type {
                 DistanceType::L2 => data
                     .par_chunks(dimension)
@@ -549,16 +555,16 @@ where
                             })
                             .collect::<Vec<_>>()
                     }),
-                _ => {
-                    panic!(
+                unsupported => {
+                    return Err(Error::index(format!(
                         "KMeans::find_partitions: {} is not supported",
-                        distance_type
-                    );
+                        unsupported
+                    )));
                 }
             },
         };
 
-        cluster_and_dists.into_iter().map(Option::unzip).unzip()
+        Ok(cluster_and_dists.into_iter().map(Option::unzip).unzip())
     }
 
     fn to_kmeans(
@@ -652,7 +658,7 @@ impl KMeansAlgo<u8> for KModeAlgo {
         balance_factor: f32,
         cluster_sizes: Option<&[usize]>,
         _: Option<&SimpleIndex>,
-    ) -> (Vec<Option<u32>>, Vec<Option<f32>>) {
+    ) -> Result<MembershipAndDists> {
         assert_eq!(distance_type, DistanceType::Hamming);
         let cluster_and_dists = data
             .par_chunks(dimension)
@@ -669,7 +675,7 @@ impl KMeansAlgo<u8> for KModeAlgo {
                 )
             })
             .collect::<Vec<_>>();
-        cluster_and_dists.into_iter().map(Option::unzip).unzip()
+        Ok(cluster_and_dists.into_iter().map(Option::unzip).unzip())
     }
 
     fn to_kmeans(
@@ -920,7 +926,7 @@ impl KMeans {
             (DataType::Float16, DataType::Float16, _) => {
                 let data_values = data.values().as_primitive::<Float16Type>().values();
                 let centroids = self.centroids.as_primitive::<Float16Type>().values();
-                Ok(KMeansAlgoFloat::<Float16Type>::compute_membership_and_dist(
+                KMeansAlgoFloat::<Float16Type>::compute_membership_and_dist(
                     centroids,
                     data_values,
                     self.dimension,
@@ -928,12 +934,13 @@ impl KMeans {
                     0.0,
                     None,
                     index.as_ref(),
-                ))
+                )
+                .map_err(external_error)
             }
             (DataType::Float32, DataType::Float32, _) => {
                 let data_values = data.values().as_primitive::<Float32Type>().values();
                 let centroids = self.centroids.as_primitive::<Float32Type>().values();
-                Ok(KMeansAlgoFloat::<Float32Type>::compute_membership_and_dist(
+                KMeansAlgoFloat::<Float32Type>::compute_membership_and_dist(
                     centroids,
                     data_values,
                     self.dimension,
@@ -941,12 +948,13 @@ impl KMeans {
                     0.0,
                     None,
                     index.as_ref(),
-                ))
+                )
+                .map_err(external_error)
             }
             (DataType::Float64, DataType::Float64, _) => {
                 let data_values = data.values().as_primitive::<Float64Type>().values();
                 let centroids = self.centroids.as_primitive::<Float64Type>().values();
-                Ok(KMeansAlgoFloat::<Float64Type>::compute_membership_and_dist(
+                KMeansAlgoFloat::<Float64Type>::compute_membership_and_dist(
                     centroids,
                     data_values,
                     self.dimension,
@@ -954,12 +962,13 @@ impl KMeans {
                     0.0,
                     None,
                     index.as_ref(),
-                ))
+                )
+                .map_err(external_error)
             }
             (DataType::UInt8, DataType::UInt8, DistanceType::Hamming) => {
                 let data_values = data.values().as_primitive::<UInt8Type>().values();
                 let centroids = self.centroids.as_primitive::<UInt8Type>().values();
-                Ok(KModeAlgo::compute_membership_and_dist(
+                KModeAlgo::compute_membership_and_dist(
                     centroids,
                     data_values,
                     self.dimension,
@@ -967,7 +976,8 @@ impl KMeans {
                     0.0,
                     None,
                     index.as_ref(),
-                ))
+                )
+                .map_err(external_error)
             }
             _ => Err(ArrowError::InvalidArgumentError(format!(
                 "KMeans: can not compute membership for data type {} with centroid type {} and distance type {}",
@@ -1064,7 +1074,7 @@ impl KMeans {
                     balance_factor,
                     Some(&cluster_sizes),
                     index.as_ref(),
-                );
+                )?;
 
                 adjusted_balance_factor =
                     compute_cluster_sizes(&membership, &radius, &losses, &mut cluster_sizes);
@@ -1111,30 +1121,29 @@ impl KMeans {
         dimension: usize,
         indices: &[usize],
         distance_type: DistanceType,
-    ) -> Vec<Option<u32>>
+    ) -> Result<Vec<Option<u32>>>
     where
         T::Native: Num,
     {
         let chunk_rows = (MEMBERSHIP_CHUNK_BYTES / (dimension * size_of::<T::Native>())).max(1);
-        indices
-            .par_chunks(chunk_rows)
-            .flat_map_iter(|chunk| {
-                let mut rows = Vec::with_capacity(chunk.len() * dimension);
-                for &idx in chunk {
-                    rows.extend_from_slice(&data_values[idx * dimension..(idx + 1) * dimension]);
-                }
-                let (membership, _) = Algo::compute_membership_and_dist(
-                    centroids,
-                    &rows,
-                    dimension,
-                    distance_type,
-                    0.0,
-                    None,
-                    None,
-                );
-                membership
-            })
-            .collect()
+        let mut membership = Vec::with_capacity(indices.len());
+        for chunk in indices.chunks(chunk_rows) {
+            let mut rows = Vec::with_capacity(chunk.len() * dimension);
+            for &idx in chunk {
+                rows.extend_from_slice(&data_values[idx * dimension..(idx + 1) * dimension]);
+            }
+            let (chunk_membership, _) = Algo::compute_membership_and_dist(
+                centroids,
+                &rows,
+                dimension,
+                distance_type,
+                0.0,
+                None,
+                None,
+            )?;
+            membership.extend(chunk_membership);
+        }
+        Ok(membership)
     }
 
     fn create_array_from_indices<T: ArrowNumericType>(
@@ -1299,7 +1308,7 @@ impl KMeans {
             dimension,
             &indices,
             params.distance_type,
-        );
+        )?;
         let mut children: Vec<(usize, Vec<usize>)> =
             (0..k).map(|centroid| (centroid, Vec::new())).collect();
         for (local, cluster) in membership.iter().enumerate() {
@@ -1425,7 +1434,7 @@ impl KMeans {
                 0.0,
                 None,
                 None,
-            );
+            )?;
             for (orphan, cluster) in orphans.into_iter().zip(membership) {
                 if let Some(cluster) = cluster {
                     funded[cluster as usize].0.1.push(orphan);
@@ -1771,7 +1780,7 @@ pub fn compute_partitions_arrow_array(
     centroids: &FixedSizeListArray,
     vectors: &FixedSizeListArray,
     distance_type: DistanceType,
-) -> arrow::error::Result<(Vec<Option<u32>>, Vec<Option<f32>>)> {
+) -> arrow::error::Result<MembershipAndDists> {
     if centroids.value_length() != vectors.value_length() {
         return Err(ArrowError::InvalidArgumentError(
             "Centroids and vectors have different dimensions".to_string(),
@@ -1841,6 +1850,10 @@ where
     T::Native: Num,
 {
     let dimension = dimension.as_();
+    // No SimpleIndex on this path, so the only Err is an unsupported
+    // metric for this algo (Cosine or Hamming for floats); callers must
+    // normalize the metric (Cosine -> L2) before calling — dispatch does
+    // not filter it.
     let (membership, _, losses) = K::compute_membership_and_loss(
         centroids.values(),
         vectors.values(),
@@ -1849,7 +1862,8 @@ where
         0.0,
         None,
         None,
-    );
+    )
+    .expect("KMeans::compute_partitions: unsupported distance type for this data type");
     (membership, losses.iter().sum::<f64>())
 }
 
@@ -1865,6 +1879,8 @@ where
     T::Native: Num,
 {
     let dimension = dimension.as_();
+    // Same invariant as compute_partitions above: no SimpleIndex, and the
+    // caller must have normalized the metric.
     K::compute_membership_and_dist(
         centroids.values(),
         vectors.values(),
@@ -1874,6 +1890,7 @@ where
         None,
         None,
     )
+    .expect("KMeans::compute_partitions_with_dists: unsupported distance type for this data type")
 }
 
 /// Train KMeans model and returns the centroids of each cluster.
@@ -2071,7 +2088,8 @@ mod tests {
             0.0,
             None,
             None,
-        );
+        )
+        .unwrap();
         let loss = losses.iter().sum::<f64>();
         assert!(loss > 0.0, "loss is not zero: {}", loss);
         membership.iter().for_each(|cd| {
@@ -2116,7 +2134,8 @@ mod tests {
             0.0,
             None,
             None,
-        );
+        )
+        .unwrap();
 
         membership.iter().for_each(|cd| assert!(cd.is_none()));
     }
@@ -2404,6 +2423,7 @@ mod tests {
                 sizes,
                 None,
             )
+            .unwrap()
             .0
         };
         assert_ne!(
@@ -2444,7 +2464,8 @@ mod tests {
             0.0,
             None,
             None,
-        );
+        )
+        .unwrap();
         for (row, cluster_id) in membership.iter().enumerate() {
             assert_eq!(
                 cluster_id.is_none(),
