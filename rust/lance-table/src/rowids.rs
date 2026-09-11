@@ -977,6 +977,9 @@ pub fn select_row_ids<'a>(
             Ok(sequence.iter().collect())
         }
         ReadBatchParams::RangeFrom(from) => {
+            if from.start > sequence.len() as usize {
+                return Err(out_of_bounds_err(from.start as u32));
+            }
             let sequence = sequence.slice(from.start, sequence.len() as usize - from.start);
             Ok(sequence.iter().collect())
         }
@@ -1262,6 +1265,9 @@ mod test {
             ReadBatchParams::Indices(vec![1, 4, 1000].into()),
             ReadBatchParams::Range(2..1000),
             ReadBatchParams::RangeTo(..1000),
+            // RangeFrom's bound is a start offset, so out-of-bounds means
+            // start > len; == len must stay valid (empty tail).
+            ReadBatchParams::RangeFrom(1000..),
         ];
 
         let sequence = RowIdSequence::from(0..10);
@@ -1271,6 +1277,10 @@ mod test {
             assert!(result.is_err());
             assert!(matches!(result.unwrap_err(), Error::InvalidInput { .. }));
         }
+
+        // start == len selects an empty tail, not an error.
+        let result = select_row_ids(&sequence, &ReadBatchParams::RangeFrom(10..));
+        assert_eq!(result.unwrap(), Vec::<u64>::new());
     }
 
     #[test]
