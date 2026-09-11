@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
+use arrow_array::types::{UInt32Type, UInt64Type};
 use arrow_array::{Array, FixedSizeListArray, UInt32Array, UInt64Array};
 use futures::TryStreamExt;
 use object_store::path::Path;
@@ -149,6 +150,15 @@ pub fn recommended_num_partitions(num_rows: usize, target_partition_size: usize)
     (num_rows / target_partition_size).clamp(1, MAX_PARTITIONS)
 }
 
+/// Describes a possibly-absent column for error messages, e.g. "missing" or
+/// "an Int64 column".
+fn describe_column(schema: &arrow_schema::Schema, name: &str) -> String {
+    match schema.field_with_name(name) {
+        Ok(field) => format!("a {} column", field.data_type()),
+        Err(_) => "no such column".to_string(),
+    }
+}
+
 /// Load precomputed partitions from disk.
 ///
 /// Currently, because `Dataset` is not cleanly refactored from `lance` to `lance-core`,
@@ -158,25 +168,89 @@ pub async fn load_precomputed_partitions(
     size_hint: usize,
 ) -> Result<HashMap<u64, u32>> {
     let partition_lookup = stream
-        .try_fold(HashMap::with_capacity(size_hint), |mut lookup, batch| {
-            let row_ids: &UInt64Array = batch
-                .column_by_name("row_id")
-                .expect("malformed partition file: missing row_id column")
-                .as_primitive();
-            let partitions: &UInt32Array = batch
-                .column_by_name("partition")
-                .expect("malformed partition file: missing partition column")
-                .as_primitive();
-            row_ids
-                .values()
-                .iter()
-                .zip(partitions.values().iter())
-                .for_each(|(row_id, partition)| {
-                    lookup.insert(*row_id, *partition);
-                });
-            async move { Ok(lookup) }
-        })
+        .try_fold(
+            HashMap::with_capacity(size_hint),
+            |mut lookup, batch| async move {
+                let row_ids: &UInt64Array = batch
+                    .column_by_name("row_id")
+                    .and_then(|col| col.as_primitive_opt::<UInt64Type>())
+                    .ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "malformed partition file: expected a UInt64 'row_id' column, got {}",
+                            describe_column(batch.schema_ref(), "row_id")
+                        ))
+                    })?;
+                let partitions: &UInt32Array = batch
+                    .column_by_name("partition")
+                    .and_then(|col| col.as_primitive_opt::<UInt32Type>())
+                    .ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "malformed partition file: expected a UInt32 'partition' column, got {}",
+                            describe_column(batch.schema_ref(), "partition")
+                        ))
+                    })?;
+                lookup.extend(
+                    row_ids
+                        .values()
+                        .iter()
+                        .copied()
+                        .zip(partitions.values().iter().copied()),
+                );
+                Ok(lookup)
+            },
+        )
         .await?;
 
     Ok(partition_lookup)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::RecordBatch;
+    use arrow_array::{Int64Array, UInt64Array};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use lance_io::stream::RecordBatchStreamAdapter;
+
+    fn stream_of(batch: RecordBatch) -> impl RecordBatchStream + Unpin {
+        let schema = batch.schema();
+        RecordBatchStreamAdapter::new(schema, futures::stream::iter(vec![Ok(batch)]))
+    }
+
+    #[tokio::test]
+    async fn test_load_precomputed_partitions_rejects_bad_columns() {
+        // A file without the expected typed columns used to panic via
+        // .expect; it must surface as an input error.
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "row_id",
+            DataType::Int64,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1i64]))]).unwrap();
+        let err = load_precomputed_partitions(stream_of(batch), 4)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("UInt64 'row_id'"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_load_precomputed_partitions_rejects_wrong_partition_type() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("row_id", DataType::UInt64, false),
+            Field::new("partition", DataType::Float32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(vec![1u64])),
+                Arc::new(arrow_array::Float32Array::from(vec![0.0f32])),
+            ],
+        )
+        .unwrap();
+        let err = load_precomputed_partitions(stream_of(batch), 4)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("UInt32 'partition'"), "got: {err}");
+    }
 }
