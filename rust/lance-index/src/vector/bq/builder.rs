@@ -166,7 +166,7 @@ fn best_ex_rescale_factor(abs_normalized: &[f32], ex_bits: u8) -> f32 {
     let mut current_codes = Vec::with_capacity(abs_normalized.len());
     let mut squared_denominator = abs_normalized.len() as f32 * 0.25;
     let mut numerator = 0.0f32;
-    let mut thresholds = Vec::with_capacity(abs_normalized.len() * max_code);
+    let mut thresholds = Vec::new();
 
     for (idx, &value) in abs_normalized.iter().enumerate() {
         if value <= 0.0 || !value.is_finite() {
@@ -984,7 +984,7 @@ mod tests {
         let mut current_codes = Vec::with_capacity(abs_normalized.len());
         let mut squared_denominator = abs_normalized.len() as f32 * 0.25;
         let mut numerator = 0.0f32;
-        let mut thresholds = Vec::with_capacity(abs_normalized.len() * max_code);
+        let mut thresholds = Vec::new();
 
         for (idx, &value) in abs_normalized.iter().enumerate() {
             if value <= 0.0 || !value.is_finite() {
