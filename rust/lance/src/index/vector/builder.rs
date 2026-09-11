@@ -666,6 +666,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         if self.quantizer.is_some() {
             return Ok(self.quantizer.clone().unwrap());
         }
+        // Fail before any sampling or residual work when there is nothing
+        // to build with.
+        if self.quantizer_params.is_none() {
+            return Err(Error::invalid_input("quantizer build params not set"));
+        }
 
         let Some(dataset) = self.dataset.as_ref() else {
             return Err(Error::invalid_input(
@@ -720,16 +725,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         info!("Start to train quantizer");
         let start = std::time::Instant::now();
-        let quantizer = match &self.quantizer {
-            Some(q) => q.clone(),
-            None => {
-                let quantizer_params = self
-                    .quantizer_params
-                    .as_ref()
-                    .ok_or(Error::invalid_input("quantizer build params not set"))?;
-                Q::build(&training_data, DistanceType::L2, quantizer_params)?
-            }
-        };
+        let quantizer_params = self.quantizer_params.as_ref().unwrap();
+        let quantizer = Q::build(&training_data, DistanceType::L2, quantizer_params)?;
         info!(
             "Trained quantizer in {:02} seconds",
             start.elapsed().as_secs_f32()
