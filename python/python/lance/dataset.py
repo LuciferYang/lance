@@ -3904,6 +3904,13 @@ class LanceDataset(pa.dataset.Dataset):
                     f"got {field.type.value_type}"
                 )
 
+        if index_cache_size is not None:
+            LOGGER.warning(
+                "index_cache_size is not applicable to index building; "
+                "the index cache is configured on the Dataset, not per-index. "
+                "This parameter is ignored."
+            )
+
         if not isinstance(metric, str) or metric.lower() not in [
             "l2",
             "cosine",
