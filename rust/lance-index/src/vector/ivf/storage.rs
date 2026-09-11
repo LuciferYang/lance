@@ -103,17 +103,19 @@ impl IvfModel {
     }
 
     /// Use the query vector to find `nprobes` closest partitions.
+    ///
+    /// Returns an error if the model carries no centroids: models that only
+    /// track sub-index offsets (e.g. HNSW) have no partitions to search.
     pub fn find_partitions(
         &self,
         query: &dyn Array,
         nprobes: usize,
         distance_type: DistanceType,
     ) -> Result<(UInt32Array, Float32Array)> {
-        let internal = crate::vector::ivf::new_ivf_transformer(
-            self.centroids.clone().unwrap(),
-            distance_type,
-            vec![],
-        );
+        let centroids = self.centroids.clone().ok_or_else(|| {
+            Error::index("IvfModel::find_partitions: the model has no centroids".to_string())
+        })?;
+        let internal = crate::vector::ivf::new_ivf_transformer(centroids, distance_type, vec![]);
         internal.find_partitions(query, nprobes)
     }
 
@@ -263,6 +265,22 @@ mod tests {
     use crate::pb;
 
     use super::*;
+
+    #[test]
+    fn test_find_partitions_without_centroids_errors() {
+        // IvfModel legitimately exists without centroids (it tracks
+        // sub-index offsets for HNSW); searching it must error, not panic
+        // on unwrap.
+        let mut ivf = IvfModel::empty();
+        ivf.add_partition(20);
+
+        let query = Float32Array::from(vec![0.0f32; 4]);
+        let query = arrow_array::FixedSizeListArray::try_new_from_values(query, 4).unwrap();
+        let err = ivf
+            .find_partitions(&query, 1, DistanceType::L2)
+            .unwrap_err();
+        assert!(err.to_string().contains("no centroids"), "got: {err}");
+    }
 
     #[test]
     fn test_ivf_find_rows() {
