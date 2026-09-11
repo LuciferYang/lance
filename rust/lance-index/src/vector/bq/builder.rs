@@ -420,7 +420,19 @@ impl RabitQuantizer {
             RQRotationType::Matrix => {
                 let rotate_mat = self.rotate_mat::<T>();
                 let rotate_mat = rotate_mat.slice(s![.., 0..dim]);
-                rotate_mat.dot(&vectors).mapv(|v| v.as_())
+                let ncols = vectors.ncols();
+                let mut rotated_data = vec![num_traits::Zero::zero(); code_dim * ncols];
+                rotated_data
+                    .par_chunks_mut(code_dim)
+                    .enumerate()
+                    .for_each(|(col_idx, dst)| {
+                        let column = vectors.column(col_idx);
+                        let rotated = rotate_mat.dot(&column);
+                        dst.copy_from_slice(rotated.as_slice().unwrap());
+                    });
+                ndarray::Array2::from_shape_vec((code_dim, ncols).f(), rotated_data)
+                    .unwrap()
+                    .mapv(|v| v.as_())
             }
             RQRotationType::Fast => {
                 let signs = self.fast_rotation_signs();
