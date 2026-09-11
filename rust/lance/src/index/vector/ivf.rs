@@ -4497,21 +4497,19 @@ fn train_weighted_hierarchical_f32_kmeans(
 
     let mut clusters = heap.into_vec();
     clusters.sort_by_key(|cluster| cluster.id);
-    while clusters.len() < target_k {
-        let duplicate = clusters
-            .iter()
-            .max_by(|left, right| {
-                left.weight
-                    .partial_cmp(&right.weight)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .cloned()
-            .ok_or_else(|| Error::index("No weighted clusters were trained"))?;
-        clusters.push(WeightedCluster {
-            id: next_cluster_id,
-            ..duplicate
-        });
-        next_cluster_id += 1;
+    if clusters.len() < target_k {
+        // Duplicating the heaviest cluster to pad the count used to leave
+        // permanently empty partitions: argmin ties always resolve to the
+        // first copy, so no vector is ever assigned to a duplicate. Match
+        // the flat hierarchical trainer, which rejects the request.
+        return Err(Error::invalid_input(format!(
+            "Cannot create {target_k} IVF partitions: weighted k-means could only form {} \
+             non-empty clusters. The dataset is likely too small or has too many \
+             (near-)duplicate vectors for this many partitions. Reduce num_partitions to \
+             <= {} or provide more diverse data.",
+            clusters.len(),
+            clusters.len()
+        )));
     }
     clusters.truncate(target_k);
 
@@ -6410,6 +6408,41 @@ mod tests {
         assert!(
             !is_callback_active.load(Ordering::SeqCst),
             "progress callback remained active after streaming IVF returned"
+        );
+    }
+
+    /// Duplicating the heaviest cluster to pad the partition count used to
+    /// yield permanently empty partitions (argmin ties always resolve to
+    /// the first copy); reject like the flat hierarchical trainer.
+    #[test]
+    fn test_weighted_hierarchical_rejects_padding_with_duplicates() {
+        let dimension = 8;
+        let num_points = 6;
+        let values: Vec<f32> = (0..num_points * dimension)
+            .map(|i| (i % 251) as f32 * 0.01)
+            .collect();
+        let data =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(values), dimension as i32)
+                .unwrap();
+        // Six distinct single-member clusters can never reach 16, so the
+        // trainer used to pad with duplicates of the heaviest cluster.
+        let params = WeightedHierarchicalKMeansParams {
+            dimension,
+            target_k: 16,
+            metric_type: MetricType::L2,
+            max_iters: 2,
+            on_progress: Arc::new(|_, _| {}),
+        };
+        let err = train_weighted_hierarchical_f32_kmeans(
+            &data,
+            &vec![1.0; num_points],
+            &vec![0.1; num_points],
+            &params,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("Cannot create 16 IVF partitions"),
+            "got: {err}"
         );
     }
 
