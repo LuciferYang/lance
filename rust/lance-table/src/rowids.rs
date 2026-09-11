@@ -897,6 +897,16 @@ pub fn rechunk_sequences(
         chunked_sequences.push(sequence);
     }
 
+    // The fill loop only drains empty segments while a chunk still needs
+    // rows, so a trailing empty segment (e.g. one a full-segment `delete`
+    // left behind) is still sitting in the iterator here. It carries no ids
+    // and must not be reported as excess.
+    while segment_iter
+        .peek()
+        .is_some_and(|segment| segment.is_empty())
+    {
+        segment_iter.next();
+    }
     if segment_iter.peek().is_some() {
         return Err(too_many_segments_error(
             chunked_sequences.len(),
@@ -1795,6 +1805,21 @@ mod test {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].len(), 2);
 
+        let elements: Vec<u64> = result[0].iter().collect();
+        assert_eq!(elements, vec![0, 1]);
+
+        // trailing empty segment: the final chunk is satisfied, so the fill
+        // loop exits without draining the iterator. A trailing empty segment
+        // carries no ids and must not be reported as excess.
+        let input_sequences = vec![
+            RowIdSequence::from(0..2),   // [0, 1] - 2 elements
+            RowIdSequence::from(10..10), // [] - 0 elements (trailing empty)
+        ];
+        let chunk_sizes = vec![2];
+        let result = rechunk_sequences(input_sequences, chunk_sizes, false).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 2);
         let elements: Vec<u64> = result[0].iter().collect();
         assert_eq!(elements, vec![0, 1]);
     }
