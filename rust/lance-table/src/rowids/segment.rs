@@ -312,6 +312,22 @@ impl U64Segment {
             return Self::Range(0..0);
         }
 
+        // A contiguous subslice of a Range is the Range itself; computing it
+        // directly avoids decoding the values and re-encoding them through
+        // from_slice's stats pass. Rechunking a long Range across K chunks
+        // otherwise decodes and re-encodes every chunk separately; the fast
+        // path is O(1) per slice. Out-of-bounds slices keep the generic path,
+        // which silently truncates rather than panicking.
+        if let Self::Range(range) = self
+            && let Some(end) = offset
+                .checked_add(len)
+                .and_then(|end| u64::try_from(end).ok())
+            && end <= range.end - range.start
+        {
+            let start = range.start + offset as u64;
+            return Self::Range(start..start + len as u64);
+        }
+
         let values: Vec<u64> = self.iter().skip(offset).take(len).collect();
 
         // `from_slice` will compute stats and select the best representation.
@@ -857,6 +873,38 @@ impl SegmentCursorState {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn test_range_slice_matches_generic_path() {
+        // The fast path must agree with decode-and-re-encode for every
+        // in-bounds slice: same representation (a contiguous run re-encodes
+        // to a Range) and same values.
+        let segment = U64Segment::Range(5..15);
+        for (offset, len) in [(0, 10), (3, 4), (9, 1), (10, 0)] {
+            let fast = segment.slice(offset, len);
+            let slow = {
+                let values: Vec<u64> = segment.iter().skip(offset).take(len).collect();
+                U64Segment::from_slice(&values)
+            };
+            assert_eq!(fast, slow, "slice({offset}, {len}) diverged");
+            assert_eq!(
+                fast.iter().collect::<Vec<_>>(),
+                (5 + offset as u64..5 + offset as u64 + len as u64).collect::<Vec<_>>()
+            );
+        }
+
+        // Out-of-bounds falls back to the truncating generic path.
+        assert_eq!(segment.slice(8, 5), U64Segment::Range(13..15));
+    }
+
+    #[test]
+    fn test_range_with_holes_len_matches_hole_count() {
+        let segment = U64Segment::RangeWithHoles {
+            range: 0..100,
+            holes: EncodedU64Array::from_iter(10..90),
+        };
+        assert_eq!(segment.len(), 20);
+    }
 
     #[test]
     fn test_range_with_bitmap_data_remains_publicly_mutable() {
