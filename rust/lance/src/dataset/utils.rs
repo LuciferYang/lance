@@ -14,7 +14,7 @@ use lance_arrow::json::{
     arrow_json_to_lance_json, convert_json_columns, convert_lance_json_to_arrow,
     has_arrow_json_fields, has_json_fields, lance_json_to_arrow_json,
 };
-use lance_core::ROW_ID;
+use lance_core::{ROW_ADDR, ROW_ID};
 use lance_table::rowids::{RowIdIndex, RowIdSequence};
 use roaring::RoaringTreemap;
 use std::borrow::Cow;
@@ -40,6 +40,49 @@ fn extract_row_ids(
         .values();
     row_ids.capture(row_ids_itr)?;
     Ok(batch.project(non_row_id_projection)?)
+}
+
+/// Given a stream that includes a row address column, return a stream that
+/// will capture the row addresses. At completion of the stream, the captured
+/// addresses can be received from the returned receiver.
+///
+/// Deletion flows only need the addresses of the removed rows for their
+/// deletion vectors. Capturing them directly keeps those flows out of the
+/// row-id domain entirely: no dataset-wide row-id index is built just to
+/// translate a handful of captured ids back into addresses.
+pub fn make_row_addr_capture_stream(
+    mut target: SendableRecordBatchStream,
+) -> Result<(SendableRecordBatchStream, Receiver<CapturedRowIds>)> {
+    let mut row_ids = CapturedRowIds::AddressStyle(RoaringTreemap::new());
+
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    let schema = target.schema();
+    let (row_addr_idx, _) = schema
+        .column_with_name(ROW_ADDR)
+        .expect("Received a batch without row addresses");
+    let non_addr_cols = (0..schema.fields.len())
+        .filter(|col| *col != row_addr_idx)
+        .collect::<Vec<_>>();
+    let output_schema = Arc::new(schema.project(&non_addr_cols)?);
+
+    let stream = futures::stream::poll_fn(move |cx| match target.poll_next_unpin(cx) {
+        std::task::Poll::Ready(Some(Ok(batch))) => {
+            let res = extract_row_ids(&mut row_ids, batch, row_addr_idx, &non_addr_cols);
+            std::task::Poll::Ready(Some(res))
+        }
+        std::task::Poll::Ready(Some(Err(err))) => std::task::Poll::Ready(Some(Err(err))),
+        std::task::Poll::Ready(None) => {
+            let row_ids_out = std::mem::take(&mut row_ids);
+            tx.send(row_ids_out).unwrap();
+            std::task::Poll::Ready(None)
+        }
+        std::task::Poll::Pending => std::task::Poll::Pending,
+    });
+
+    let stream = RecordBatchStreamAdapter::new(output_schema, stream);
+
+    Ok((Box::pin(stream), rx))
 }
 
 /// Given a stream that includes a row id column, return a stream that will

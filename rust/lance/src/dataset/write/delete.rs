@@ -1,17 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::scanner::ExprFilter;
 use crate::{
     Dataset,
     dataset::transaction::{Operation, Transaction},
-    dataset::utils::make_rowid_capture_stream,
+    dataset::utils::make_row_addr_capture_stream,
 };
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::{StreamExt, TryStreamExt};
-use lance_core::{Error, ROW_ID, Result};
+use lance_core::{Error, ROW_ADDR, Result};
 use lance_select::RowAddrTreeMap;
 use lance_table::format::Fragment;
 use roaring::RoaringTreemap;
@@ -269,7 +268,10 @@ impl RetryExecutor for DeleteJob {
     async fn execute_impl(&self) -> Result<Self::Data> {
         // Create a single scanner for the entire dataset
         let mut scanner = self.dataset.scan();
-        scanner.with_row_id().project(&[ROW_ID])?;
+        // Capturing addresses directly keeps the delete flow out of the
+        // row-id domain: no dataset-wide row-id index is built just to
+        // translate the captured ids back into addresses.
+        scanner.with_row_address().project(&[ROW_ADDR])?;
         match &self.filter {
             ExprFilter::Sql(s) => {
                 scanner.filter(s)?;
@@ -309,24 +311,20 @@ impl RetryExecutor for DeleteJob {
                 } else {
                     // Regular predicate - scan and collect row addresses to delete
                     let stream = scanner.try_into_stream().await?.into();
-                    let (stream, row_id_rx) = make_rowid_capture_stream(
-                        stream,
-                        self.dataset.manifest.uses_stable_row_ids(),
-                    )?;
+                    let (stream, row_id_rx) = make_row_addr_capture_stream(stream)?;
 
                     // Process the stream to capture row addresses
                     // We need to consume the stream to trigger the capture
                     futures::pin_mut!(stream);
                     while let Some(_batch) = stream.try_next().await? {
-                        // The row addresses are captured automatically by make_rowid_capture_stream
+                        // The row addresses are captured automatically by make_row_addr_capture_stream
                     }
 
                     // Extract the row addresses from the receiver
                     let removed_row_ids = row_id_rx.try_recv().map_err(|err| {
                         Error::internal(format!("Failed to receive row ids: {}", err))
                     })?;
-                    let row_id_index = get_row_id_index(&self.dataset).await?;
-                    let removed_row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref())?;
+                    let removed_row_addrs = removed_row_ids.row_addrs(None)?;
 
                     let (fragments, deleted_ids) =
                         apply_deletions(&self.dataset, &removed_row_addrs).await?;
@@ -1035,6 +1033,57 @@ mod tests {
             .unwrap();
         // All rows should be deleted, including the updated ones
         assert_eq!(final_result.new_dataset.count_rows(None).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_delete_under_stable_row_ids_keeps_surviving_ids() {
+        // Delete captures row addresses directly (it never needs the ids of
+        // the removed rows), so the deletion vector must land on exactly the
+        // matching rows: surviving rows keep their stable ids and the deleted
+        // ids stop resolving.
+        use arrow::datatypes::UInt64Type;
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::UInt32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt32Array::from_iter_values(0..10u32))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://test_delete_stable_ids",
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(dataset.manifest.uses_stable_row_ids());
+
+        let mut dataset = (*dataset.delete("i >= 7").await.unwrap().new_dataset).clone();
+
+        let surviving: Vec<u64> = dataset.scan().with_row_id().try_into_batch().await.unwrap()
+            [crate::dataset::ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .to_vec();
+        assert_eq!(surviving, vec![0, 1, 2, 3, 4, 5, 6]);
+
+        let index = crate::dataset::rowids::get_row_id_index(&dataset)
+            .await
+            .unwrap()
+            .expect("stable row id index");
+        for id in 7..10u64 {
+            assert!(
+                index.get(id).unwrap().is_none(),
+                "deleted id {id} must no longer resolve"
+            );
+        }
     }
 
     #[tokio::test]
