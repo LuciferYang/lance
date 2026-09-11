@@ -330,6 +330,16 @@ impl<'a> CreateIndexBuilder<'a> {
 
         let index_id = self.index_uuid.unwrap_or_else(Uuid::new_v4);
         let mut output_index_uuid = index_id;
+        if self.preprocessed_data.is_some() && self.index_type != IndexType::BTree {
+            // Outside B-Tree this input was either an assert! (scalar arm)
+            // or silently ignored (vector and inverted arms train from a
+            // full dataset scan while the caller believes the stream was
+            // consumed); reject uniformly instead.
+            return Err(Error::invalid_input(
+                "Preprocessed data stream can only be provided for B-Tree index type at the moment."
+                    .to_string(),
+            ));
+        }
         let created_index = match (self.index_type, self.params.index_name()) {
             (
                 IndexType::Bitmap
@@ -343,10 +353,6 @@ impl<'a> CreateIndexBuilder<'a> {
                 | IndexType::RTree,
                 LANCE_SCALAR_INDEX,
             ) => {
-                assert!(
-                    self.preprocessed_data.is_none() || self.index_type.eq(&IndexType::BTree),
-                    "Preprocessed data stream can only be provided for B-Tree index type at the moment."
-                );
                 let base_params = ScalarIndexParams::for_builtin(self.index_type.try_into()?);
 
                 // If custom params were provided, extract the params JSON and apply it
@@ -1042,6 +1048,8 @@ mod tests {
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
     use lance_linalg::distance::{DistanceType, MetricType};
+
+    use super::super::vector::VectorIndexParams;
     use roaring::RoaringBitmap;
     use rstest::rstest;
     use std::{collections::BTreeSet, ops::Bound, sync::Arc};
@@ -1497,6 +1505,49 @@ mod tests {
         assert_eq!(resolved[1].as_ref().unwrap().id() as u32, first);
         assert_eq!(resolved[2].as_ref().unwrap().id() as u32, second);
         assert!(resolved[3].is_none());
+    }
+
+    /// The preprocessed-data restriction used to be an assert! (panic) on the
+    /// scalar path and a silent no-op on the vector path: same contract,
+    /// three behaviors. Both must reject with a descriptive error.
+    #[tokio::test]
+    async fn test_preprocessed_data_rejected_outside_btree() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+        let batch = create_text_batch(0, 10);
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], create_text_batch(0, 1).schema());
+        let mut dataset = Dataset::write(batches, &dataset_uri, None).await.unwrap();
+
+        let params = InvertedIndexParams::default();
+        let stream: Box<dyn RecordBatchReader + Send + 'static> =
+            Box::new(RecordBatchIterator::new(
+                vec![Ok(create_text_batch(0, 1))],
+                create_text_batch(0, 1).schema(),
+            ));
+        let mut builder = dataset
+            .create_index_builder(&["text"], IndexType::Inverted, &params)
+            .preprocessed_data(stream);
+        let err = builder.execute_uncommitted().await.unwrap_err();
+        assert!(
+            err.to_string().contains("can only be provided for B-Tree"),
+            "got: {err}"
+        );
+
+        // Vector types reject instead of silently ignoring the stream.
+        let vector_params = VectorIndexParams::ivf_flat(2, MetricType::L2);
+        let stream: Box<dyn RecordBatchReader + Send + 'static> =
+            Box::new(RecordBatchIterator::new(
+                vec![Ok(create_text_batch(0, 1))],
+                create_text_batch(0, 1).schema(),
+            ));
+        let mut builder = dataset
+            .create_index_builder(&["text"], IndexType::Vector, &vector_params)
+            .preprocessed_data(stream);
+        let err = builder.execute_uncommitted().await.unwrap_err();
+        assert!(
+            err.to_string().contains("can only be provided for B-Tree"),
+            "got: {err}"
+        );
     }
 
     #[tokio::test]
