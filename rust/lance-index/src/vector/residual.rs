@@ -19,7 +19,9 @@ use lance_linalg::distance::{DistanceType, Dot, L2};
 use num_traits::{Float, FromPrimitive, Num};
 use tracing::instrument;
 
-use super::{PQ_CODE_COLUMN, transform::Transformer};
+use super::PQ_CODE_COLUMN;
+use super::transform::Transformer;
+use crate::vector::bq::storage::RABIT_CODE_COLUMN;
 
 /// Compute the residual vector of a Vector Matrix to their centroids.
 ///
@@ -147,8 +149,11 @@ impl Transformer for ResidualTransform {
     /// The new [`RecordBatch`] will have a new column named `RESIDUAL_COLUMN`.
     #[instrument(name = "ResidualTransform::transform", level = "debug", skip_all)]
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
-        if batch.column_by_name(PQ_CODE_COLUMN).is_some() {
-            // If the PQ code column is present, we don't need to compute residual vectors.
+        if batch.column_by_name(PQ_CODE_COLUMN).is_some()
+            || batch.column_by_name(RABIT_CODE_COLUMN).is_some()
+        {
+            // If a quantizer code column is present, the vectors are already
+            // encoded and no residual needs to be computed.
             return Ok(batch.clone());
         }
 
@@ -447,5 +452,32 @@ mod tests {
         assert_eq!(field.data_type(), residual.data_type());
         assert_eq!(residual.value_type(), DataType::Float32);
         assert_eq!(f32_values(residual), vec![3.5, 7.5]);
+    }
+
+    #[test]
+    fn test_residual_transform_skips_rabit_encoded_batches() {
+        // An already-RQ-encoded batch carries no vector column (the RQ
+        // transformer drops it); the residual stage must skip it just like
+        // PQ-encoded batches, not fail with a column-not-found error.
+        let centroids = fsl(Float32Array::from(vec![0.0, 0.0, 1.0, 1.0]), 2);
+        let transform = ResidualTransform::new(centroids, "part", "vector");
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("row_id", arrow::datatypes::DataType::UInt64, false),
+            arrow_schema::Field::new(RABIT_CODE_COLUMN, arrow::datatypes::DataType::UInt8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow_array::UInt64Array::from(vec![1u64])),
+                Arc::new(arrow_array::UInt8Array::from(vec![0u8])),
+            ],
+        )
+        .unwrap();
+        let result = transform.transform(&batch).unwrap();
+        assert_eq!(
+            result.num_columns(),
+            2,
+            "batch should pass through unchanged"
+        );
     }
 }
