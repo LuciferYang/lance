@@ -123,15 +123,18 @@ impl CapturedRowIds {
             Self::SequenceStyle(sequence) => {
                 let mut treemap = RoaringTreemap::new();
                 let Some(index) = index else {
-                    panic!("RowIdIndex required for sequence style row ids")
+                    return Err(crate::Error::internal(
+                        "A row id index is required to resolve sequence-style row ids, but \
+                         none was available",
+                    ));
                 };
                 for row_id in sequence.iter() {
-                    treemap.insert(
-                        index
-                            .get(row_id)?
-                            .expect("row id missing from index")
-                            .into(),
-                    );
+                    let address = index.get(row_id)?.ok_or_else(|| {
+                        crate::Error::internal(format!(
+                            "Captured row id {row_id} is missing from the row id index"
+                        ))
+                    })?;
+                    treemap.insert(address.into());
                 }
                 Ok(Cow::Owned(treemap))
             }
@@ -337,5 +340,30 @@ impl SchemaAdapter {
             converted_schema,
             converted_stream,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn row_addrs_errors_instead_of_panicking() {
+        let captured = CapturedRowIds::SequenceStyle(RowIdSequence::from(0..2u64));
+
+        // No index provided for sequence-style row ids: an error, not a panic.
+        let err = captured.row_addrs(None).unwrap_err();
+        assert!(
+            err.to_string().contains("none was available"),
+            "error should name the missing index, got: {err}"
+        );
+
+        // An id the index does not know: a descriptive error, not a panic.
+        let index = RowIdIndex::new(&[]).unwrap();
+        let err = captured.row_addrs(Some(&index)).unwrap_err();
+        assert!(
+            err.to_string().contains("missing"),
+            "error should name the missing row id, got: {err}"
+        );
     }
 }
