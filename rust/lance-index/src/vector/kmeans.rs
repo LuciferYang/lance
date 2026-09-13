@@ -296,6 +296,12 @@ fn compute_cluster_sizes(
         }
     });
 
+    if max_cluster_size == 0 {
+        // No vector was assigned (all memberships are None): the division
+        // below yields NaN. Return 0 so the balance schedule degrades
+        // gracefully instead of depending on f32::min swallowing NaN.
+        return 0.0;
+    }
     (radius[max_cluster_id] - losses[max_cluster_id] as f32 / cluster_sizes[max_cluster_id] as f32)
         / membership.len() as f32
 }
