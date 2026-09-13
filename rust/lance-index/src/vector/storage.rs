@@ -530,8 +530,14 @@ impl<Q: Quantization> StorageBuilder<Q> {
             )?;
         }
 
-        debug_assert!(batch.column_by_name(ROW_ID).is_some());
-        debug_assert!(batch.column_by_name(self.quantizer.column()).is_some());
+        for required in [ROW_ID, self.quantizer.column()] {
+            if batch.column_by_name(required).is_none() {
+                return Err(Error::index(format!(
+                    "Storage build: required column {} missing from batch",
+                    required
+                )));
+            }
+        }
 
         Q::Storage::try_from_batch_with_remapper(
             batch,
@@ -604,8 +610,13 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 .ok_or(Error::index(format!("{} not found", STORAGE_METADATA_KEY)))?
                 .as_str(),
         )?;
-        debug_assert_eq!(metadata.len(), 1);
         // for now the metadata is the same for all partitions, so we just store one
+        if metadata.len() != 1 {
+            return Err(Error::index(format!(
+                "Storage metadata should have exactly one entry, got {}",
+                metadata.len()
+            )));
+        }
         let metadata = metadata
             .pop()
             .ok_or(Error::index("metadata is empty".to_string()))?;
