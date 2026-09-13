@@ -4574,9 +4574,19 @@ async fn train_streaming_coreset_ivf_model(
         let coreset_budget = num_partitions
             .saturating_mul(coreset_rate)
             .max(num_partitions);
+        // The weighted coreset implementation degrades above num_partitions * 16;
+        // reject the request rather than silently clamping so the caller's
+        // accuracy/memory expectations are not silently violated.
+        if coreset_budget > num_partitions * 16 {
+            return Err(Error::invalid_input(format!(
+                "streaming_coreset_rate={} yields a coreset budget of {} which exceeds the \
+                 supported maximum of num_partitions*16 = {}; reduce streaming_coreset_rate",
+                coreset_rate, coreset_budget, num_partitions * 16
+            )));
+        }
         let total_steps = total_sample_rate.div_ceil(streaming_sample_rate);
         let decoupled_coreset_budget = params.streaming_coreset_rate.is_some();
-        let mut coreset = WeightedCoreset::new(dimension, coreset_budget.min(num_partitions * 16));
+        let mut coreset = WeightedCoreset::new(dimension, coreset_budget);
         let mut step = 0;
         while remaining_sample_rate > 0 {
             let step_sample_rate = remaining_sample_rate.min(streaming_sample_rate);
