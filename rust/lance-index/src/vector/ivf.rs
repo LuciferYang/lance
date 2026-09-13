@@ -177,7 +177,10 @@ impl IvfTransformer {
 
         transforms.push(Arc::new(FlatTransformer::new(vector_column)));
 
-        Self::new(centroids, distance_type, transforms)
+        // Store the converted metric (cosine -> L2) like every sibling
+        // constructor, so find_partitions/compute_partitions assign with the
+        // same metric the partitions were built under.
+        Self::new(centroids, dt, transforms)
     }
 
     /// Create a IVF_PQ struct.
