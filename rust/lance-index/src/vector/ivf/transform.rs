@@ -141,12 +141,11 @@ impl Transformer for PartitionTransformer {
             Some(index) => fsl
                 .iter()
                 .map(|vec| match vec {
-                    Some(v) => {
-                        let (id, dist) = index.search(v).unwrap();
-                        (Some(id), Some(dist))
-                    }
-                    None => (None, None),
+                    Some(v) => index.search(v).map(|(id, dist)| (Some(id), Some(dist))),
+                    None => Ok((None, None)),
                 })
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
                 .unzip(),
             None => compute_partitions_arrow_array(&self.centroids, fsl, self.distance_type)?,
         };
