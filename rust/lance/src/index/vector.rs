@@ -1025,6 +1025,20 @@ async fn build_vector_index_impl(
     .await?;
     let stages = &params.stages;
 
+    // RQ and SQ only accept float dtypes; validate here instead of letting
+    // the quantizer layer surface opaque unimplemented! panics.
+    if matches!(index_type, IndexType::IvfRq | IndexType::IvfSq)
+        && !matches!(
+            element_type,
+            DataType::Float16 | DataType::Float32 | DataType::Float64
+        )
+    {
+        return Err(Error::index(format!(
+            "Build Vector Index: invalid data type: {:?}",
+            element_type
+        )));
+    }
+
     match index_type {
         IndexType::IvfFlat => match element_type {
             DataType::Float16 | DataType::Float32 | DataType::Float64 => {
