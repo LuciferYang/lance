@@ -194,7 +194,15 @@ impl Transformer for Flatten {
         match arr.data_type() {
             DataType::FixedSizeList(_, _) => Ok(batch.clone()),
             DataType::List(_) => {
-                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+                let row_ids = batch
+                    .column_by_name(ROW_ID)
+                    .ok_or_else(|| {
+                        Error::index(format!(
+                            "Flatten: multivector column {} requires a {} column in the batch",
+                            self.column, ROW_ID
+                        ))
+                    })?
+                    .as_primitive::<UInt64Type>();
                 let vectors = arr.as_list::<i32>();
 
                 let row_ids = row_ids.values().iter().zip(vectors.iter()).flat_map(
