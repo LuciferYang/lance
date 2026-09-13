@@ -356,8 +356,15 @@ impl Transformer for RQTransformer {
                 DistanceType::L2 => res_norm_square.clone(),
                 DistanceType::Dot => {
                     // for dot, the add factor is `1 - v*c + |c|^2 = dist_v_c + |c|^2`
-                    let part_ids = &batch[PART_ID_COLUMN];
-                    let part_ids = part_ids.as_primitive::<UInt32Type>();
+                    let part_ids = batch
+                        .column_by_name(PART_ID_COLUMN)
+                        .ok_or_else(|| {
+                            Error::index(format!(
+                                "RQ Transform: column {} not found in batch",
+                                PART_ID_COLUMN
+                            ))
+                        })?
+                        .as_primitive::<UInt32Type>();
                     let centroids_norm_square = self.centroids_norm_square.as_ref().ok_or(
                         Error::index("RQ Transform: centroids norm square not found".to_string()),
                     )?;
@@ -427,7 +434,15 @@ impl Transformer for RQTransformer {
                 ));
             }
 
-            let part_ids = batch[PART_ID_COLUMN].as_primitive::<UInt32Type>();
+            let part_ids = batch
+                .column_by_name(PART_ID_COLUMN)
+                .ok_or_else(|| {
+                    Error::index(format!(
+                        "RQ Transform: column {} not found in batch",
+                        PART_ID_COLUMN
+                    ))
+                })?
+                .as_primitive::<UInt32Type>();
             let rotated_centroids = self.rotated_centroids.as_ref().ok_or_else(|| {
                 Error::internal("RabitQ raw-query transformer is missing rotated centroids")
             })?;
