@@ -2719,7 +2719,9 @@ impl Dataset {
             }
         };
 
-        let replace = replace.unwrap_or(true);
+        // Match the documented Python contract (replace=False): keep both indexes
+        // and fail on conflict unless the caller explicitly opts in.
+        let replace = replace.unwrap_or(false);
         let train = train.unwrap_or(true); // Default to true for backward compatibility
 
         let mut progress_handler = Self::make_index_progress_handler_from_kwargs(kwargs)?;
