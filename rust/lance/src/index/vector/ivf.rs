@@ -4873,10 +4873,13 @@ async fn train_ivf_model(
     params: &IvfBuildParams,
     progress: std::sync::Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<IvfModel> {
-    assert!(
-        distance_type != DistanceType::Cosine,
-        "Cosine metric should be done by normalized L2 distance",
-    );
+    if distance_type == DistanceType::Cosine {
+        return Err(Error::invalid_input(
+            "Cosine metric should be done by normalized L2 distance; normalize the input \
+             and train with L2"
+                .to_string(),
+        ));
+    }
     let values = data.values();
     let dim = data.value_length() as usize;
     match (values.data_type(), distance_type) {
