@@ -1244,6 +1244,7 @@ async fn build_vector_index_impl(
                 hnsw_params.clone(),
                 frag_reuse_index,
             )?
+            .with_transpose(!params.skip_transpose)
             .with_optional_fragment_filter(fragment_ids)
             .with_progress(progress.clone())
             .build()
