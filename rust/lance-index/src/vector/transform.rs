@@ -66,7 +66,11 @@ impl Transformer for NormalizeTransformer {
             ))
         })?;
 
-        let data = arr.as_fixed_size_list();
+        let data = arr.as_fixed_size_list_opt().ok_or(Error::index(format!(
+            "Normalize Transform: column {} is not a fixed size list: {}",
+            self.input_column,
+            arr.data_type()
+        )))?;
         let norm = normalize_fsl(data)?;
         let transformed = Arc::new(norm);
 
