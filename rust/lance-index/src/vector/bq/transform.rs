@@ -287,7 +287,13 @@ impl Transformer for RQTransformer {
                 && batch.column_by_name(EX_ADD_FACTORS_COLUMN).is_some()
                 && batch.column_by_name(EX_SCALE_FACTORS_COLUMN).is_some());
         if batch.column_by_name(RABIT_CODE_COLUMN).is_some() && has_split_codes {
-            return Ok(batch.clone());
+            // Match the fresh-encode output contract below: drop the vector
+            // and centroid-dist columns if present so both paths emit the
+            // same schema.
+            // drop_column is a no-op for absent columns.
+            let batch = batch.drop_column(&self.vector_column)?;
+            let batch = batch.drop_column(CENTROID_DIST_COLUMN)?;
+            return Ok(batch);
         }
 
         let residual_vectors = batch
