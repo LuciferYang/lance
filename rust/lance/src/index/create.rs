@@ -530,6 +530,14 @@ impl<'a> CreateIndexBuilder<'a> {
                         .await?
                     }
                 } else {
+                    if self.fragments.is_some() {
+                        return Err(Error::invalid_input(
+                            "fragment_ids cannot be combined with train=false for vector \
+                             index types: an empty index covers no fragments, so the \
+                             fragment list would be silently ignored"
+                                .to_string(),
+                        ));
+                    }
                     // Create empty vector index
                     build_empty_vector_index(
                         self.dataset,
