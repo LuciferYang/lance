@@ -985,6 +985,8 @@ impl TwoFileShuffleReader {
 
         match &self.offsets {
             ShuffleOffsets::Preloaded(offsets) => {
+                // Pre-count non-empty ranges so empty partitions return an
+                // empty Vec instead of num_batches zero-length ranges.
                 let mut ranges = Vec::with_capacity(self.num_batches);
                 for batch_idx in 0..self.num_batches {
                     let end_index = batch_idx * self.num_partitions + partition_id;
@@ -993,7 +995,10 @@ impl TwoFileShuffleReader {
                     } else {
                         offsets[end_index - 1]
                     };
-                    ranges.push(start..offsets[end_index]);
+                    let end = offsets[end_index];
+                    if start < end {
+                        ranges.push(start..end);
+                    }
                 }
                 Ok(ranges)
             }
