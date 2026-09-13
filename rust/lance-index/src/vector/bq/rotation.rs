@@ -156,15 +156,17 @@ pub fn apply_fast_rotation<T: AsPrimitive<f32>>(input: &[T], output: &mut [f32],
     // - non-power-of-two dims: alternate FWHT on head/tail + Kac mixing
     //
     // This keeps the fast path matrix-free: no dense orthogonal matrix materialization.
-    let dim = output.len();
-    let input_len = input.len().min(dim);
-    output[..input_len]
+    assert_eq!(
+        input.len(),
+        output.len(),
+        "apply_fast_rotation: input length {} does not match output length {}",
+        input.len(),
+        output.len()
+    );
+    output
         .iter_mut()
-        .zip(input[..input_len].iter())
+        .zip(input.iter())
         .for_each(|(dst, src)| *dst = src.as_());
-    if input_len < dim {
-        output[input_len..].fill(0.0);
-    }
 
     apply_fast_rotation_in_place(output, signs);
 }
