@@ -958,7 +958,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 })
             })
             .buffered(get_num_compute_intensive_cpus())
-            .map(|x| x.unwrap())
+            .map(|x| {
+                x.map_err(|e| Error::internal(format!("shuffle transform task failed: {e}")))?
+            })
             .peekable(),
         );
 
@@ -2197,7 +2199,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     tokio::spawn(async move { ivf_transformer.transform(&batch?) })
                 })
                 .buffered(get_num_compute_intensive_cpus())
-                .map(|x| x.unwrap())
+                .map(|x| {
+                    x.map_err(|e| Error::internal(format!("shuffle transform task failed: {e}")))?
+                })
                 .peekable(),
         );
 
