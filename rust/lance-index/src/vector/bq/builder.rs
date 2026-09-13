@@ -214,26 +214,42 @@ fn best_ex_rescale_factor(abs_normalized: &[f32], ex_bits: u8) -> f32 {
     best_t
 }
 
-fn quantize_ex_code(
+fn quantize_ex_code_with_scratch(
     rotated: &[f32],
     ex_bits: u8,
     ex_code_dst: &mut [u8],
     ex_code_values_dst: &mut [u8],
+    abs_normalized: &mut Vec<f32>,
 ) -> f32 {
-    debug_assert_eq!(rotated.len(), ex_code_values_dst.len());
-    let norm_squared = rotated.iter().map(|value| value * value).sum::<f32>();
+    abs_normalized.clear();
+    abs_normalized.extend(rotated.iter().map(|value| value.abs()));
+    let norm_squared: f32 = abs_normalized.iter().map(|v| v * v).sum();
     if norm_squared <= f32::EPSILON || !norm_squared.is_finite() {
         ex_code_dst.fill(0);
         ex_code_values_dst.fill(0);
         return 0.0;
     }
-
     let norm = norm_squared.sqrt();
-    let abs_normalized = rotated
-        .iter()
-        .map(|value| value.abs() / norm)
-        .collect::<Vec<_>>();
-    let t = best_ex_rescale_factor(&abs_normalized, ex_bits);
+    for value in abs_normalized.iter_mut() {
+        *value /= norm;
+    }
+    quantize_ex_code_tail(
+        rotated,
+        abs_normalized,
+        ex_bits,
+        ex_code_dst,
+        ex_code_values_dst,
+    )
+}
+
+fn quantize_ex_code_tail(
+    rotated: &[f32],
+    abs_normalized: &[f32],
+    ex_bits: u8,
+    ex_code_dst: &mut [u8],
+    ex_code_values_dst: &mut [u8],
+) -> f32 {
+    let t = best_ex_rescale_factor(abs_normalized, ex_bits);
     let max_code = ((1u16 << ex_bits) - 1) as u8;
     let mask = max_code;
     let code_bias = -((1u32 << ex_bits) as f32 - 0.5);
@@ -716,9 +732,18 @@ impl RabitQuantizer {
                 .zip(ex_code_values.par_chunks_mut(code_dim))
                 .zip(ex_res_dot_dists.par_iter_mut())
                 .zip(rotated_residuals.par_chunks(code_dim))
-                .for_each(|(((ex_dst, ex_values_dst), ex_dot_dst), rotated)| {
-                    *ex_dot_dst = quantize_ex_code(rotated, ex_bits, ex_dst, ex_values_dst);
-                });
+                .for_each_init(
+                    || Vec::with_capacity(code_dim),
+                    |abs_normalized, (((ex_dst, ex_values_dst), ex_dot_dst), rotated)| {
+                        *ex_dot_dst = quantize_ex_code_with_scratch(
+                            rotated,
+                            ex_bits,
+                            ex_dst,
+                            ex_values_dst,
+                            abs_normalized,
+                        );
+                    },
+                );
         }
 
         let binary_codes = UInt8Array::from(encoded_codes);
