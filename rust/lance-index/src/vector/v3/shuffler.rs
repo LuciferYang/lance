@@ -415,7 +415,16 @@ impl ShuffleReader for IvfShufflerReader {
     }
 
     fn partition_size(&self, partition_id: usize) -> Result<usize> {
-        Ok(self.partition_sizes.get(partition_id).copied().unwrap_or(0))
+        self.partition_sizes
+            .get(partition_id)
+            .copied()
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "partition_id={} is out of range [0, {})",
+                    partition_id,
+                    self.partition_sizes.len()
+                ))
+            })
     }
 
     fn total_loss(&self) -> Option<f64> {
