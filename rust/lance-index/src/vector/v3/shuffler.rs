@@ -584,28 +584,42 @@ fn sort_to_interleave_indices(
     num_partitions: usize,
 ) -> Result<InterleaveResult> {
     let total_rows: usize = part_id_columns.iter().map(|a| a.len()).sum();
-    let mut keys: Vec<(u32, u32, u32)> = Vec::with_capacity(total_rows);
-    for (batch_idx, col) in part_id_columns.iter().enumerate() {
-        let batch_idx = batch_idx as u32;
-        for (row_idx, &part_id) in col.values().iter().enumerate() {
-            keys.push((part_id, batch_idx, row_idx as u32));
-        }
-    }
-    keys.sort_unstable_by_key(|k| k.0);
 
+    // Counting sort: partition ids are bounded to [0, num_partitions), so
+    // bucket by id in O(n + num_partitions) instead of the previous
+    // O(n log n) comparison sort over 12-byte key tuples.
     let mut partition_counts = vec![0u64; num_partitions];
-    let mut interleave_indices = Vec::with_capacity(total_rows);
-    for (part_id, batch_idx, row_idx) in &keys {
-        let pid = *part_id as usize;
-        if pid >= num_partitions {
-            return Err(Error::invalid_input(format!(
-                "partition ID {} is out of range [0, {})",
-                pid, num_partitions
-            )));
+    for col in part_id_columns {
+        for &part_id in col.values().iter() {
+            let pid = part_id as usize;
+            if pid >= num_partitions {
+                return Err(Error::invalid_input(format!(
+                    "partition ID {} is out of range [0, {})",
+                    pid, num_partitions
+                )));
+            }
+            partition_counts[pid] += 1;
         }
-        partition_counts[pid] += 1;
-        interleave_indices.push((*batch_idx as usize, *row_idx as usize));
     }
+
+    // Prefix sums give the starting slot for each partition bucket.
+    let mut offsets = vec![0u32; num_partitions];
+    let mut running = 0u32;
+    for (offset, &count) in offsets.iter_mut().zip(partition_counts.iter()) {
+        *offset = running;
+        running += count as u32;
+    }
+
+    let mut interleave_indices = Vec::with_capacity(total_rows);
+    interleave_indices.resize(total_rows, (0usize, 0usize));
+    for (batch_idx, col) in part_id_columns.iter().enumerate() {
+        for (row_idx, &part_id) in col.values().iter().enumerate() {
+            let slot = offsets[part_id as usize] as usize;
+            offsets[part_id as usize] += 1;
+            interleave_indices[slot] = (batch_idx, row_idx);
+        }
+    }
+
     Ok((interleave_indices, partition_counts))
 }
 
