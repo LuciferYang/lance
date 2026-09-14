@@ -799,7 +799,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 let uri = uri.trim_end_matches("data");
                 log::info!("shuffle with precomputed shuffle buffers from {}", uri);
                 let ds = Dataset::open(uri).await?;
-                ds.scan().try_into_stream().await?
+                // Project to just the row-id and the column the shuffler
+                // consumes; the intermediate dataset may carry extra columns
+                // that would otherwise be read, shuffled, and dropped.
+                ds.scan()
+                    .batch_readahead(get_num_compute_intensive_cpus())
+                    .project(&[self.column.as_str()])?
+                    .with_row_id()
+                    .try_into_stream()
+                    .await?
             }
             _ => {
                 log::info!("shuffle column {} over dataset", self.column);
