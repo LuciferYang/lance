@@ -1739,7 +1739,9 @@ pub async fn build_ivf_model(
     fragment_ids: Option<&[u32]>,
     progress: std::sync::Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<IvfModel> {
-    let num_partitions = params.num_partitions.unwrap();
+    // Use 32 as the default like the streaming trainers below, which use
+    // the same default "to avoid panicking".
+    let num_partitions = params.num_partitions.unwrap_or(32);
     let centroids = params.centroids.clone();
     if let (Some(centroids), false) = (centroids.as_deref(), params.retrain) {
         info!("Pre-computed IVF centroids is provided, skip IVF training");
