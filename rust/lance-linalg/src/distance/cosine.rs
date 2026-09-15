@@ -24,7 +24,7 @@ use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
 #[allow(unused_imports)]
 use lance_core::utils::cpu::{SIMD_SUPPORT, SimdSupport};
 
-use super::{Dot, norm_l2::norm_l2};
+use super::{Dot, int8_query_to_f32, norm_l2::norm_l2};
 use super::{Normalize, dot::dot};
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
 use crate::distance::BatchKind;
@@ -1342,8 +1342,9 @@ where
             .as_any()
             .downcast_ref::<T::ArrayType>()
             .ok_or(Error::InvalidArgumentError(format!(
-                "Unsupported data type {:?}",
-                to.values().data_type()
+                "`to` values have data type {}, expected {} to match `from`",
+                to.values().data_type(),
+                from.data_type()
             )))?;
     let dists = cosine_distance_batch(from.as_slice(), to_values.as_slice(), dimension);
 
@@ -1362,9 +1363,18 @@ where
 /// - `from`: the vector to compute distance from.
 /// - `to`: a list of vectors to compute distance to.
 ///
+/// # Errors
+///
+/// Returns an error if `from` is an `Int8` array containing nulls, since a null
+/// query element has no distance to compute. The unsupported-type and downcast
+/// paths return errors of their own; this list is not exhaustive.
+///
 /// # Panics
 ///
-/// Panics if the length of `from` is not equal to the dimension (value length) of `to`.
+/// With debug assertions on, panics if the length of `from` is not equal to the
+/// dimension (value length) of `to`. Without them the mismatch is not reliably
+/// caught, since cosine has no always-on layout assert of its own, unlike the l2
+/// and dot equivalents.
 pub fn cosine_distance_arrow_batch(
     from: &dyn Array,
     to: &FixedSizeListArray,
@@ -1374,15 +1384,11 @@ pub fn cosine_distance_arrow_batch(
         DataType::Float32 => do_cosine_distance_arrow_batch::<Float32Type>(from.as_primitive(), to),
         DataType::Float64 => do_cosine_distance_arrow_batch::<Float64Type>(from.as_primitive(), to),
         DataType::Int8 => do_cosine_distance_arrow_batch::<Float32Type>(
-            &from
-                .as_primitive::<Int8Type>()
-                .into_iter()
-                .map(|x| x.unwrap() as f32)
-                .collect(),
+            &int8_query_to_f32(from.as_primitive::<Int8Type>())?,
             &to.convert_to_floating_point()?,
         ),
         _ => Err(Error::InvalidArgumentError(format!(
-            "Unsupported data type {:?}",
+            "`from` has unsupported data type {}",
             from.data_type()
         ))),
     }
@@ -1413,6 +1419,7 @@ mod tests {
 
     use crate::test_utils::{
         arbitrary_bf16, arbitrary_f16, arbitrary_f32, arbitrary_f64, arbitrary_vector_pair,
+        dimension_shard, run_vector_pair_proptest,
     };
     use approx::assert_relative_eq;
     use num_traits::AsPrimitive;
@@ -1500,6 +1507,78 @@ mod tests {
         Ok(())
     }
 
+    #[rstest::rstest]
+    fn test_cosine_f32(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
+    ) {
+        run_vector_pair_proptest(arbitrary_f32, dimension_shard(shard), |x, y| {
+            prop_assume!(norm_l2(&x) > 1e-10);
+            prop_assume!(norm_l2(&y) > 1e-10);
+            do_cosine_test(&x, &y)
+        });
+    }
+
+    #[rstest::rstest]
+    fn test_cosine_f64(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
+    ) {
+        run_vector_pair_proptest(arbitrary_f64, dimension_shard(shard), |x, y| {
+            prop_assume!(norm_l2(&x) > 1e-20);
+            prop_assume!(norm_l2(&y) > 1e-20);
+            do_cosine_test(&x, &y)
+        });
+    }
+
+    #[rstest::rstest]
+    fn test_cosine_fast_f32_scalar_simd_parity(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
+    ) {
+        run_vector_pair_proptest(arbitrary_f32, dimension_shard(shard), |x, y| {
+            prop_assume!(norm_l2(&x) > 1e-10);
+            prop_assume!(norm_l2(&y) > 1e-10);
+            let x_norm = norm_l2(&x);
+            let x_f64: Vec<f64> = x.iter().map(|&v| v as f64).collect();
+            let y_f64: Vec<f64> = y.iter().map(|&v| v as f64).collect();
+            let scalar = cosine_fast_scalar(&x_f64, x_norm, &y_f64);
+            let simd = <f32 as Cosine>::cosine_fast(&x, x_norm, &y);
+            prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-3));
+            Ok(())
+        });
+    }
+
+    #[rstest::rstest]
+    fn test_cosine_with_norms_f32_scalar_simd_parity(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
+    ) {
+        run_vector_pair_proptest(arbitrary_f32, dimension_shard(shard), |x, y| {
+            prop_assume!(norm_l2(&x) > 1e-10);
+            prop_assume!(norm_l2(&y) > 1e-10);
+            let x_norm = norm_l2(&x);
+            let y_norm = norm_l2(&y);
+            let x_f64: Vec<f64> = x.iter().map(|&v| v as f64).collect();
+            let y_f64: Vec<f64> = y.iter().map(|&v| v as f64).collect();
+            let scalar = cosine_with_norms_scalar(&x_f64, x_norm, y_norm, &y_f64);
+            let simd = <f32 as Cosine>::cosine_with_norms(&x, x_norm, y_norm, &y);
+            prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-3));
+            Ok(())
+        });
+    }
+
+    #[rstest::rstest]
+    fn test_cosine_fast_f64_scalar_simd_parity(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
+    ) {
+        run_vector_pair_proptest(arbitrary_f64, dimension_shard(shard), |x, y| {
+            prop_assume!(norm_l2(&x) > 1e-20);
+            prop_assume!(norm_l2(&y) > 1e-20);
+            let x_norm = norm_l2(&x);
+            let scalar = cosine_fast_scalar(&x, x_norm, &y);
+            let simd = <f64 as Cosine>::cosine_fast(&x, x_norm, &y);
+            prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-3));
+            Ok(())
+        });
+    }
+
     proptest::proptest! {
         #[test]
         fn test_cosine_f16((x, y) in arbitrary_vector_pair(arbitrary_f16, 4..4048)) {
@@ -1514,37 +1593,6 @@ mod tests {
             prop_assume!(norm_l2(&x) > 1e-6);
             prop_assume!(norm_l2(&y) > 1e-6);
             do_cosine_test(&x, &y)?;
-        }
-
-        #[test]
-        fn test_cosine_f32((x, y) in arbitrary_vector_pair(arbitrary_f32, 4..4048)){
-            prop_assume!(norm_l2(&x) > 1e-10);
-            prop_assume!(norm_l2(&y) > 1e-10);
-            do_cosine_test(&x, &y)?;
-        }
-
-        #[test]
-        fn test_cosine_f64((x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)){
-            prop_assume!(norm_l2(&x) > 1e-20);
-            prop_assume!(norm_l2(&y) > 1e-20);
-            do_cosine_test(&x, &y)?;
-        }
-
-        /// Cross-backend parity for the f32 cosine_fast kernel. Exercises the
-        /// scalar fallback (`cosine_scalar`) against the dispatched SIMD path
-        /// so the runtime fallback is exercised even on AVX2-capable CI hosts.
-        #[test]
-        fn test_cosine_fast_f32_scalar_simd_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f32, 4..4048)
-        ) {
-            prop_assume!(norm_l2(&x) > 1e-10);
-            prop_assume!(norm_l2(&y) > 1e-10);
-            let x_norm = norm_l2(&x);
-            let x_f64: Vec<f64> = x.iter().map(|&v| v as f64).collect();
-            let y_f64: Vec<f64> = y.iter().map(|&v| v as f64).collect();
-            let scalar = cosine_fast_scalar(&x_f64, x_norm, &y_f64);
-            let simd = <f32 as Cosine>::cosine_fast(&x, x_norm, &y);
-            prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-3));
         }
 
         /// AVX-512-direct parity for the f32 cosine_fast kernel. Early-returns
@@ -1601,25 +1649,6 @@ mod tests {
             let scalar = cosine_scalar(&x, x_norm, &y);
             let avx = unsafe { f32_x86::cosine_fast_avx(&x, x_norm, &y) };
             prop_assert!(approx::relative_eq!(scalar, avx, max_relative = 1e-5));
-        }
-
-        /// Cross-backend parity for the f32 cosine_with_norms kernel.
-        /// Exercises the scalar fallback (`cosine_scalar_fast`) against the
-        /// dispatched SIMD path so the runtime fallback is exercised even on
-        /// AVX2-capable CI hosts.
-        #[test]
-        fn test_cosine_with_norms_f32_scalar_simd_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f32, 4..4048)
-        ) {
-            prop_assume!(norm_l2(&x) > 1e-10);
-            prop_assume!(norm_l2(&y) > 1e-10);
-            let x_norm = norm_l2(&x);
-            let y_norm = norm_l2(&y);
-            let x_f64: Vec<f64> = x.iter().map(|&v| v as f64).collect();
-            let y_f64: Vec<f64> = y.iter().map(|&v| v as f64).collect();
-            let scalar = cosine_with_norms_scalar(&x_f64, x_norm, y_norm, &y_f64);
-            let simd = <f32 as Cosine>::cosine_with_norms(&x, x_norm, y_norm, &y);
-            prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-3));
         }
 
         /// AVX-512-direct parity for the f32 cosine_with_norms kernel.
@@ -1679,22 +1708,6 @@ mod tests {
             let scalar = cosine_scalar_fast(&x, x_norm, &y, y_norm);
             let avx = unsafe { f32_x86::cosine_with_norms_avx(&x, x_norm, y_norm, &y) };
             prop_assert!(approx::relative_eq!(scalar, avx, max_relative = 1e-5));
-        }
-
-        /// Cross-backend parity for the f64 cosine_fast kernel. Uses the
-        /// hand-rolled `cosine_fast_scalar` (not the trait-routed
-        /// `cosine_scalar`, which would itself dispatch through `dot::<f64>`)
-        /// so the reference stays free of any AVX path on AVX2-capable hosts.
-        #[test]
-        fn test_cosine_fast_f64_scalar_simd_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)
-        ) {
-            prop_assume!(norm_l2(&x) > 1e-20);
-            prop_assume!(norm_l2(&y) > 1e-20);
-            let x_norm = norm_l2(&x);
-            let scalar = cosine_fast_scalar(&x, x_norm, &y);
-            let simd = <f64 as Cosine>::cosine_fast(&x, x_norm, &y);
-            prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-3));
         }
 
         /// AVX-512-direct parity for the f64 cosine_fast kernel. Early-returns

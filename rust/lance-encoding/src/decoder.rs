@@ -259,6 +259,10 @@ use crate::format::pb21;
 use crate::repdef::{CompositeRepDefUnraveler, RepDefUnraveler};
 use crate::{BufferScheduler, EncodingsIo};
 
+/// Candidate batch sizes evaluated during byte-budget planning.
+/// Powers of 4, covering 1–16Ki rows in 8 probes.
+pub const CANDIDATE_BATCH_SIZES: [u32; 8] = [1, 4, 16, 64, 256, 1024, 4096, 16384];
+
 pub trait SchedulingJob: std::fmt::Debug {
     fn schedule_next(
         &mut self,
@@ -1814,7 +1818,12 @@ impl<T: RootDecoderType> RecordBatchReader for BatchDecodeIterator<T> {
 /// This estimate ignores validity bitmaps at the moment.  We can't infer
 /// their presence simply from the data_type and their impact is probably
 /// fairly negligible.
-fn estimate_bytes_per_row(data_type: &DataType) -> f64 {
+/// Returns a schema-based estimate of the decoded bytes per row for `data_type`.
+///
+/// Fixed-width types are exact. Variable-width types (strings, lists, etc.) use
+/// heuristic constants. This estimate is used both in batch-size planning and as
+/// a fallback for V1 files that lack structural decoders.
+pub fn estimate_bytes_per_row(data_type: &DataType) -> f64 {
     if let Some(w) = data_type.byte_width_opt() {
         return w as f64;
     }
@@ -2177,6 +2186,7 @@ pub fn create_decode_stream(
             arrow_schema.fields,
             should_validate,
             /*is_root=*/ true,
+            /*nullable=*/ false,
         )?;
         Ok(StructuralBatchDecodeStream::new(
             rx,
@@ -2213,8 +2223,12 @@ pub fn create_decode_iterator(
     let arrow_schema = Arc::new(ArrowSchema::from(schema));
     let root_fields = arrow_schema.fields.clone();
     if is_structural {
-        let simple_struct_decoder =
-            StructuralStructDecoder::new(root_fields, should_validate, /*is_root=*/ true)?;
+        let simple_struct_decoder = StructuralStructDecoder::new(
+            root_fields,
+            should_validate,
+            /*is_root=*/ true,
+            /*nullable=*/ false,
+        )?;
         Ok(Box::new(BatchDecodeIterator::new(
             messages,
             batch_size,
@@ -2883,6 +2897,13 @@ pub trait DecodePageTask: Send + std::fmt::Debug {
 pub trait StructuralPageDecoder: std::fmt::Debug + Send {
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>>;
     fn num_rows(&self) -> u64;
+    /// Returns the exact decoded byte count for the next `num_rows` rows
+    /// from this decoder's current position, without consuming any rows.
+    fn decoded_bytes(&self, _num_rows: u64) -> Result<u64> {
+        Err(Error::not_supported(
+            "decoded_bytes is not implemented for this page decoder".to_string(),
+        ))
+    }
 }
 
 #[derive(Debug)]
@@ -2931,6 +2952,20 @@ pub trait StructuralFieldDecoder: std::fmt::Debug + Send {
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn StructuralDecodeArrayTask>>;
     /// The data type of the decoded data
     fn data_type(&self) -> &DataType;
+    /// Returns the exact decoded byte count for each of [`CANDIDATE_BATCH_SIZES`]
+    /// row counts, clamped to `rows_remaining`.
+    ///
+    /// Implementations should do their best to estimate the exact size required for
+    /// the uncompressed data.  In cases where this is not possible they should return
+    /// a worst-case estimate.
+    ///
+    /// The default implementation simply returns a "not supported" error though this
+    /// will hopefully be removed once implementation is complete.
+    fn plan_decoded_bytes(&self, _rows_remaining: u64) -> Result<[u64; 8]> {
+        Err(Error::not_supported(
+            "decoded_bytes is not implemented for this field decoder".to_string(),
+        ))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -3221,7 +3256,10 @@ mod tests {
         let batch_readahead = 2;
         let load_error_message = "simulated page load failure";
         let fields = Fields::from(vec![ArrowField::new("vector", DataType::Float32, true)]);
-        let root_decoder = StructuralStructDecoder::new(fields, false, /*is_root=*/ true).unwrap();
+        let root_decoder = StructuralStructDecoder::new(
+            fields, false, /*is_root=*/ true, /*nullable=*/ false,
+        )
+        .unwrap();
         let (tx, rx) = unbounded_channel();
         let failed_page = async move { Err(Error::io(load_error_message)) }.boxed();
 
