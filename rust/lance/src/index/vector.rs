@@ -2552,8 +2552,14 @@ mod tests {
 
         // Child half: build under the root the parent handed us and let it do the
         // leak detection. The dataset goes outside the temp dir's `.tmp*` namespace
-        // so the parent never mistakes it for a leaked scratch directory.
-        if let Ok(root) = std::env::var(ROOT_VAR) {
+        // so the parent never mistakes it for a leaked scratch directory. Read the
+        // value as an `OsString`: with `env::var`, a root that is not valid UTF-8
+        // would send the child down the parent branch and have it spawn a child of
+        // its own, without end.
+        if let Some(root) = std::env::var_os(ROOT_VAR) {
+            let root = root
+                .into_string()
+                .expect("the isolated root must be valid UTF-8");
             tokio::runtime::Runtime::new()
                 .unwrap()
                 .block_on(async move {
