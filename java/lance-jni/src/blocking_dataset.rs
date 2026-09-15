@@ -70,7 +70,10 @@ pub const NATIVE_DATASET: &str = "nativeDatasetHandle";
 
 impl FromJObjectWithEnv<BasePath> for JObject<'_> {
     fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<BasePath> {
-        let id = env.get_u32_from_method(self, "getId")?;
+        let java_id = env.call_method(self, "getId", "()I", &[])?.i()?;
+        let id = u32::try_from(java_id).map_err(|_| {
+            Error::input_error(format!("BasePath.id must be non-negative, got {java_id}"))
+        })?;
         let name = env.get_optional_string_from_method(self, "getName")?;
         let path = env.get_string_from_method(self, "getPath")?;
         let is_dataset_root = env.get_boolean_from_method(self, "isDatasetRoot")?;
@@ -80,6 +83,37 @@ impl FromJObjectWithEnv<BasePath> for JObject<'_> {
             path,
             is_dataset_root,
         })
+    }
+}
+
+impl IntoJava for &BasePath {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        let id = i32::try_from(self.id).map_err(|_| {
+            Error::runtime_error(format!("Base path id {} exceeds Java int range", self.id))
+        })?;
+        let name = match self.name.as_ref() {
+            Some(name) => env.new_string(name)?.into(),
+            None => JObject::null(),
+        };
+        let name = env
+            .call_static_method(
+                "java/util/Optional",
+                "ofNullable",
+                "(Ljava/lang/Object;)Ljava/util/Optional;",
+                &[JValue::Object(&name)],
+            )?
+            .l()?;
+        let path = env.new_string(&self.path)?;
+        Ok(env.new_object(
+            "org/lance/BasePath",
+            "(ILjava/util/Optional;Ljava/lang/String;Z)V",
+            &[
+                JValue::Int(id),
+                JValue::Object(&name),
+                JValue::Object(&path),
+                JValue::Bool(self.is_dataset_root.into()),
+            ],
+        )?)
     }
 }
 
@@ -485,6 +519,7 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiSchema<'local>(
     target_bases: JObject,
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    file_write_options: JObject,                // FileWriteOptions
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -505,6 +540,7 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiSchema<'local>(
             target_bases,
             allow_external_blob_outside_bases,
             blob_pack_file_size_threshold,
+            file_write_options,
         )
     )
 }
@@ -527,6 +563,7 @@ fn inner_create_with_ffi_schema<'local>(
     target_bases: JObject,
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    file_write_options: JObject,                // FileWriteOptions
 ) -> Result<JObject<'local>> {
     let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
     let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
@@ -549,6 +586,7 @@ fn inner_create_with_ffi_schema<'local>(
         target_bases,
         allow_external_blob_outside_bases,
         blob_pack_file_size_threshold,
+        file_write_options,
         reader,
         None,  // No namespace for schema-only creation
         false, // No managed versioning for schema-only creation
@@ -607,6 +645,7 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStream<'local>(
     target_bases: JObject,                         // Optional<List<String>>
     allow_external_blob_outside_bases: JObject,    // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,        // Optional<Long>
+    file_write_options: JObject,                   // FileWriteOptions
     namespace_obj: JObject,                        // LanceNamespace (can be null)
     table_id_obj: JObject,                         // List<String> (can be null)
     namespace_client_managed_versioning: jboolean, // Whether namespace manages versioning
@@ -630,6 +669,7 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStream<'local>(
             target_bases,
             allow_external_blob_outside_bases,
             blob_pack_file_size_threshold,
+            file_write_options,
             namespace_obj,
             table_id_obj,
             namespace_client_managed_versioning != 0,
@@ -655,6 +695,7 @@ fn inner_create_with_ffi_stream<'local>(
     target_bases: JObject,                      // Optional<List<String>>
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    file_write_options: JObject,                // FileWriteOptions
     namespace_obj: JObject,                     // LanceNamespace (can be null)
     table_id_obj: JObject,                      // List<String> (can be null)
     namespace_client_managed_versioning: bool,  // Whether namespace manages versioning
@@ -681,6 +722,7 @@ fn inner_create_with_ffi_stream<'local>(
         target_bases,
         allow_external_blob_outside_bases,
         blob_pack_file_size_threshold,
+        file_write_options,
         reader,
         namespace_info,
         namespace_client_managed_versioning,
@@ -709,6 +751,7 @@ fn create_dataset<'local>(
     target_bases: JObject,
     allow_external_blob_outside_bases: JObject,
     blob_pack_file_size_threshold: JObject,
+    file_write_options: JObject,
     reader: impl RecordBatchReader + Send + 'static,
     namespace_info: Option<(Arc<dyn LanceNamespace>, Vec<String>)>,
     namespace_client_managed_versioning: bool,
@@ -730,6 +773,7 @@ fn create_dataset<'local>(
         &target_bases,
         &allow_external_blob_outside_bases,
         &blob_pack_file_size_threshold,
+        &file_write_options,
     )?;
 
     // Set up namespace commit handler and storage options provider if namespace is provided
@@ -1814,6 +1858,33 @@ fn inner_get_fragments<'local>(
         .map(|f| f.metadata().clone())
         .collect::<Vec<Fragment>>();
     export_vec(env, &fragments)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeGetBasePaths<'a>(
+    mut env: JNIEnv<'a>,
+    jdataset: JObject,
+) -> JObject<'a> {
+    ok_or_throw!(env, inner_get_base_paths(&mut env, jdataset))
+}
+
+fn inner_get_base_paths<'local>(
+    env: &mut JNIEnv<'local>,
+    jdataset: JObject,
+) -> Result<JObject<'local>> {
+    let mut base_paths = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
+        dataset
+            .inner
+            .manifest()
+            .base_paths
+            .values()
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    base_paths.sort_by_key(|base_path| base_path.id);
+    export_vec(env, &base_paths)
 }
 
 #[unsafe(no_mangle)]
@@ -3535,6 +3606,14 @@ fn convert_java_compaction_options_to_rust(
             &[],
         )?
         .l()?;
+    let data_storage_version = env
+        .call_method(
+            &java_options,
+            "getDataStorageVersion",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
 
     build_compaction_options(
         env,
@@ -3552,6 +3631,7 @@ fn convert_java_compaction_options_to_rust(
         &max_source_rows,
         &max_source_bytes,
         &excluded_fragment_ids,
+        &data_storage_version,
         config,
     )
 }
