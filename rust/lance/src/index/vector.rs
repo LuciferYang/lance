@@ -2541,20 +2541,54 @@ mod tests {
     /// per index build.
     ///
     /// The OS temp dir is process-global, so an in-process check cannot
-    /// attribute a leftover directory to our own build. Run the build in a child
-    /// process with `TMPDIR` pointed at an isolated dir we own, then assert
-    /// nothing survives. Same shape as
+    /// attribute a leftover directory to our own build. This test re-executes
+    /// itself in a child process with `TMPDIR` pointed at an isolated dir we
+    /// own: the child builds, the parent asserts nothing survives. Same shape as
     /// `index::vector::ivf::io::tests::test_hnsw_pq_scratch_dir_is_not_leaked`,
     /// which covers the legacy partition-staging dir.
     #[test]
     fn test_shuffle_scratch_dir_is_not_leaked() {
-        let isolated_root = TempStdDir::default();
+        const ROOT_VAR: &str = "LANCE_SHUFFLE_LEAK_TEST_ROOT";
 
-        let child_test = "index::vector::tests::build_vector_index_in_child_process";
+        // Child half: build under the root the parent handed us and let it do the
+        // leak detection. The dataset goes outside the temp dir's `.tmp*` namespace
+        // so the parent never mistakes it for a leaked scratch directory.
+        if let Ok(root) = std::env::var(ROOT_VAR) {
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(async move {
+                    let uri = format!("{root}/dataset");
+                    let reader = lance_datagen::gen_batch()
+                        .col("id", array::step::<Int32Type>())
+                        .col("vector", array::rand_vec::<Float32Type>(8.into()))
+                        .into_reader_rows(RowCount::from(256), BatchCount::from(1));
+                    let mut dataset = Dataset::write(reader, &uri, None).await.unwrap();
+
+                    let params = VectorIndexParams::ivf_flat(2, MetricType::L2);
+                    for i in 0..2 {
+                        dataset
+                            .create_index(
+                                &["vector"],
+                                IndexType::Vector,
+                                Some(format!("vector_idx_{i}")),
+                                &params,
+                                false,
+                            )
+                            .await
+                            .unwrap();
+                    }
+                });
+            return;
+        }
+
+        let isolated_root = TempStdDir::default();
+        // libtest names the thread after the running test, so the child's filter
+        // cannot drift out of sync with this function's name.
+        let this_test = std::thread::current().name().unwrap().to_string();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([child_test, "--exact", "--ignored", "--nocapture"])
+            .args([&this_test, "--exact", "--nocapture"])
             .env("TMPDIR", isolated_root.as_ref())
-            .env("LANCE_SHUFFLE_LEAK_TEST_ROOT", isolated_root.as_ref())
+            .env(ROOT_VAR, isolated_root.as_ref())
             .output()
             .expect("failed to spawn child test process");
         assert!(
@@ -2564,11 +2598,11 @@ mod tests {
             String::from_utf8_lossy(&output.stderr),
         );
 
-        // A libtest filter that matches nothing also exits 0, so a stale
-        // `child_test` name would pass silently. The child writes this first.
+        // A filter that matches nothing also exits 0, so confirm the child did the
+        // work instead of reporting a clean scan of an untouched directory.
         assert!(
             isolated_root.join("dataset").is_dir(),
-            "the child test did not run; is {child_test} still the right name?"
+            "the child process did not run the build; filter was {this_test:?}"
         );
 
         // Every scratch dir a build creates sits directly under TMPDIR and is
@@ -2590,42 +2624,6 @@ mod tests {
             leaked.is_empty(),
             "vector index build leaked scratch directories under the temp dir: {leaked:?}"
         );
-    }
-
-    /// Child half of [`test_shuffle_scratch_dir_is_not_leaked`]. Ignored so it
-    /// only runs when the parent spawns it with `TMPDIR` and
-    /// `LANCE_SHUFFLE_LEAK_TEST_ROOT` pointed at an isolated dir.
-    #[tokio::test]
-    #[ignore = "spawned as a child process by test_shuffle_scratch_dir_is_not_leaked"]
-    async fn build_vector_index_in_child_process() {
-        // A bare `--ignored` run leaves the variable unset, so no-op rather
-        // than fail.
-        let Ok(root) = std::env::var("LANCE_SHUFFLE_LEAK_TEST_ROOT") else {
-            return;
-        };
-
-        // Keep the dataset out of the temp dir's `.tmp*` namespace so the parent
-        // never mistakes it for a leaked scratch directory.
-        let uri = format!("{root}/dataset");
-        let reader = lance_datagen::gen_batch()
-            .col("id", array::step::<Int32Type>())
-            .col("vector", array::rand_vec::<Float32Type>(8.into()))
-            .into_reader_rows(RowCount::from(256), BatchCount::from(1));
-        let mut dataset = Dataset::write(reader, &uri, None).await.unwrap();
-
-        let params = VectorIndexParams::ivf_flat(2, MetricType::L2);
-        for i in 0..2 {
-            dataset
-                .create_index(
-                    &["vector"],
-                    IndexType::Vector,
-                    Some(format!("vector_idx_{i}")),
-                    &params,
-                    false,
-                )
-                .await
-                .unwrap();
-        }
     }
 
     #[tokio::test]
