@@ -721,6 +721,7 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiSchema<'local>(
     target_bases: JObject,
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    file_write_options: JObject,                // FileWriteOptions
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -741,6 +742,7 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiSchema<'local>(
             target_bases,
             allow_external_blob_outside_bases,
             blob_pack_file_size_threshold,
+            file_write_options,
         )
     )
 }
@@ -763,6 +765,7 @@ fn inner_create_with_ffi_schema<'local>(
     target_bases: JObject,
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    file_write_options: JObject,                // FileWriteOptions
 ) -> Result<JObject<'local>> {
     let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
     let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
@@ -785,6 +788,7 @@ fn inner_create_with_ffi_schema<'local>(
         target_bases,
         allow_external_blob_outside_bases,
         blob_pack_file_size_threshold,
+        file_write_options,
         reader,
         None,  // No namespace for schema-only creation
         false, // No managed versioning for schema-only creation
@@ -843,6 +847,7 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStream<'local>(
     target_bases: JObject,                         // Optional<List<String>>
     allow_external_blob_outside_bases: JObject,    // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,        // Optional<Long>
+    file_write_options: JObject,                   // FileWriteOptions
     namespace_obj: JObject,                        // LanceNamespace (can be null)
     table_id_obj: JObject,                         // List<String> (can be null)
     namespace_client_managed_versioning: jboolean, // Whether namespace manages versioning
@@ -866,6 +871,7 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStream<'local>(
             target_bases,
             allow_external_blob_outside_bases,
             blob_pack_file_size_threshold,
+            file_write_options,
             namespace_obj,
             table_id_obj,
             namespace_client_managed_versioning != 0,
@@ -891,6 +897,7 @@ fn inner_create_with_ffi_stream<'local>(
     target_bases: JObject,                      // Optional<List<String>>
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    file_write_options: JObject,                // FileWriteOptions
     namespace_obj: JObject,                     // LanceNamespace (can be null)
     table_id_obj: JObject,                      // List<String> (can be null)
     namespace_client_managed_versioning: bool,  // Whether namespace manages versioning
@@ -917,6 +924,7 @@ fn inner_create_with_ffi_stream<'local>(
         target_bases,
         allow_external_blob_outside_bases,
         blob_pack_file_size_threshold,
+        file_write_options,
         reader,
         namespace_info,
         namespace_client_managed_versioning,
@@ -945,6 +953,7 @@ fn create_dataset<'local>(
     target_bases: JObject,
     allow_external_blob_outside_bases: JObject,
     blob_pack_file_size_threshold: JObject,
+    file_write_options: JObject,
     reader: impl RecordBatchReader + Send + 'static,
     namespace_info: Option<(Arc<dyn LanceNamespace>, Vec<String>)>,
     namespace_client_managed_versioning: bool,
@@ -966,6 +975,7 @@ fn create_dataset<'local>(
         &target_bases,
         &allow_external_blob_outside_bases,
         &blob_pack_file_size_threshold,
+        &file_write_options,
     )?;
 
     // Set up namespace commit handler and storage options provider if namespace is provided
@@ -3798,6 +3808,14 @@ fn convert_java_compaction_options_to_rust(
             &[],
         )?
         .l()?;
+    let data_storage_version = env
+        .call_method(
+            &java_options,
+            "getDataStorageVersion",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
 
     build_compaction_options(
         env,
@@ -3815,6 +3833,7 @@ fn convert_java_compaction_options_to_rust(
         &max_source_rows,
         &max_source_bytes,
         &excluded_fragment_ids,
+        &data_storage_version,
         config,
     )
 }
