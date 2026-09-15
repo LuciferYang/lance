@@ -1088,7 +1088,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             Compression::FixedSizeList(fsl) => {
                 // In the future, we might need to do something more complex here if FSL supports
                 // compression.
-                Ok(Box::new(ValueDecompressor::from_fsl(fsl)))
+                Ok(Box::new(ValueDecompressor::from_fsl(fsl)?))
             }
             Compression::Rle(rle) => Ok(Box::new(create_rle_decompressor(
                 rle,
@@ -1143,7 +1143,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                     .map(|v| LanceBuffer::from_bytes(v.clone(), 1)),
             ))),
             Compression::Flat(flat) => Ok(Box::new(ValueDecompressor::from_flat(flat))),
-            Compression::FixedSizeList(fsl) => Ok(Box::new(ValueDecompressor::from_fsl(fsl))),
+            Compression::FixedSizeList(fsl) => Ok(Box::new(ValueDecompressor::from_fsl(fsl)?)),
             Compression::PackedStruct(description) => Ok(Box::new(
                 PackedStructFixedPerValueDecompressor::new(description)?,
             )),
@@ -1239,7 +1239,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             }
             Compression::Variable(_) => Ok(Box::new(BinaryBlockDecompressor::default())),
             Compression::FixedSizeList(fsl) => {
-                Ok(Box::new(ValueDecompressor::from_fsl(fsl.as_ref())))
+                Ok(Box::new(ValueDecompressor::from_fsl(fsl.as_ref())?))
             }
             Compression::OutOfLineBitpacking(out_of_line) => {
                 // Extract the compressed bit width from the values encoding
