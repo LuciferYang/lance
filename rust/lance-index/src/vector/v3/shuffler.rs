@@ -166,6 +166,11 @@ pub struct IvfShuffler {
     num_partitions: usize,
     format_version: ConcreteFileVersion,
 
+    /// `Some` when this shuffler owns the directory `output_dir` points at: it is
+    /// removed once this shuffler and every reader it produced are dropped.
+    /// `None` when the caller owns the directory and its cleanup.
+    owned_scratch_dir: Option<Arc<tempfile::TempDir>>,
+
     progress: Arc<dyn crate::progress::IndexBuildProgress>,
 }
 
@@ -176,8 +181,16 @@ impl IvfShuffler {
             output_dir,
             num_partitions,
             format_version: ConcreteFileVersion::V2_0,
+            owned_scratch_dir: None,
             progress: crate::progress::noop_progress(),
         }
+    }
+
+    /// Hand this shuffler ownership of the scratch directory `output_dir` points at,
+    /// so no caller has to keep a guard alive for the duration of the build.
+    pub fn with_owned_scratch_dir(mut self, scratch_dir: Arc<tempfile::TempDir>) -> Self {
+        self.owned_scratch_dir = Some(scratch_dir);
+        self
     }
 
     pub fn with_format_version(mut self, format_version: ConcreteFileVersion) -> Self {
@@ -301,7 +314,8 @@ impl Shuffler for IvfShuffler {
                 partition_sizes,
                 total_loss,
             )
-            .with_estimated_row_bytes(estimated_row_bytes),
+            .with_estimated_row_bytes(estimated_row_bytes)
+            .with_scratch_dir_guard(self.owned_scratch_dir.clone()),
         ))
     }
 }
@@ -312,6 +326,9 @@ pub struct IvfShufflerReader {
     partition_sizes: Vec<usize>,
     estimated_row_bytes: Option<usize>,
     loss: f64,
+    /// Keeps an owned scratch directory alive for as long as this reader can read
+    /// from it. `None` when the directory is owned elsewhere.
+    _scratch_dir_guard: Option<Arc<tempfile::TempDir>>,
 }
 
 impl IvfShufflerReader {
@@ -329,7 +346,15 @@ impl IvfShufflerReader {
             partition_sizes,
             estimated_row_bytes: None,
             loss,
+            _scratch_dir_guard: None,
         }
+    }
+
+    /// Tie the lifetime of an owned scratch directory to this reader. Pass `None`
+    /// when the directory is owned elsewhere.
+    pub fn with_scratch_dir_guard(mut self, guard: Option<Arc<tempfile::TempDir>>) -> Self {
+        self._scratch_dir_guard = guard;
+        self
     }
 
     fn with_estimated_row_bytes(mut self, estimated_row_bytes: usize) -> Self {
@@ -456,18 +481,58 @@ pub fn create_ivf_shuffler(
     format_version: ConcreteFileVersion,
     progress: Option<Arc<dyn crate::progress::IndexBuildProgress>>,
 ) -> Box<dyn Shuffler> {
+    create_shuffler(output_dir, None, num_partitions, format_version, progress)
+}
+
+/// Create a shuffler that owns the scratch directory it shuffles into.
+///
+/// The directory is created here and removed once the shuffler and the reader it
+/// returns are both dropped, so callers do not have to hold a guard for the
+/// duration of the build. Use [`create_ivf_shuffler`] instead when the caller
+/// already owns the directory, for example a subdirectory of a larger staging
+/// area it cleans up itself.
+pub fn create_owned_ivf_shuffler(
+    num_partitions: usize,
+    format_version: ConcreteFileVersion,
+    progress: Option<Arc<dyn crate::progress::IndexBuildProgress>>,
+) -> Result<Box<dyn Shuffler>> {
+    let scratch_dir = tempfile::TempDir::new()?;
+    let output_dir = Path::from_filesystem_path(scratch_dir.path())
+        .map_err(|e| Error::io_source(Box::new(e)))?;
+    Ok(create_shuffler(
+        output_dir,
+        Some(Arc::new(scratch_dir)),
+        num_partitions,
+        format_version,
+        progress,
+    ))
+}
+
+fn create_shuffler(
+    output_dir: Path,
+    owned_scratch_dir: Option<Arc<tempfile::TempDir>>,
+    num_partitions: usize,
+    format_version: ConcreteFileVersion,
+    progress: Option<Arc<dyn crate::progress::IndexBuildProgress>>,
+) -> Box<dyn Shuffler> {
     let use_legacy = std::env::var("LANCE_LEGACY_SHUFFLER")
         .map(|v| str_is_truthy(&v))
         .unwrap_or(false);
     if use_legacy {
         let mut shuffler =
             IvfShuffler::new(output_dir, num_partitions).with_format_version(format_version);
+        if let Some(scratch_dir) = owned_scratch_dir {
+            shuffler = shuffler.with_owned_scratch_dir(scratch_dir);
+        }
         if let Some(progress) = progress {
             shuffler = shuffler.with_progress(progress);
         }
         Box::new(shuffler)
     } else {
         let mut shuffler = TwoFileShuffler::new(output_dir, num_partitions);
+        if let Some(scratch_dir) = owned_scratch_dir {
+            shuffler = shuffler.with_owned_scratch_dir(scratch_dir);
+        }
         if let Some(progress) = progress {
             shuffler = shuffler.with_progress(progress);
         }
@@ -538,6 +603,11 @@ pub struct TwoFileShuffler {
     num_partitions: usize,
     batch_size_bytes: usize,
 
+    /// `Some` when this shuffler owns the directory `output_dir` points at: it is
+    /// removed once this shuffler and every reader it produced are dropped.
+    /// `None` when the caller owns the directory and its cleanup.
+    owned_scratch_dir: Option<Arc<tempfile::TempDir>>,
+
     progress: Arc<dyn crate::progress::IndexBuildProgress>,
 }
 
@@ -548,8 +618,16 @@ impl TwoFileShuffler {
             output_dir,
             num_partitions,
             batch_size_bytes: shuffle_batch_bytes(),
+            owned_scratch_dir: None,
             progress: crate::progress::noop_progress(),
         }
+    }
+
+    /// Hand this shuffler ownership of the scratch directory `output_dir` points at,
+    /// so no caller has to keep a guard alive for the duration of the build.
+    pub fn with_owned_scratch_dir(mut self, scratch_dir: Arc<tempfile::TempDir>) -> Self {
+        self.owned_scratch_dir = Some(scratch_dir);
+        self
     }
 
     pub fn with_progress(mut self, progress: Arc<dyn crate::progress::IndexBuildProgress>) -> Self {
@@ -716,6 +794,7 @@ impl Shuffler for TwoFileShuffler {
             num_batches,
             partition_counts,
             total_loss,
+            self.owned_scratch_dir.clone(),
         )
         .await
     }
@@ -788,6 +867,9 @@ pub struct TwoFileShuffleReader {
     partition_counts: Vec<u64>,
     estimated_row_bytes: usize,
     total_loss: f64,
+    /// Keeps an owned scratch directory alive for as long as this reader can read
+    /// from it. `None` when the directory is owned elsewhere.
+    _scratch_dir_guard: Option<Arc<tempfile::TempDir>>,
 }
 
 enum ShuffleOffsets {
@@ -803,6 +885,7 @@ impl TwoFileShuffleReader {
         num_batches: u64,
         partition_counts: Vec<u64>,
         total_loss: f64,
+        scratch_dir_guard: Option<Arc<tempfile::TempDir>>,
     ) -> Result<Box<dyn ShuffleReader>> {
         Self::try_new_with_preload_limit(
             object_store,
@@ -811,11 +894,13 @@ impl TwoFileShuffleReader {
             num_batches,
             partition_counts,
             total_loss,
+            scratch_dir_guard,
             MAX_PRELOADED_OFFSETS_BYTES,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn try_new_with_preload_limit(
         object_store: Arc<ObjectStore>,
         output_dir: Path,
@@ -823,6 +908,7 @@ impl TwoFileShuffleReader {
         num_batches: u64,
         partition_counts: Vec<u64>,
         total_loss: f64,
+        scratch_dir_guard: Option<Arc<tempfile::TempDir>>,
         max_preloaded_offsets_bytes: usize,
     ) -> Result<Box<dyn ShuffleReader>> {
         if num_batches == 0 {
@@ -972,6 +1058,7 @@ impl TwoFileShuffleReader {
             partition_counts,
             estimated_row_bytes,
             total_loss,
+            _scratch_dir_guard: scratch_dir_guard,
         }))
     }
 
@@ -1739,6 +1826,45 @@ mod tests {
         values
     }
 
+    /// A shuffler that owns its scratch directory has to keep it alive for the
+    /// reader it produced, not just for itself: `IvfIndexBuilder` holds the
+    /// shuffler and the reader in separate fields, and `split_shuffle` drops its
+    /// shuffler as soon as `shuffle()` returns, so the reader can be the last
+    /// thing that still needs the directory.
+    #[tokio::test]
+    async fn test_owned_scratch_dir_outlives_the_shuffler() {
+        let scratch_dir = Arc::new(tempfile::TempDir::new().unwrap());
+        let scratch_path = scratch_dir.path().to_path_buf();
+        let output_dir = Path::from_filesystem_path(&scratch_path).unwrap();
+
+        let shuffler = TwoFileShuffler::new(output_dir, 2).with_owned_scratch_dir(scratch_dir);
+        let reader = shuffler
+            .shuffle(batches_to_stream(vec![make_batch(
+                &[0, 1, 0],
+                &[10, 20, 30],
+                None,
+            )]))
+            .await
+            .unwrap();
+
+        drop(shuffler);
+        assert!(
+            scratch_path.is_dir(),
+            "dropping the shuffler removed the directory the reader still reads from: {scratch_path:?}"
+        );
+        let partition = collect_partition(reader.as_ref(), 0).await.unwrap();
+        let vals: &Int32Array = partition.column_by_name("val").unwrap().as_primitive();
+        let mut values: Vec<i32> = vals.iter().map(|x| x.unwrap()).collect();
+        values.sort();
+        assert_eq!(values, vec![10, 30]);
+
+        drop(reader);
+        assert!(
+            !scratch_path.exists(),
+            "the scratch directory outlived the last reader holding it: {scratch_path:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_two_file_shuffler_round_trip() {
         let dir = TempStrDir::default();
@@ -1997,6 +2123,7 @@ mod tests {
             4,
             vec![2, 1, 1, 3, 0],
             0.0,
+            None,
             0,
         )
         .await
@@ -2094,6 +2221,7 @@ mod tests {
             2,
             vec![1, 2, 1],
             0.0,
+            None,
             0,
         )
         .await
