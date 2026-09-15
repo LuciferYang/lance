@@ -915,8 +915,8 @@ mod tests {
     /// IVF_HNSW_* builds.
     ///
     /// The OS temp dir is process-global, so an in-process check can't attribute a
-    /// leak to our own build. Instead we run the build in a child process with
-    /// `TMPDIR` pointed at an isolated dir we own, then assert nothing survives.
+    /// leak to our own build. Instead we run the build in a child process with its
+    /// temp dir pointed at an isolated dir we own, then assert nothing survives.
     #[test]
     fn test_hnsw_pq_scratch_dir_is_not_leaked() {
         // Isolated temp root for the child. Owned here so it -- and anything the
@@ -926,7 +926,13 @@ mod tests {
         let child_test = "index::vector::ivf::io::tests::build_legacy_hnsw_pq_in_child_process";
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([child_test, "--exact", "--ignored", "--nocapture"])
+            // `std::env::temp_dir()` reads `TMPDIR` on POSIX and `TMP`/`TEMP` on
+            // Windows. Set all three, and let the child confirm the redirect took
+            // effect: a child staging into the real temp dir would leave the scan
+            // below looking at an empty directory and passing for the wrong reason.
             .env("TMPDIR", isolated_root.as_ref())
+            .env("TMP", isolated_root.as_ref())
+            .env("TEMP", isolated_root.as_ref())
             .env("LANCE_HNSW_LEAK_TEST_ROOT", isolated_root.as_ref())
             .output()
             .expect("failed to spawn child test process");
@@ -937,8 +943,9 @@ mod tests {
             String::from_utf8_lossy(&output.stderr),
         );
 
-        // Each build stages its partitions in one `.tmp*` dir directly under TMPDIR.
-        // Every guard removes its dir when it drops, so none should survive.
+        // Each build stages its partitions in one `.tmp*` dir directly under the
+        // child's temp dir. Every guard removes its dir when it drops, so none
+        // should survive.
         let leaked: Vec<PathBuf> = std::fs::read_dir(&isolated_root)
             .expect("read isolated temp root")
             .flatten()
@@ -963,9 +970,9 @@ mod tests {
     }
 
     /// Child half of [`test_hnsw_pq_scratch_dir_is_not_leaked`]. Ignored so it only
-    /// runs when the parent spawns it with `TMPDIR` and `LANCE_HNSW_LEAK_TEST_ROOT`
-    /// pointed at an isolated dir. Builds a few legacy IVF_HNSW_PQ indices; the
-    /// parent does the leak detection.
+    /// runs when the parent spawns it with the temp-dir env vars and
+    /// `LANCE_HNSW_LEAK_TEST_ROOT` pointed at an isolated dir. Builds a few legacy
+    /// IVF_HNSW_PQ indices; the parent does the leak detection.
     #[tokio::test]
     #[ignore = "spawned as a child process by test_hnsw_pq_scratch_dir_is_not_leaked"]
     async fn build_legacy_hnsw_pq_in_child_process() {
@@ -974,6 +981,17 @@ mod tests {
         let Ok(root) = std::env::var("LANCE_HNSW_LEAK_TEST_ROOT") else {
             return;
         };
+
+        // The parent can only scan the directory it owns, so if its temp-dir env
+        // vars did not take effect the scan is vacuous and passes no matter what
+        // the build does. Fail here instead of reporting a clean run.
+        let temp_dir = std::env::temp_dir();
+        assert_eq!(
+            temp_dir.canonicalize().unwrap(),
+            std::path::Path::new(&root).canonicalize().unwrap(),
+            "the temp dir was not redirected to the isolated root; \
+             temp_dir() is {temp_dir:?}, root is {root:?}",
+        );
 
         const DIM: usize = 8;
         const ROWS: usize = 256;
