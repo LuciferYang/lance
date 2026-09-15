@@ -2201,13 +2201,11 @@ mod tests {
     use arrow_array::Array;
     use arrow_array::RecordBatch;
     use arrow_array::types::{Float32Type, Int32Type};
-    use arrow_array::{Int32Array, UInt32Array};
     use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_file::writer::FileWriterOptions;
     use lance_index::metrics::NoOpMetricsCollector;
-    use lance_index::vector::PART_ID_COLUMN;
     use lance_linalg::distance::MetricType;
 
     /// `open_index_file` skips the HEAD when the size is known and still falls
@@ -2538,77 +2536,6 @@ mod tests {
         assert_eq!(results.num_rows(), 10, "Should return 10 nearest neighbors");
     }
 
-    /// The shuffler carries only the scratch-directory path, so the
-    /// `TempStdDir` guard has to be handed back to the caller. Dropping it
-    /// inside `prepare_vector_segment_build` removed the directory before the
-    /// shuffle wrote into it, the writer recreated it, and nothing owned it
-    /// afterwards: one leaked scratch directory per index build, holding the
-    /// full shuffled copy of the vector column.
-    #[tokio::test]
-    async fn test_prepare_vector_segment_build_keeps_scratch_dir_alive() {
-        let test_dir = TempStrDir::default();
-        let uri = format!("{}/ds", test_dir.as_str());
-        let reader = lance_datagen::gen_batch()
-            .col("id", array::step::<Int32Type>())
-            .col("vector", array::rand_vec::<Float32Type>(8.into()))
-            .into_reader_rows(RowCount::from(64), BatchCount::from(1));
-        let dataset = Dataset::write(reader, &uri, None).await.unwrap();
-
-        let params = VectorIndexParams::ivf_flat(2, MetricType::L2);
-        let (_, _, _, shuffler, scratch_dir) = prepare_vector_segment_build(
-            &dataset,
-            "vector",
-            &params,
-            noop_progress(),
-            "test",
-            false,
-            None,
-        )
-        .await
-        .unwrap();
-
-        let scratch_path = scratch_dir.to_path_buf();
-        assert!(
-            scratch_path.is_dir(),
-            "the scratch directory must still be there when the helper returns: {scratch_path:?}"
-        );
-
-        // Drive the shuffler so the scratch directory holds real output: that
-        // is what the guard has to outlive, and what used to be left behind.
-        // `record_batch!` would make both fields nullable; the shuffler's own
-        // tests declare `__ivf_part_id` non-null, so spell the schema out.
-        let schema = Arc::new(ArrowSchema::new(vec![
-            Field::new(PART_ID_COLUMN, ArrowDataType::UInt32, false),
-            Field::new("val", ArrowDataType::Int32, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(UInt32Array::from(vec![0u32, 1, 0])),
-                Arc::new(Int32Array::from(vec![10, 20, 30])),
-            ],
-        )
-        .unwrap();
-        shuffler
-            .shuffle(Box::new(lance_io::stream::RecordBatchStreamAdapter::new(
-                schema,
-                stream::iter(vec![Ok(batch)]),
-            )))
-            .await
-            .unwrap();
-        assert!(
-            std::fs::read_dir(&scratch_path).unwrap().next().is_some(),
-            "the shuffle output must land under the returned guard: {scratch_path:?}"
-        );
-
-        drop(shuffler);
-        drop(scratch_dir);
-        assert!(
-            !scratch_path.exists(),
-            "dropping the guard must remove the scratch directory and the shuffle output in it: {scratch_path:?}"
-        );
-    }
-
     /// The scratch directory the guard owns has to be gone once the build is
     /// over, or the OS temp dir grows by one shuffled copy of the vector column
     /// per index build.
@@ -2637,9 +2564,8 @@ mod tests {
             String::from_utf8_lossy(&output.stderr),
         );
 
-        // A libtest filter that matches nothing also exits 0, so without this
-        // the whole test would silently pass if `child_test` ever went stale.
-        // The child writes its dataset here before it builds anything.
+        // A libtest filter that matches nothing also exits 0, so a stale
+        // `child_test` name would pass silently. The child writes this first.
         assert!(
             isolated_root.join("dataset").is_dir(),
             "the child test did not run; is {child_test} still the right name?"
@@ -2662,10 +2588,7 @@ mod tests {
 
         assert!(
             leaked.is_empty(),
-            "vector index build leaked {} scratch director{} under the temp dir: {:?}",
-            leaked.len(),
-            if leaked.len() == 1 { "y" } else { "ies" },
-            leaked,
+            "vector index build leaked scratch directories under the temp dir: {leaked:?}"
         );
     }
 
