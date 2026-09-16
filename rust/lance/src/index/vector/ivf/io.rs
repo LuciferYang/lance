@@ -943,6 +943,15 @@ mod tests {
             String::from_utf8_lossy(&output.stderr),
         );
 
+        // A filter that matches nothing also exits 0, so confirm the child did the
+        // work instead of reporting a clean scan of an untouched directory.
+        assert!(
+            isolated_root.join("dataset").is_dir(),
+            "the child process did not run the build; filter was {child_test:?}\n\
+             --- child stdout ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+
         // Each build stages its partitions in one `.tmp*` dir directly under the
         // child's temp dir. Every guard removes its dir when it drops, so none
         // should survive.
@@ -962,7 +971,9 @@ mod tests {
         assert!(
             leaked.is_empty(),
             "legacy IVF_HNSW_PQ build leaked {} scratch director{} under the temp dir; \
-             the TempStdDir guard should remove each one when it drops: {:?}",
+             the TempStdDir guard should remove each one when it drops: {:?}. `.tmp` is \
+             tempfile's default prefix, so one of these may belong to another tempfile \
+             user rather than to that guard.",
             leaked.len(),
             if leaked.len() == 1 { "y" } else { "ies" },
             leaked,
@@ -986,11 +997,18 @@ mod tests {
         // vars did not take effect the scan is vacuous and passes no matter what
         // the build does. Fail here instead of reporting a clean run.
         let temp_dir = std::env::temp_dir();
+        let canonical = |path: &std::path::Path| {
+            path.canonicalize()
+                .unwrap_or_else(|e| panic!("cannot canonicalize {path:?}: {e}"))
+        };
         assert_eq!(
-            temp_dir.canonicalize().unwrap(),
-            std::path::Path::new(&root).canonicalize().unwrap(),
-            "the temp dir was not redirected to the isolated root; \
-             temp_dir() is {temp_dir:?}, root is {root:?}",
+            canonical(&temp_dir),
+            canonical(std::path::Path::new(&root)),
+            "the temp dir was not redirected to the isolated root; temp_dir() is \
+             {temp_dir:?}, root is {root:?}. On Windows 11 and Server 2022 and newer, \
+             `std::env::temp_dir` goes through `GetTempPath2`, which ignores TMP and \
+             TEMP for a process running as SYSTEM; older Windows falls back to \
+             `GetTempPathW`, which honors them.",
         );
 
         const DIM: usize = 8;

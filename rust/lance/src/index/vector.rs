@@ -2565,11 +2565,18 @@ mod tests {
             // vars did not take effect the scan is vacuous and passes no matter what
             // the build does. Fail here instead of reporting a clean run.
             let temp_dir = std::env::temp_dir();
+            let canonical = |path: &std::path::Path| {
+                path.canonicalize()
+                    .unwrap_or_else(|e| panic!("cannot canonicalize {path:?}: {e}"))
+            };
             assert_eq!(
-                temp_dir.canonicalize().unwrap(),
-                std::path::Path::new(&root).canonicalize().unwrap(),
-                "the temp dir was not redirected to the isolated root; \
-                 temp_dir() is {temp_dir:?}, root is {root:?}",
+                canonical(&temp_dir),
+                canonical(std::path::Path::new(&root)),
+                "the temp dir was not redirected to the isolated root; temp_dir() is \
+                 {temp_dir:?}, root is {root:?}. On Windows 11 and Server 2022 and newer, \
+                 `std::env::temp_dir` goes through `GetTempPath2`, which ignores TMP and \
+                 TEMP for a process running as SYSTEM; older Windows falls back to \
+                 `GetTempPathW`, which honors them.",
             );
 
             tokio::runtime::Runtime::new()
@@ -2646,7 +2653,9 @@ mod tests {
 
         assert!(
             leaked.is_empty(),
-            "vector index build leaked scratch directories under the temp dir: {leaked:?}"
+            "vector index build leaked scratch directories under the temp dir: {leaked:?}. \
+             `.tmp` is tempfile's default prefix, so one of these may belong to another \
+             tempfile user rather than to the shuffler's guard."
         );
     }
 
