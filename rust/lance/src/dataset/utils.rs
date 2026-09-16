@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::Result;
+use crate::{Error, Result};
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator, RecordBatchReader, UInt64Array};
 use arrow_schema::{
     DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
@@ -121,16 +121,16 @@ impl CapturedRowIds {
         match self {
             Self::AddressStyle(addrs) => Ok(Cow::Borrowed(addrs)),
             Self::SequenceStyle(sequence) => {
+                let index = index.ok_or_else(|| {
+                    Error::internal(
+                        "Resolving sequence-style row ids to addresses requires a row id index, \
+                         but none was available",
+                    )
+                })?;
                 let mut treemap = RoaringTreemap::new();
-                let Some(index) = index else {
-                    return Err(crate::Error::internal(
-                        "A row id index is required to resolve sequence-style row ids, but \
-                         none was available",
-                    ));
-                };
                 for row_id in sequence.iter() {
                     let address = index.get(row_id)?.ok_or_else(|| {
-                        crate::Error::internal(format!(
+                        Error::internal(format!(
                             "Captured row id {row_id} is missing from the row id index"
                         ))
                     })?;
@@ -349,20 +349,33 @@ mod tests {
 
     #[test]
     fn row_addrs_errors_instead_of_panicking() {
-        let captured = CapturedRowIds::SequenceStyle(RowIdSequence::from(0..2u64));
+        // Ids that are neither 0 nor the sequence length, so an error message
+        // built from the wrong value cannot look right by coincidence.
+        let captured = CapturedRowIds::SequenceStyle(RowIdSequence::from(7..9u64));
 
         // No index provided for sequence-style row ids: an error, not a panic.
         let err = captured.row_addrs(None).unwrap_err();
+        assert!(matches!(err, Error::Internal { .. }));
         assert!(
-            err.to_string().contains("none was available"),
-            "error should name the missing index, got: {err}"
+            err.to_string().contains("requires a row id index"),
+            "error should say the index is what is missing, got: {err}"
         );
 
-        // An id the index does not know: a descriptive error, not a panic.
+        // An empty capture still needs the index: no silent Ok.
+        let empty = CapturedRowIds::SequenceStyle(RowIdSequence::new());
+        assert!(matches!(
+            empty.row_addrs(None).unwrap_err(),
+            Error::Internal { .. }
+        ));
+
+        // An id the index does not know: a descriptive error, not a panic. The
+        // message has to name the id, since that is what a maintainer needs.
         let index = RowIdIndex::new(&[]).unwrap();
         let err = captured.row_addrs(Some(&index)).unwrap_err();
+        assert!(matches!(err, Error::Internal { .. }));
         assert!(
-            err.to_string().contains("missing"),
+            err.to_string()
+                .contains("Captured row id 7 is missing from the row id index"),
             "error should name the missing row id, got: {err}"
         );
     }
