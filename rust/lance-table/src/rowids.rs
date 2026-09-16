@@ -1265,9 +1265,6 @@ mod test {
             ReadBatchParams::Indices(vec![1, 4, 1000].into()),
             ReadBatchParams::Range(2..1000),
             ReadBatchParams::RangeTo(..1000),
-            // RangeFrom's bound is a start offset, so out-of-bounds means
-            // start > len; == len must stay valid (empty tail).
-            ReadBatchParams::RangeFrom(1000..),
         ];
 
         let sequence = RowIdSequence::from(0..10);
@@ -1281,6 +1278,19 @@ mod test {
         // start == len selects an empty tail, not an error.
         let result = select_row_ids(&sequence, &ReadBatchParams::RangeFrom(10..));
         assert_eq!(result.unwrap(), Vec::<u64>::new());
+
+        // RangeFrom's bound is a start offset, so out of bounds starts one past
+        // the length.
+        for start in [11, 1000] {
+            let err = select_row_ids(&sequence, &ReadBatchParams::RangeFrom(start..)).unwrap_err();
+            assert!(matches!(err, Error::InvalidInput { .. }));
+            assert!(
+                err.to_string().contains(&format!(
+                    "Index out of bounds: {start} for sequence of length 10"
+                )),
+                "error should name the out-of-bounds start, got: {err}"
+            );
+        }
     }
 
     #[test]
