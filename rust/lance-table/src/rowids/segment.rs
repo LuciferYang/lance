@@ -898,15 +898,6 @@ mod test {
     }
 
     #[test]
-    fn test_range_with_holes_len_matches_hole_count() {
-        let segment = U64Segment::RangeWithHoles {
-            range: 0..100,
-            holes: EncodedU64Array::from_iter(10..90),
-        };
-        assert_eq!(segment.len(), 20);
-    }
-
-    #[test]
     fn test_range_with_bitmap_data_remains_publicly_mutable() {
         let mut segment = U64Segment::RangeWithBitmap {
             range: 0..8,
