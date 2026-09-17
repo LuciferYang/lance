@@ -255,9 +255,15 @@ public class WriteParams {
     }
 
     /**
-     * Enable stable row ids. Experimental. Row ids persist across compaction and update operations,
-     * which makes compaction more efficient: with stable row ids, secondary indices do not need to
-     * be updated to point to new row ids.
+     * Enable stable row ids (experimental).
+     *
+     * <p>A row then keeps the same {@code _rowid} for its lifetime: compaction, update and merge
+     * insert relocate or rewrite the row without changing its id. An index that stores row ids
+     * therefore needs no remap after compaction.
+     *
+     * <p>This only applies to new datasets. An append or overwrite to an existing dataset does not
+     * change that dataset's setting, so this value can neither enable nor disable the feature after
+     * creation. Default is false.
      *
      * @param enableStableRowIds whether to enable stable row ids
      * @return this builder

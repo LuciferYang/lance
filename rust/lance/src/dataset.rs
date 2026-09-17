@@ -3208,9 +3208,15 @@ impl Dataset {
 
     /// Migrate a table to use stable row IDs.
     ///
-    /// Stable row IDs assign a persistent identifier to each row that remains
-    /// stable across compaction operations. This enables more efficient updates
-    /// to secondary indices.
+    /// Afterwards a row keeps the same id for its lifetime: compaction, update
+    /// and merge insert relocate or rewrite the row without changing its id,
+    /// which enables more efficient updates to secondary indices.
+    ///
+    /// Migration assigns a fresh id to every physical row position, in fragment
+    /// order, starting from the dataset's `next_row_id` high-water mark. Before
+    /// migration `_rowid` is a row address, a different namespace from the ids
+    /// assigned here, so a `_rowid` recorded beforehand must not be reused as a
+    /// row id afterwards.
     ///
     /// A single Merge commit assigns row ID sequences to all fragments and
     /// activates the stable row ID feature flag atomically. Because `Merge`

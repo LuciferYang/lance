@@ -1305,9 +1305,9 @@ def write_fragments(
         used to store connection parameters like credentials, endpoint, etc.
     enable_stable_row_ids: bool
         Experimental: if set to true, the writer will use stable row ids.
-        These row ids persist across compaction and update operations.
-        This makes compaction more efficient, since with stable row ids no
-        secondary indices need to be updated to point to new row ids.
+        A row then keeps the same id for its lifetime: compaction, update and
+        merge insert relocate or rewrite the row without changing its id. An
+        index that stores row ids therefore needs no remap after compaction.
     target_bases : list of str, optional
         References to base paths where data should be written. Can be
         specified in all modes.
