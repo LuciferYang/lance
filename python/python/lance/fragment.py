@@ -1304,11 +1304,12 @@ def write_fragments(
         Extra options that make sense for a particular storage connection. This is
         used to store connection parameters like credentials, endpoint, etc.
     enable_stable_row_ids: bool
-        Experimental: request stable row ids for the dataset these fragments are
-        committed to. Writing fragments allocates no ids; the commit assigns them,
-        and a destination that already exists keeps its own setting. Once enabled,
-        a row keeps the same id for its lifetime: compaction, update and merge
-        insert relocate or rewrite the row without changing its id.
+        Experimental, and without effect here: writing fragments assigns no row
+        ids, and this value is not carried into the commit. For a new dataset,
+        enable stable row ids on the commit instead; a destination that already
+        exists keeps its own setting either way. Once enabled, a row keeps the
+        same id for its lifetime: compaction, update and merge insert relocate or
+        rewrite the row without changing its id.
     target_bases : list of str, optional
         References to base paths where data should be written. Can be
         specified in all modes.
