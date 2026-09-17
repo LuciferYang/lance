@@ -8057,10 +8057,9 @@ def write_dataset(
     enable_stable_row_ids : bool, optional
         Experimental parameter: if set to true, the writer will use stable row ids.
         A row then keeps the same id for its lifetime: compaction, update and merge
-        insert relocate or rewrite the row without changing its id. An index that
-        stores row ids therefore needs no remap after compaction. This only applies
-        to new datasets; a write to an existing dataset keeps that dataset's own
-        setting.
+        insert relocate or rewrite the row without changing its id. This only
+        applies to new datasets; a write to an existing dataset keeps that
+        dataset's own setting.
     auto_cleanup_options: optional, AutoCleanupConfig
         Config options for automatic cleanup of the dataset.
         If set, and this is a new dataset, old dataset versions will be automatically

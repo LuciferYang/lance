@@ -1306,8 +1306,7 @@ def write_fragments(
     enable_stable_row_ids: bool
         Experimental: if set to true, the writer will use stable row ids.
         A row then keeps the same id for its lifetime: compaction, update and
-        merge insert relocate or rewrite the row without changing its id. An
-        index that stores row ids therefore needs no remap after compaction.
+        merge insert relocate or rewrite the row without changing its id.
     target_bases : list of str, optional
         References to base paths where data should be written. Can be
         specified in all modes.
