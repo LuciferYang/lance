@@ -48,21 +48,34 @@ impl PartitionTransformer {
         centroids: FixedSizeListArray,
         distance_type: DistanceType,
         input_column: impl AsRef<str>,
-    ) -> Result<Self> {
-        let index = SimpleIndex::may_train_index(
+    ) -> Self {
+        // The HNSW over the centroids only speeds assignment up; `None` is the
+        // supported brute-force path. Failing to build it is not a reason to
+        // fail the index build, so warn and fall back rather than unwrap.
+        let index = match SimpleIndex::may_train_index(
             centroids.values().clone(),
             centroids.value_length() as usize,
             distance_type,
-        )?;
+        ) {
+            Ok(index) => index,
+            Err(err) => {
+                log::warn!(
+                    "could not train the centroid index for partition assignment, \
+                     falling back to a full scan of {} centroids: {err}",
+                    centroids.len()
+                );
+                None
+            }
+        };
 
-        Ok(Self {
+        Self {
             centroids,
             distance_type,
             input_column: input_column.as_ref().to_owned(),
             output_column: PART_ID_COLUMN.to_owned(),
             with_distance: false,
             index,
-        })
+        }
     }
 
     pub fn with_distance(mut self, with_distance: bool) -> Self {
@@ -230,7 +243,7 @@ mod tests {
     }
 
     fn transformer() -> PartitionTransformer {
-        PartitionTransformer::new(centroids(), DistanceType::L2, VECTOR_COLUMN).unwrap()
+        PartitionTransformer::new(centroids(), DistanceType::L2, VECTOR_COLUMN)
     }
 
     fn vector_batch(vectors: Vec<Vec<f32>>) -> RecordBatch {

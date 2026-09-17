@@ -59,15 +59,26 @@ pub fn new_ivf_transformer_with_quantizer(
     range: Option<Range<u32>>,
 ) -> Result<IvfTransformer> {
     match quantizer {
-        Quantizer::Flat(_) | Quantizer::FlatBin(_) => {
-            IvfTransformer::new_flat(centroids, metric_type, vector_column, range)
-        }
-        Quantizer::Product(pq) => {
-            IvfTransformer::with_pq(centroids, metric_type, vector_column, pq, range)
-        }
-        Quantizer::Scalar(sq) => {
-            IvfTransformer::with_sq(centroids, metric_type, vector_column, sq, range)
-        }
+        Quantizer::Flat(_) | Quantizer::FlatBin(_) => Ok(IvfTransformer::new_flat(
+            centroids,
+            metric_type,
+            vector_column,
+            range,
+        )),
+        Quantizer::Product(pq) => Ok(IvfTransformer::with_pq(
+            centroids,
+            metric_type,
+            vector_column,
+            pq,
+            range,
+        )),
+        Quantizer::Scalar(sq) => Ok(IvfTransformer::with_sq(
+            centroids,
+            metric_type,
+            vector_column,
+            sq,
+            range,
+        )),
         Quantizer::Rabit(rq) => {
             IvfTransformer::with_rq(centroids, metric_type, vector_column, rq, range)
         }
@@ -108,7 +119,7 @@ impl IvfTransformer {
         centroids: FixedSizeListArray,
         distance_type: DistanceType,
         vector_column: &str,
-    ) -> Result<Self> {
+    ) -> Self {
         let mut transforms: Vec<Arc<dyn Transformer>> =
             vec![Arc::new(super::transform::Flatten::new(vector_column))];
 
@@ -126,9 +137,9 @@ impl IvfTransformer {
             centroids.clone(),
             distance_type,
             vector_column,
-        )?);
+        ));
         transforms.push(partition_transform);
-        Ok(Self::new(centroids, distance_type, transforms))
+        Self::new(centroids, distance_type, transforms)
     }
 
     pub fn new_flat(
@@ -136,7 +147,7 @@ impl IvfTransformer {
         distance_type: DistanceType,
         vector_column: &str,
         range: Option<Range<u32>>,
-    ) -> Result<Self> {
+    ) -> Self {
         let mut transforms: Vec<Arc<dyn Transformer>> =
             vec![Arc::new(super::transform::Flatten::new(vector_column))];
 
@@ -154,7 +165,7 @@ impl IvfTransformer {
             centroids.clone(),
             dt,
             vector_column,
-        )?);
+        ));
         transforms.push(ivf_transform);
 
         if let Some(range) = range {
@@ -166,7 +177,7 @@ impl IvfTransformer {
 
         transforms.push(Arc::new(FlatTransformer::new(vector_column)));
 
-        Ok(Self::new(centroids, distance_type, transforms))
+        Self::new(centroids, distance_type, transforms)
     }
 
     /// Create a IVF_PQ struct.
@@ -176,7 +187,7 @@ impl IvfTransformer {
         vector_column: &str,
         pq: ProductQuantizer,
         range: Option<Range<u32>>,
-    ) -> Result<Self> {
+    ) -> Self {
         let mut transforms: Vec<Arc<dyn Transformer>> =
             vec![Arc::new(super::transform::Flatten::new(vector_column))];
 
@@ -194,7 +205,7 @@ impl IvfTransformer {
             centroids.clone(),
             distance_type,
             vector_column,
-        )?);
+        ));
         transforms.push(partition_transform);
 
         if let Some(range) = range {
@@ -217,7 +228,7 @@ impl IvfTransformer {
             PQ_CODE_COLUMN,
         )));
 
-        Ok(Self::new(centroids, distance_type, transforms))
+        Self::new(centroids, distance_type, transforms)
     }
 
     fn with_sq(
@@ -226,7 +237,7 @@ impl IvfTransformer {
         vector_column: &str,
         sq: ScalarQuantizer,
         range: Option<Range<u32>>,
-    ) -> Result<Self> {
+    ) -> Self {
         let mut transforms: Vec<Arc<dyn Transformer>> =
             vec![Arc::new(super::transform::Flatten::new(vector_column))];
 
@@ -244,7 +255,7 @@ impl IvfTransformer {
             centroids.clone(),
             distance_type,
             vector_column,
-        )?);
+        ));
         transforms.push(partition_transformer);
 
         if let Some(range) = range {
@@ -260,7 +271,7 @@ impl IvfTransformer {
             SQ_CODE_COLUMN.to_owned(),
         )));
 
-        Ok(Self::new(centroids, distance_type, transforms))
+        Self::new(centroids, distance_type, transforms)
     }
 
     fn with_rq(
@@ -284,7 +295,7 @@ impl IvfTransformer {
         transforms.push(Arc::new(KeepFiniteVectors::new(vector_column)));
 
         let partition_transform = Arc::new(
-            PartitionTransformer::new(centroids.clone(), distance_type, vector_column)?
+            PartitionTransformer::new(centroids.clone(), distance_type, vector_column)
                 .with_distance(true),
         );
         transforms.push(partition_transform);
