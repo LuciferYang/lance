@@ -4441,10 +4441,10 @@ fn train_weighted_hierarchical_f32_kmeans(
             break;
         }
         if cluster.indices.len() <= 1 {
-            // Priority is loss, not size, so a heavy singleton can outrank
-            // clusters that still have rows to give. Finalize it so it sinks
-            // below them and keep splitting the rest; giving up here would
-            // reject a build that can still reach target_k.
+            // Priority is loss, not size, so a singleton can outrank clusters
+            // that still have rows to give. Finalize it so it sinks below them
+            // and keep splitting the rest; giving up here would reject a build
+            // that can still reach target_k.
             cluster.finalized = true;
             heap.push(cluster);
             continue;
@@ -6486,6 +6486,38 @@ mod tests {
             msg.contains(&format!("{num_points} weighted coreset rows")),
             "got: {msg}"
         );
+    }
+
+    /// Splitting must not stop at the first unsplittable cluster while others
+    /// still have rows to give. With one more row than partitions, the loop
+    /// has to walk past singletons to find the last splittable cluster, so
+    /// abandoning the loop there loses a partition that was attainable.
+    #[test]
+    fn test_weighted_hierarchical_reaches_target_past_unsplittable_clusters() {
+        let dimension = 4;
+        let num_points = 258;
+        let target_k = 257;
+        let values: Vec<f32> = (0..num_points)
+            .flat_map(|row| std::iter::repeat_n(row as f32, dimension))
+            .collect();
+        let data =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(values), dimension as i32)
+                .unwrap();
+        let params = WeightedHierarchicalKMeansParams {
+            dimension,
+            target_k,
+            metric_type: MetricType::L2,
+            max_iters: 2,
+            on_progress: Arc::new(|_, _| {}),
+        };
+        let centroids = train_weighted_hierarchical_f32_kmeans(
+            &data,
+            &vec![1.0; num_points],
+            &vec![0.1; num_points],
+            &params,
+        )
+        .expect("258 distinct rows can reach 257 partitions");
+        assert_eq!(centroids.len(), target_k);
     }
 
     /// Regression test for a hang in the streaming *coreset* trainer
