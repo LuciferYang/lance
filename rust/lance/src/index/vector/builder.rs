@@ -711,7 +711,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     ivf.centroids.clone().unwrap(),
                     DistanceType::L2,
                     vec![],
-                )?;
+                );
                 span!(Level::INFO, "compute residual for PQ training")
                     .in_scope(|| ivf_transformer.compute_residual(&training_data))?
             }

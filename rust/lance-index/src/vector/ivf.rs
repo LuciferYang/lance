@@ -47,8 +47,8 @@ pub fn new_ivf_transformer(
     centroids: FixedSizeListArray,
     metric_type: DistanceType,
     transforms: Vec<Arc<dyn Transformer>>,
-) -> Result<IvfTransformer> {
-    Ok(IvfTransformer::new(centroids, metric_type, transforms))
+) -> IvfTransformer {
+    IvfTransformer::new(centroids, metric_type, transforms)
 }
 
 pub fn new_ivf_transformer_with_quantizer(

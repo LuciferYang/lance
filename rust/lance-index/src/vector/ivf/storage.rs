@@ -113,7 +113,7 @@ impl IvfModel {
             self.centroids.clone().unwrap(),
             distance_type,
             vec![],
-        )?;
+        );
         internal.find_partitions(query, nprobes)
     }
 
