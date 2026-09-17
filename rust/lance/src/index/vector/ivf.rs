@@ -4441,10 +4441,11 @@ fn train_weighted_hierarchical_f32_kmeans(
             break;
         }
         if cluster.indices.len() <= 1 {
-            // Priority is loss, not size, so a singleton can outrank clusters
-            // that still have rows to give. Finalize it so it sinks below them
-            // and keep splitting the rest; giving up here would reject a build
-            // that can still reach target_k.
+            // Priority is loss, not size, and `assign_weighted_f32_points`
+            // folds each supplied base loss into the cluster loss that orders
+            // the heap, so one huge base loss puts a singleton on top. Finalize
+            // it so it sinks and keep splitting the rest; giving up here
+            // rejected counts that were attainable.
             cluster.finalized = true;
             heap.push(cluster);
             continue;
@@ -6488,35 +6489,35 @@ mod tests {
         );
     }
 
-    /// Splitting must not stop at the first unsplittable cluster while others
-    /// still have rows to give. With one more row than partitions, the loop
-    /// has to walk past singletons to find the last splittable cluster, so
-    /// abandoning the loop there loses a partition that was attainable.
+    /// A high-loss singleton must not stop training while other clusters still
+    /// have distinct rows to split. `assign_weighted_f32_points` folds each
+    /// supplied `base_losses[row]` into the cluster loss that orders the heap,
+    /// so one huge base loss puts a single-member cluster at the top; breaking
+    /// there rejected a 257-partition request that 258 distinct rows can serve,
+    /// advising a maximum of 16.
     #[test]
-    fn test_weighted_hierarchical_reaches_target_past_unsplittable_clusters() {
-        let dimension = 4;
+    fn test_weighted_hierarchical_exhausts_splittable_clusters() {
+        let dimension = 1;
         let num_points = 258;
         let target_k = 257;
-        let values: Vec<f32> = (0..num_points)
-            .flat_map(|row| std::iter::repeat_n(row as f32, dimension))
-            .collect();
+        let mut values = Vec::with_capacity(num_points);
+        values.push(1.0e9);
+        values.extend((1..num_points).map(|i| i as f32 * 100.0));
         let data =
-            FixedSizeListArray::try_new_from_values(Float32Array::from(values), dimension as i32)
-                .unwrap();
+            FixedSizeListArray::try_new_from_values(Float32Array::from(values), dimension).unwrap();
         let params = WeightedHierarchicalKMeansParams {
-            dimension,
+            dimension: dimension as usize,
             target_k,
             metric_type: MetricType::L2,
-            max_iters: 2,
+            max_iters: 20,
             on_progress: Arc::new(|_, _| {}),
         };
-        let centroids = train_weighted_hierarchical_f32_kmeans(
-            &data,
-            &vec![1.0; num_points],
-            &vec![0.1; num_points],
-            &params,
-        )
-        .expect("258 distinct rows can reach 257 partitions");
+        let mut losses = vec![0.0; num_points];
+        losses[0] = 1.0e20;
+
+        let centroids =
+            train_weighted_hierarchical_f32_kmeans(&data, &vec![1.0; num_points], &losses, &params)
+                .unwrap();
         assert_eq!(centroids.len(), target_k);
     }
 
