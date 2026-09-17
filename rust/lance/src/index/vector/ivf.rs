@@ -4499,19 +4499,29 @@ fn train_weighted_hierarchical_f32_kmeans(
     clusters.sort_by_key(|cluster| cluster.id);
     if clusters.len() < target_k {
         // Duplicating the heaviest cluster to pad the count used to leave
-        // permanently empty partitions: argmin ties always resolve to the
-        // first copy, so no vector is ever assigned to a duplicate. Match
-        // the flat hierarchical trainer, which rejects the request.
+        // permanently empty partitions: a padded centroid is a bit-identical
+        // clone, and assignment keeps the incumbent on a tie, so no vector is
+        // ever assigned to a duplicate. Reject instead, like the flat
+        // hierarchical trainer. The shortfall has two causes worth
+        // distinguishing in a bug report but not in the advice: the coreset
+        // rows are too alike to split further, or splitting stopped early.
         return Err(Error::invalid_input(format!(
             "Cannot create {target_k} IVF partitions: weighted k-means could only form {} \
-             non-empty clusters. The dataset is likely too small or has too many \
-             (near-)duplicate vectors for this many partitions. Reduce num_partitions to \
-             <= {} or provide more diverse data.",
+             non-empty clusters from {} weighted coreset rows, and the rest could not be \
+             split further. Reduce num_partitions to <= {} or provide more diverse data.",
             clusters.len(),
+            data.len(),
             clusters.len()
         )));
     }
-    clusters.truncate(target_k);
+    // The split loop stops at `target_k`, and every `cluster_k` it takes is
+    // bounded by what is left, so the count lands exactly on `target_k`.
+    debug_assert_eq!(
+        clusters.len(),
+        target_k,
+        "weighted kmeans formed {} clusters for target_k {target_k}",
+        clusters.len()
+    );
 
     let mut values = Vec::with_capacity(target_k * dimension);
     for cluster in clusters {
@@ -6412,23 +6422,38 @@ mod tests {
     }
 
     /// Duplicating the heaviest cluster to pad the partition count used to
-    /// yield permanently empty partitions (argmin ties always resolve to
-    /// the first copy); reject like the flat hierarchical trainer.
+    /// yield permanently empty partitions (a padded centroid is a clone, and
+    /// assignment keeps the incumbent on a tie); reject like the flat
+    /// hierarchical trainer.
+    ///
+    /// Two shapes reach the shortfall. Fewer rows than partitions is the
+    /// obvious one; the one the only production caller can actually produce is
+    /// a coreset with enough rows whose clusters cannot be split further,
+    /// because the coreset always carries at least `num_partitions` rows.
+    #[rstest::rstest]
+    #[case::fewer_rows_than_partitions(6, 16)]
+    #[case::enough_rows_all_identical(32, 16)]
     #[test]
-    fn test_weighted_hierarchical_rejects_padding_with_duplicates() {
+    fn test_weighted_hierarchical_rejects_padding_with_duplicates(
+        #[case] num_points: usize,
+        #[case] target_k: usize,
+    ) {
         let dimension = 8;
-        let num_points = 6;
-        let values: Vec<f32> = (0..num_points * dimension)
-            .map(|i| (i % 251) as f32 * 0.01)
-            .collect();
+        // Every row identical in the second case, a ramp in the first: either
+        // way the trainer cannot reach `target_k` non-empty clusters.
+        let values: Vec<f32> = if num_points < target_k {
+            (0..num_points * dimension)
+                .map(|i| i as f32 * 0.01)
+                .collect()
+        } else {
+            vec![0.5; num_points * dimension]
+        };
         let data =
             FixedSizeListArray::try_new_from_values(Float32Array::from(values), dimension as i32)
                 .unwrap();
-        // Six distinct single-member clusters can never reach 16, so the
-        // trainer used to pad with duplicates of the heaviest cluster.
         let params = WeightedHierarchicalKMeansParams {
             dimension,
-            target_k: 16,
+            target_k,
             metric_type: MetricType::L2,
             max_iters: 2,
             on_progress: Arc::new(|_, _| {}),
@@ -6440,9 +6465,16 @@ mod tests {
             &params,
         )
         .unwrap_err();
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("Cannot create 16 IVF partitions"),
-            "got: {err}"
+            msg.contains(&format!("Cannot create {target_k} IVF partitions")),
+            "got: {msg}"
+        );
+        // The row count belongs in the message: it is the coreset size, not
+        // the dataset's, so a reader can tell the two shortfalls apart.
+        assert!(
+            msg.contains(&format!("{num_points} weighted coreset rows")),
+            "got: {msg}"
         );
     }
 
