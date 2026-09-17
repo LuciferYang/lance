@@ -4434,10 +4434,20 @@ fn train_weighted_hierarchical_f32_kmeans(
         let mut cluster = heap
             .pop()
             .ok_or_else(|| Error::index("No weighted cluster can be further split"))?;
-        if cluster.finalized || cluster.indices.len() <= 1 {
-            cluster.finalized = true;
+        if cluster.finalized {
+            // Ordering pops non-finalized clusters first, so a finalized
+            // cluster at the top means nothing splittable is left.
             heap.push(cluster);
             break;
+        }
+        if cluster.indices.len() <= 1 {
+            // Priority is loss, not size, so a heavy singleton can outrank
+            // clusters that still have rows to give. Finalize it so it sinks
+            // below them and keep splitting the rest; giving up here would
+            // reject a build that can still reach target_k.
+            cluster.finalized = true;
+            heap.push(cluster);
+            continue;
         }
 
         let remaining_k = target_k - heap.len();
