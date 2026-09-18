@@ -666,21 +666,19 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         if self.quantizer.is_some() {
             return Ok(self.quantizer.clone().unwrap());
         }
-        // Fail before any sampling or residual work when there is nothing
-        // to build with.
-        if self.quantizer_params.is_none() {
+        // Bind the params up front: the sampling and residual work below is
+        // wasted if there is nothing to build with. Reaching here with no
+        // params means the builder was given neither params nor a quantizer.
+        let Some(quantizer_params) = self.quantizer_params.as_ref() else {
             return Err(Error::invalid_input("quantizer build params not set"));
-        }
+        };
 
         let Some(dataset) = self.dataset.as_ref() else {
             return Err(Error::invalid_input(
                 "dataset not set before loading or building quantizer",
             ));
         };
-        let sample_size_hint = match &self.quantizer_params {
-            Some(params) => params.try_sample_size()?,
-            None => 256 * 256, // here it must be retrain, let's just set sample size to the default value
-        };
+        let sample_size_hint = quantizer_params.try_sample_size()?;
 
         let start = std::time::Instant::now();
         info!(
@@ -725,7 +723,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         info!("Start to train quantizer");
         let start = std::time::Instant::now();
-        let quantizer_params = self.quantizer_params.as_ref().unwrap();
         let quantizer = Q::build(&training_data, DistanceType::L2, quantizer_params)?;
         info!(
             "Trained quantizer in {:02} seconds",
