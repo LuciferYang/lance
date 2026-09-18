@@ -594,9 +594,9 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             .ok_or(Error::index(format!("{} not found", IVF_METADATA_KEY)))?
             .parse()
             .map_err(|e| Error::index(format!("Failed to decode IVF metadata: {}", e)))?;
-        // Parse the quantizer metadata JSON before issuing reads so both
-        // global-buffer reads (IVF protobuf and quantizer buffer) can be
-        // fetched concurrently — one round trip saved per cold index open.
+        // Parsed before the reads below because it holds the position of the
+        // quantizer buffer, which is what lets that read start alongside the
+        // IVF one.
         let mut metadata_strs: Vec<String> = serde_json::from_str(
             schema
                 .metadata
@@ -612,19 +612,21 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         let mut metadata: Q::Metadata = serde_json::from_str(&metadata_str)?;
         let quantizer_buffer_pos = metadata.buffer_index();
 
-        let ivf_fut = reader.read_global_buffer(ivf_pos);
-        let quantizer_buffer_fut = async {
-            match quantizer_buffer_pos {
-                Some(pos) => reader.read_global_buffer(pos).await.map(Some),
-                None => Ok(None),
-            }
-        };
-        let (ivf_bytes, quantizer_bytes) = tokio::join!(ivf_fut, quantizer_buffer_fut);
-        let ivf = IvfModel::try_from(pb::Ivf::decode(ivf_bytes?)?)?;
+        // Both positions come from the schema metadata, so the reads do not
+        // depend on each other: issue them together instead of waiting for the
+        // IVF protobuf before asking for the quantizer buffer.
+        let (ivf_bytes, quantizer_bytes) =
+            futures::try_join!(reader.read_global_buffer(ivf_pos), async {
+                match quantizer_buffer_pos {
+                    Some(pos) => reader.read_global_buffer(pos).await.map(Some),
+                    None => Ok(None),
+                }
+            })?;
+        let ivf = IvfModel::try_from(pb::Ivf::decode(ivf_bytes)?)?;
 
         // we store large metadata (e.g. PQ codebook) in global buffer,
         // and the schema metadata just contains a pointer to the buffer
-        if let Some(bytes) = quantizer_bytes? {
+        if let Some(bytes) = quantizer_bytes {
             metadata.parse_buffer(bytes)?;
         }
 
