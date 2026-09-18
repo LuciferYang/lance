@@ -3566,6 +3566,41 @@ mod tests {
             .collect()
     }
 
+    /// The params check has to run before the sampling work, not after it.
+    /// Both orders end in the same error for a builder with no quantizer
+    /// params, so the discriminator is *which* error comes first: this builder
+    /// points at a column the dataset does not have, so sampling fails with
+    /// its own message, and only a check that runs ahead of it still reports
+    /// the missing params.
+    #[tokio::test]
+    async fn test_load_or_build_quantizer_checks_params_before_sampling() {
+        use lance_index::vector::v3::shuffler::IvfShuffler;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = tmp.path().to_str().unwrap();
+        let dataset = write_clusters(uri, &[(8, 0.0)]).await;
+        let index_dir = dataset.indices_dir().child("idx");
+
+        let builder = IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
+            dataset,
+            "no_such_column".to_owned(),
+            index_dir.clone(),
+            DistanceType::L2,
+            Box::new(IvfShuffler::new(index_dir, 1)),
+            None,
+            None,
+            (),
+            None,
+        )
+        .unwrap();
+
+        let err = builder.load_or_build_quantizer().await.unwrap_err();
+        assert!(
+            err.to_string().contains("quantizer build params not set"),
+            "expected the params error before any sampling, got: {err}"
+        );
+    }
+
     fn cluster_batch(
         schema: &Arc<arrow_schema::Schema>,
         num_rows: usize,
