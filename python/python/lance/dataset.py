@@ -3998,10 +3998,14 @@ class LanceDataset(pa.dataset.Dataset):
                 )
 
         if index_cache_size is not None:
-            LOGGER.warning(
-                "index_cache_size is not applicable to index building; "
-                "the index cache is configured on the Dataset, not per-index. "
-                "This parameter is ignored."
+            # The parameter has never reached Rust: index building does not use
+            # the index cache, and the cache is sized on the dataset or session.
+            warnings.warn(
+                "The 'index_cache_size' parameter of create_index is ignored. "
+                "The index cache is sized on the dataset, via "
+                "lance.dataset(..., index_cache_size_bytes=...) or a Session.",
+                DeprecationWarning,
+                stacklevel=3,
             )
 
         if not isinstance(metric, str) or metric.lower() not in [
@@ -4394,7 +4398,9 @@ class LanceDataset(pa.dataset.Dataset):
             Accepted accelerator: "cuda" (Nvidia GPU) and "mps" (Apple Silicon GPU).
             If not set, use the CPU.
         index_cache_size : int, optional
-            The size of the index cache in number of entries. Default value is 256.
+            Deprecated and ignored. Index building does not read the index cache;
+            size it on the dataset with
+            ``lance.dataset(..., index_cache_size_bytes=...)`` or on a ``Session``.
         shuffle_partition_batches : int, optional
             The number of batches, using the row group size of the dataset, to include
             in each shuffle partition. Default value is 10240.
