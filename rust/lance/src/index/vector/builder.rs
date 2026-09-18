@@ -3579,7 +3579,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let uri = tmp.path().to_str().unwrap();
         let dataset = write_clusters(uri, &[(8, 0.0)]).await;
-        let index_dir = dataset.indices_dir().child("idx");
+        let index_dir = dataset.indices_dir().join("idx");
 
         let builder = IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
             dataset,
