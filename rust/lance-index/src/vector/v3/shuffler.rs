@@ -2864,6 +2864,39 @@ mod tests {
         assert_eq!(p1.num_rows(), 130);
     }
 
+    /// Two non-empty batches in one flush group: the bucketing has to keep each
+    /// row with its own batch, so a partition's rows come out batch by batch and
+    /// in row order within a batch. A wrong bucket offset would move values into
+    /// the neighbouring partition while leaving every partition size intact.
+    #[tokio::test]
+    async fn test_two_file_shuffler_groups_two_batches_by_partition() {
+        let dir = TempStrDir::default();
+        let output_dir = Path::from(dir.as_ref());
+
+        let batch1 = make_batch(&[1, 0, 2], &[10, 20, 30], None);
+        let batch2 = make_batch(&[2, 1, 0], &[40, 50, 60], None);
+
+        let shuffler = TwoFileShuffler::new(output_dir, 3);
+        let reader = shuffler
+            .shuffle(batches_to_stream(vec![batch1, batch2]))
+            .await
+            .unwrap();
+
+        let expected = [vec![20, 60], vec![10, 50], vec![30, 40]];
+        for (partition_id, expected_values) in expected.iter().enumerate() {
+            assert_eq!(reader.partition_size(partition_id).unwrap(), 2);
+            let partition = collect_partition(reader.as_ref(), partition_id)
+                .await
+                .unwrap();
+            let values: &Int32Array = partition["val"].as_primitive();
+            assert_eq!(
+                values.values(),
+                expected_values,
+                "partition {partition_id} holds the wrong rows"
+            );
+        }
+    }
+
     /// Nullable `__ivf_part_id` must not be treated as partition 0 via `values()`.
     #[tokio::test]
     async fn test_two_file_shuffler_rejects_null_partition_ids() {
