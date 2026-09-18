@@ -4006,16 +4006,6 @@ class LanceDataset(pa.dataset.Dataset):
         ]:
             raise ValueError(f"Metric {metric} not supported.")
 
-        # Hamming is a binary-vector metric meaningful only for uint8
-        # columns; reject the combination for float-only index types
-        # instead of failing deep in quantizer training.
-        _upper = index_type.upper()
-        if metric.lower() == "hamming" and "IVF_RQ" in _upper:
-            raise ValueError(
-                f"Metric 'hamming' is not supported for {_upper}; "
-                "IVF_RQ operates on float vectors with l2/cosine/dot."
-            )
-
         kwargs["metric_type"] = metric
 
         index_type = index_type.upper()
