@@ -3998,10 +3998,15 @@ class LanceDataset(pa.dataset.Dataset):
                 )
 
         if filter_nan is False and accelerator is None:
-            LOGGER.warning(
-                "filter_nan=False is only honored on GPU (accelerator) builds; "
-                "on CPU builds non-finite vectors are always filtered and this "
-                "parameter has no effect."
+            # filter_nan only reaches the torch helpers in lance.vector, which
+            # run under `accelerator`; CPU training filters non-finite vectors
+            # unconditionally.
+            warnings.warn(
+                "filter_nan=False only has an effect on accelerator builds. "
+                "A CPU build always filters non-finite vectors, so this "
+                "parameter is ignored.",
+                UserWarning,
+                stacklevel=3,
             )
 
         if not isinstance(metric, str) or metric.lower() not in [
@@ -4411,11 +4416,11 @@ class LanceDataset(pa.dataset.Dataset):
             Extra options that make sense for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
         filter_nan: bool
-            Defaults to True. Only honored for GPU (accelerator) builds on
-            IVF_PQ: False is UNSAFE there, and will cause a crash if any
-            null/nan values are present (and otherwise will not), in exchange
-            for a small speed boost. On CPU builds this parameter is ignored —
-            CPU training always filters non-finite vectors.
+            Defaults to True. Only honored on accelerator builds, where False is
+            UNSAFE: it disables the null filter for nullable columns, which
+            crashes if any null or nan value is present, in exchange for a small
+            speed boost. A CPU build always filters non-finite vectors, so the
+            parameter is ignored there.
         train : bool, default True
             If True, the index will be trained on the data (e.g., compute IVF
             centroids, PQ codebooks). If False, an empty index structure will be
