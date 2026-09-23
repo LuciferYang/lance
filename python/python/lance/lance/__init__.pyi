@@ -149,6 +149,7 @@ class CleanupStats:
     transaction_files_removed: int
     index_files_removed: int
     deletion_files_removed: int
+    failed_deletes: int
 
 class CleanupCandidateFile:
     path: str
@@ -356,6 +357,8 @@ class LanceBlobFile:
     def read_range(self, offset: int, length: int) -> bytes: ...
     def read_ranges(self, ranges: List[Tuple[int, int]]) -> List[bytes]: ...
     def read_into(self, b: bytearray) -> int: ...
+    def set_buffer_size(self, buffer_size: int) -> None: ...
+    def _range_submission_count(self) -> int: ...
 
 class _Dataset:
     @property
@@ -421,6 +424,9 @@ class _Dataset:
         order_by: Optional[List[Any]] = None,
         disable_scoring_autoprojection: Optional[bool] = None,
         substrait_aggregate: Optional[bytes] = None,
+        row_addr_allowlist: Optional[bytes] = None,
+        row_addr_blocklist: Optional[bytes] = None,
+        minhash_query: Optional[Dict[str, str]] = None,
     ) -> _Scanner: ...
     def count_rows(self, filter: Optional[str] = None) -> int: ...
     def take(
