@@ -97,6 +97,10 @@ impl<T: Clone> Drop for SharedStream<'_, T> {
             Side::Left => std::mem::take(&mut inner_state.left_buffered),
             Side::Right => std::mem::take(&mut inner_state.right_buffered),
         };
+        debug_assert!(
+            pending_for_self == 0 || inner_state.buffer.len() as u32 == pending_for_self,
+            "buffer holds items for both sides"
+        );
         for _ in 0..pending_for_self {
             inner_state.buffer.pop_front();
             if let Some(available_buffer) = inner_state.available_buffer.as_mut() {
@@ -556,11 +560,12 @@ mod tests {
     }
 
     /// If one side is dropped mid-stream, the survivor must still be able to
-    /// make progress. Two mechanisms used to wedge it: items buffered for the
-    /// dropped side never release their capacity permits (a bounded stream
-    /// deadlocks once the budget is exhausted), and a dropped side recorded
-    /// as the current poller blocks the survivor from ever polling the inner
-    /// stream again.
+    /// make progress. Two mechanisms used to wedge a bounded stream: items
+    /// buffered for the dropped side never released their capacity permits,
+    /// and every later fetch kept spending a permit on a clone nobody would
+    /// take, so the survivor stalled again one capacity later. The third
+    /// mechanism, a dropped side left recorded as the current poller, is
+    /// covered by the two tests below.
     #[tokio::test]
     async fn test_shared_stream_survivor_progresses_after_drop() {
         let (tx, rx) = tokio::sync::mpsc::channel::<u32>(10);
@@ -598,8 +603,8 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<u32>(10);
         let (mut left, mut right) = ReceiverStream::new(rx).boxed().share(Capacity::Unbounded);
 
-        // Left polls while the channel is empty: the inner stream registers
-        // left's (about to die) waker and left is recorded as the poller.
+        // Left polls while the channel is empty, so it stays recorded as the
+        // poller and the inner stream keeps the waker it was polled with.
         let mut left_fut = left.next();
         assert!(is_pending(&mut left_fut));
         drop(left_fut);
@@ -613,5 +618,84 @@ mod tests {
             item.expect("survivor wedged by dropped poller").unwrap(),
             42
         );
+    }
+    struct FlagWaker(AtomicBool);
+
+    impl futures::task::ArcWake for FlagWaker {
+        fn wake_by_ref(arc_self: &Arc<Self>) {
+            arc_self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A survivor already parked behind `polling` has to be woken when the
+    /// recorded poller is dropped: the inner stream only holds the waker the
+    /// dropped side polled with, so nothing else will re-poll the survivor.
+    #[tokio::test]
+    async fn test_shared_stream_dropped_poller_wakes_parked_survivor() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<u32>(10);
+        let (mut left, mut right) = ReceiverStream::new(rx).boxed().share(Capacity::Unbounded);
+
+        // Left becomes the recorded poller and parks on the empty channel.
+        let mut left_fut = left.next();
+        assert!(is_pending(&mut left_fut));
+        drop(left_fut);
+
+        // Right parks behind `polling == Some(Left)`, leaving its waker behind.
+        let flag = Arc::new(FlagWaker(AtomicBool::new(false)));
+        let flag_waker = futures::task::waker(flag.clone());
+        let mut cx = std::task::Context::from_waker(&flag_waker);
+        let mut right_fut = right.next();
+        assert!(right_fut.poll_unpin(&mut cx).is_pending());
+        assert!(!flag.0.load(Ordering::SeqCst));
+
+        drop(left);
+        assert!(
+            flag.0.load(Ordering::SeqCst),
+            "dropping the poller must wake the parked survivor"
+        );
+
+        tx.send(42).await.unwrap();
+        let item = tokio::time::timeout(std::time::Duration::from_secs(5), right_fut).await;
+        assert_eq!(
+            item.expect("survivor wedged by dropped poller").unwrap(),
+            42
+        );
+    }
+
+    /// With an unbounded capacity nothing blocks, so the only observable effect
+    /// of a drop is memory: the dropped side's buffered items must be freed and
+    /// no further clone queued for it.
+    #[tokio::test]
+    async fn test_shared_stream_unbounded_stops_buffering_for_dropped_side() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<u32>(10);
+        for i in 0..4 {
+            tx.send(i).await.unwrap();
+        }
+        let (left, mut right) = ReceiverStream::new(rx).boxed().share(Capacity::Unbounded);
+
+        // Right reads ahead, so every item is also cloned into the buffer for left.
+        assert_eq!(right.next().await.unwrap(), 0);
+        assert_eq!(right.next().await.unwrap(), 1);
+        assert_eq!(right.state.lock().unwrap().buffer.len(), 2);
+
+        drop(left);
+        assert!(
+            right.state.lock().unwrap().buffer.is_empty(),
+            "the dropped side's buffered items must be released"
+        );
+
+        for expected in 2..4 {
+            let item = tokio::time::timeout(std::time::Duration::from_secs(5), right.next()).await;
+            assert_eq!(
+                item.expect("survivor wedged after peer drop").unwrap(),
+                expected
+            );
+        }
+        let state = right.state.lock().unwrap();
+        assert!(
+            state.buffer.is_empty(),
+            "no clone may be queued for a dropped side"
+        );
+        assert_eq!(state.left_buffered, 0);
     }
 }
