@@ -52,16 +52,10 @@ impl DeletionVector {
         }
     }
 
-    pub fn contains_range(&self, range: Range<u32>) -> bool {
+    pub fn contains_range(&self, mut range: Range<u32>) -> bool {
         match self {
             Self::NoDeletions => range.is_empty(),
-            // Same member-iteration reasoning as range_cardinality; callers
-            // pass full-fragment ranges (e.g. 0..physical_rows).
-            Self::Set(set) => {
-                let range_len = range.len();
-                range_len <= set.len()
-                    && set.iter().filter(|i| range.contains(i)).count() == range_len
-            }
+            Self::Set(set) => range.all(|i| set.contains(&i)),
             Self::Bitmap(bitmap) => bitmap.contains_range(range),
         }
     }
@@ -69,10 +63,10 @@ impl DeletionVector {
     fn range_cardinality(&self, range: Range<u32>) -> u64 {
         match self {
             Self::NoDeletions => 0,
-            // Iterate the set's members instead of the range: a set is
-            // bounded by BITMAP_THRESDHOLD while the range can span millions
-            // of rows, and OffsetMapper::map_offset calls this once per
-            // binary-search step.
+            // Iterate the set's members instead of the range: the write path
+            // keeps a set below BITMAP_THRESDHOLD while the range can span
+            // millions of rows, and OffsetMapper::map_offset calls this once
+            // per binary-search step.
             Self::Set(set) => set.iter().filter(|i| range.contains(i)).count() as u64,
             Self::Bitmap(bitmap) => bitmap.range_cardinality(range),
         }
@@ -383,17 +377,25 @@ mod test {
         assert_eq!(dv.contains_range(range), expected);
     }
 
-    #[test]
-    fn test_range_cardinality() {
-        assert_eq!(DeletionVector::NoDeletions.range_cardinality(0..100), 0);
-        let bm = bitmap_dv([5, 10, 15]);
-        assert_eq!(bm.range_cardinality(0..20), 3);
-        assert_eq!(bm.range_cardinality(6..14), 1);
-        let set = set_dv([5, 10, 15]);
-        assert_eq!(set.range_cardinality(0..20), 3);
-        assert_eq!(set.range_cardinality(6..14), 1);
-        assert_eq!(set.range_cardinality(0..u32::MAX), 3);
-        assert_eq!(set.range_cardinality(16..u32::MAX), 0);
+    #[rstest]
+    #[case::no_deletions(DeletionVector::NoDeletions, 0..100, 0)]
+    #[case::bitmap_all(bitmap_dv([5, 10, 15]), 0..20, 3)]
+    #[case::bitmap_middle(bitmap_dv([5, 10, 15]), 6..14, 1)]
+    #[case::set_all(set_dv([5, 10, 15]), 0..20, 3)]
+    #[case::set_middle(set_dv([5, 10, 15]), 6..14, 1)]
+    // The two wide ranges are the regression guard: counting by range walks
+    // every offset in the range, so they only finish when the count is driven
+    // by the set's members. The timeout turns that into a failure rather than
+    // a hung job.
+    #[case::set_whole_u32_range(set_dv([5, 10, 15]), 0..u32::MAX, 3)]
+    #[case::set_above_all_members(set_dv([5, 10, 15]), 16..u32::MAX, 0)]
+    #[timeout(std::time::Duration::from_secs(5))]
+    fn test_range_cardinality(
+        #[case] dv: DeletionVector,
+        #[case] range: std::ops::Range<u32>,
+        #[case] expected: u64,
+    ) {
+        assert_eq!(dv.range_cardinality(range), expected);
     }
 
     #[rstest]
