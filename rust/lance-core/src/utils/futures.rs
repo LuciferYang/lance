@@ -33,6 +33,8 @@ struct InnerState<'a, T> {
     exhausted: bool,
     left_buffered: u32,
     right_buffered: u32,
+    left_dropped: bool,
+    right_dropped: bool,
     available_buffer: Option<PollSemaphore>,
 }
 
@@ -58,6 +60,8 @@ impl<'a, T: Clone> SharedStream<'a, T> {
             exhausted: false,
             left_buffered: 0,
             right_buffered: 0,
+            left_dropped: false,
+            right_dropped: false,
             available_buffer,
         };
 
@@ -72,6 +76,47 @@ impl<'a, T: Clone> SharedStream<'a, T> {
             side: Side::Right,
         };
         (left, right)
+    }
+}
+
+impl<T: Clone> Drop for SharedStream<'_, T> {
+    fn drop(&mut self) {
+        let Ok(mut inner_state) = self.state.lock() else {
+            return;
+        };
+        match self.side {
+            Side::Left => inner_state.left_dropped = true,
+            Side::Right => inner_state.right_dropped = true,
+        }
+        // The buffer only ever holds items destined for one side (a side
+        // polls the inner stream only after draining its own share), so any
+        // count still pending for this side sits at the front. Pop those
+        // items and release their capacity permits, or a bounded survivor
+        // deadlocks once the budget is exhausted.
+        let pending_for_self = match self.side {
+            Side::Left => std::mem::take(&mut inner_state.left_buffered),
+            Side::Right => std::mem::take(&mut inner_state.right_buffered),
+        };
+        for _ in 0..pending_for_self {
+            inner_state.buffer.pop_front();
+            if let Some(available_buffer) = inner_state.available_buffer.as_mut() {
+                available_buffer.add_permits(1);
+            }
+        }
+        // If this side was mid-poll when its task went away, the inner
+        // stream holds a dead waker and the survivor would wait forever on
+        // `polling`. Let the survivor take over.
+        let was_polling = inner_state.polling == Some(self.side);
+        let to_wake = if was_polling {
+            inner_state.polling = None;
+            inner_state.waker.take()
+        } else {
+            None
+        };
+        drop(inner_state);
+        if let Some(waker) = to_wake {
+            waker.wake();
+        }
     }
 }
 
@@ -149,21 +194,29 @@ impl<T: Clone> Stream for SharedStream<'_, T> {
                     inner_state.polling = None;
                 }
                 std::task::Poll::Ready(Some(item)) => {
-                    // We got an item, forget the permit to mark that we can take one fewer items
-                    if let Some(permit) = permit {
-                        permit.forget();
-                    }
                     inner_state.polling = None;
-                    // Let the other side know an item is available
-                    match self.side {
-                        Side::Left => {
-                            inner_state.right_buffered += 1;
-                        }
-                        Side::Right => {
-                            inner_state.left_buffered += 1;
-                        }
+                    // Let the other side know an item is available. A dropped
+                    // side never will be: skip the clone so neither a buffer
+                    // entry nor its capacity permit is stranded.
+                    let other_alive = match self.side {
+                        Side::Left => !inner_state.right_dropped,
+                        Side::Right => !inner_state.left_dropped,
                     };
-                    inner_state.buffer.push_back(item.clone());
+                    if other_alive {
+                        // We got an item, forget the permit to mark that we can take one fewer items
+                        if let Some(permit) = permit {
+                            permit.forget();
+                        }
+                        match self.side {
+                            Side::Left => {
+                                inner_state.right_buffered += 1;
+                            }
+                            Side::Right => {
+                                inner_state.left_buffered += 1;
+                            }
+                        };
+                        inner_state.buffer.push_back(item.clone());
+                    }
                 }
                 std::task::Poll::Pending => {
                     should_wake = false;
@@ -500,5 +553,65 @@ mod tests {
         assert!(!called.load(Ordering::SeqCst));
         drop(stream);
         assert!(called.load(Ordering::SeqCst));
+    }
+
+    /// If one side is dropped mid-stream, the survivor must still be able to
+    /// make progress. Two mechanisms used to wedge it: items buffered for the
+    /// dropped side never release their capacity permits (a bounded stream
+    /// deadlocks once the budget is exhausted), and a dropped side recorded
+    /// as the current poller blocks the survivor from ever polling the inner
+    /// stream again.
+    #[tokio::test]
+    async fn test_shared_stream_survivor_progresses_after_drop() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<u32>(10);
+        for i in 0..6 {
+            tx.send(i).await.unwrap();
+        }
+        let (left, mut right) = ReceiverStream::new(rx).boxed().share(Capacity::Bounded(2));
+
+        // Right races ahead by the full capacity; the two buffered items are
+        // destined for left and hold the only two permits.
+        assert_eq!(right.next().await.unwrap(), 0);
+        assert_eq!(right.next().await.unwrap(), 1);
+        let mut right_fut = right.next();
+        assert!(is_pending(&mut right_fut));
+
+        drop(left);
+
+        // The stranded permits must be released so right can keep reading,
+        // including past the original capacity budget: later fetches must
+        // stop buffering clones for the dropped side at all.
+        let item = tokio::time::timeout(std::time::Duration::from_secs(5), right_fut).await;
+        assert_eq!(item.expect("survivor wedged by dropped side").unwrap(), 2);
+        for expected in 3..6 {
+            let item = tokio::time::timeout(std::time::Duration::from_secs(5), right.next()).await;
+            assert_eq!(
+                item.expect("survivor wedged after capacity re-spent")
+                    .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_shared_stream_dropped_poller_releases_inner_stream() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<u32>(10);
+        let (mut left, mut right) = ReceiverStream::new(rx).boxed().share(Capacity::Unbounded);
+
+        // Left polls while the channel is empty: the inner stream registers
+        // left's (about to die) waker and left is recorded as the poller.
+        let mut left_fut = left.next();
+        assert!(is_pending(&mut left_fut));
+        drop(left_fut);
+        drop(left);
+
+        // An item arriving for the survivor must not be lost to the dead
+        // side's stale poll.
+        tx.send(42).await.unwrap();
+        let item = tokio::time::timeout(std::time::Duration::from_secs(5), right.next()).await;
+        assert_eq!(
+            item.expect("survivor wedged by dropped poller").unwrap(),
+            42
+        );
     }
 }
