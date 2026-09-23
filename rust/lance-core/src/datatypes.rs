@@ -352,13 +352,22 @@ impl TryFrom<&DataType> for LogicalType {
             DataType::Duration(tu) => format!("duration:{}", timeunit_to_str(tu)),
             DataType::Struct(_) => "struct".to_string(),
             DataType::Dictionary(key_type, value_type) => {
-                format!(
-                    "dict:{}:{}:{}",
-                    Self::try_from(value_type.as_ref())?.0,
-                    Self::try_from(key_type.as_ref())?.0,
-                    // Arrow C++ Dictionary has "ordered:bool" field, but it does not exist in `arrow-rs`.
-                    false
-                )
+                let value_logical = Self::try_from(value_type.as_ref())?.0;
+                let index_logical = Self::try_from(key_type.as_ref())?.0;
+                let logical_type = format!("dict:{value_logical}:{index_logical}:false");
+                // The parser locates the index type and trailing flag by
+                // segment count and only understands leaf value types, so a
+                // component whose logical string carries ':' of its own
+                // (decimal, timestamp, ...) or a struct/list-like value yields
+                // a string that can never parse back. Validate by round-trip
+                // so the write fails up front instead of committing a
+                // manifest that no reader can open.
+                if DataType::try_from(&Self::from(logical_type.as_str())).is_err() {
+                    return Err(Error::schema(format!(
+                        "Dictionary value type {value_logical} with index type {index_logical} is not supported: the encoded logical type \"{logical_type}\" cannot be parsed back"
+                    )));
+                }
+                logical_type
             }
             DataType::List(elem) => match elem.data_type() {
                 DataType::Struct(_) => "list.struct".to_string(),
@@ -717,6 +726,79 @@ mod tests {
             data_type,
             "logical type: {logical_type}"
         );
+    }
+
+    /// The `dict:{value}:{index}:false` encoding embeds the value type's logical
+    /// string verbatim, but the parser locates the index type and the trailing
+    /// flag by segment count. A value type whose logical string itself contains
+    /// colons would therefore encode successfully and fail every later parse, so
+    /// the encoder must reject it up front instead of writing an unreadable
+    /// manifest.
+    #[test]
+    fn test_dictionary_logical_type_round_trip() {
+        let key = Box::new(DataType::UInt8);
+        for value_type in [
+            DataType::Utf8,
+            DataType::LargeUtf8,
+            DataType::Binary,
+            DataType::Int32,
+            DataType::Float64,
+        ] {
+            let data_type = DataType::Dictionary(key.clone(), Box::new(value_type.clone()));
+            let logical_type = LogicalType::try_from(&data_type).unwrap();
+            assert_eq!(
+                DataType::try_from(&logical_type).unwrap(),
+                data_type,
+                "logical type: {logical_type}"
+            );
+        }
+    }
+
+    #[rstest]
+    #[case::decimal(DataType::Decimal128(10, 2))]
+    #[case::date32(DataType::Date32)]
+    #[case::time32(DataType::Time32(TimeUnit::Second))]
+    #[case::timestamp(DataType::Timestamp(TimeUnit::Microsecond, None))]
+    #[case::timestamp_with_zone(DataType::Timestamp(
+        TimeUnit::Microsecond,
+        Some(Arc::from("+08:00"))
+    ))]
+    #[case::duration(DataType::Duration(TimeUnit::Second))]
+    #[case::fixed_size_binary(DataType::FixedSizeBinary(16))]
+    #[case::nested_dict(DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8)))]
+    // These value logicals carry no ':' but are still not leaf types the
+    // dictionary decoder can parse back on their own.
+    #[case::struct_value(DataType::Struct(Fields::from(vec![ArrowField::new(
+        "x",
+        DataType::Int32,
+        true
+    )])))]
+    #[case::list_value(DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))))]
+    fn test_dictionary_logical_type_rejects_colon_value(#[case] value_type: DataType) {
+        let data_type = DataType::Dictionary(Box::new(DataType::UInt8), Box::new(value_type));
+        let err = LogicalType::try_from(&data_type)
+            .expect_err("dictionary over a colon-bearing value type must not encode");
+        assert!(
+            err.to_string().contains("ictionary"),
+            "error should mention the dictionary: {err}"
+        );
+    }
+
+    /// The index type is embedded in the same string, so a colon-bearing key
+    /// type is just as unparsable as a colon-bearing value type.
+    #[test]
+    fn test_dictionary_logical_type_rejects_colon_key() {
+        for key_type in [
+            DataType::Decimal128(10, 2),
+            DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8)),
+        ] {
+            let data_type =
+                DataType::Dictionary(Box::new(key_type.clone()), Box::new(DataType::Utf8));
+            assert!(
+                LogicalType::try_from(&data_type).is_err(),
+                "dictionary with key {key_type:?} must not encode"
+            );
+        }
     }
 
     /// Pins the on-disk spelling as well as the round trip: the timezone is written
