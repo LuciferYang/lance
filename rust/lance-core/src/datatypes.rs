@@ -570,10 +570,19 @@ impl DeepSizeOf for Dictionary {
 
 impl PartialEq for Dictionary {
     fn eq(&self, other: &Self) -> bool {
-        match (&self.values, &other.values) {
-            (Some(a), Some(b)) => a == b,
-            _ => false,
-        }
+        // Fragment metadata stores the dictionary as offset/length with no
+        // attached values, so those two fields carry the identity; the values
+        // array is compared when present on both sides. Comparing only the
+        // values made equality non-reflexive (None == None compared false)
+        // and blind to differing offsets over the same array. Offsets are
+        // stable because the global dictionary file is append-only.
+        self.offset == other.offset
+            && self.length == other.length
+            && match (&self.values, &other.values) {
+                (Some(a), Some(b)) => a == b,
+                (None, None) => true,
+                _ => false,
+            }
     }
 }
 
@@ -619,6 +628,35 @@ mod tests {
     use super::*;
     use arrow_schema::Schema as ArrowSchema;
     use rstest::rstest;
+
+    #[test]
+    fn test_dictionary_partial_eq_contract() {
+        // Dictionary is compared by fragment-metadata consumers (e.g. merge
+        // transaction validation), so equality must be reflexive and must
+        // distinguish dictionaries over the same values array at different
+        // offsets or lengths.
+        let d = Dictionary::default();
+        assert_eq!(d, d.clone(), "Dictionary equality must be reflexive");
+
+        let same = Dictionary {
+            offset: 4,
+            length: 2,
+            values: None,
+        };
+        assert_eq!(same, same.clone());
+
+        let different_offset = Dictionary {
+            offset: 8,
+            ..same.clone()
+        };
+        assert_ne!(same, different_offset);
+
+        let different_length = Dictionary {
+            length: 3,
+            ..same.clone()
+        };
+        assert_ne!(same, different_length);
+    }
 
     #[test]
     fn test_classify_blob_v2_layouts() {

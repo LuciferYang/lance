@@ -571,6 +571,46 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_preserved_dictionary_not_flagged() {
+        // Fragment metadata stores dictionaries as offset/length with no
+        // attached values. An identical dictionary must not count as a field
+        // change (which would demand a full rewrite), while a moved offset
+        // still must.
+        let dictionary = lance_core::datatypes::Dictionary {
+            offset: 100,
+            length: 5,
+            values: None,
+        };
+        let schema = one_field_schema();
+        let mut prior_schema = schema.clone();
+        prior_schema.fields[0].dictionary = Some(dictionary.clone());
+        let manifest = Manifest::new(
+            prior_schema,
+            Arc::new(vec![fragment_with_file_fields(0, "old.lance", vec![0])]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+
+        let mut unchanged = schema.clone();
+        unchanged.fields[0].dictionary = Some(dictionary);
+        let retained = vec![fragment_with_file_fields(0, "old.lance", vec![0])];
+        merge_schema_valid(&manifest, &unchanged, &retained).unwrap();
+
+        let mut moved = schema;
+        moved.fields[0].dictionary = Some(lance_core::datatypes::Dictionary {
+            offset: 200,
+            length: 5,
+            values: None,
+        });
+        let err = merge_schema_valid(&manifest, &moved, &retained).unwrap_err();
+        assert!(
+            err.to_string().contains("dictionary"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
     fn test_merge_shared_id_change_rejects_retained_overlay() {
         let schema = one_field_schema();
         let mut prior_fragment = fragment_with_file_fields(0, "old.lance", vec![0]);
