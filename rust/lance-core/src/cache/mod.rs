@@ -231,6 +231,11 @@ impl CacheState {
     where
         T: DeepSizeOf + Send + Sync + 'static,
     {
+        if !self.backend.uses_entry_sizes() {
+            // The backend drops entries without accounting them, so a
+            // deep-size traversal per load would be discarded work.
+            return 0;
+        }
         let type_id = TypeId::of::<T>();
         let is_registered = self
             .entry_size_accessors
@@ -742,6 +747,62 @@ mod tests {
             Poll::Ready(output) => Poll::Ready(output),
         })
         .await
+    }
+
+    static DEEP_SIZE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    struct CountingSizeValue;
+
+    impl DeepSizeOf for CountingSizeValue {
+        fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+            DEEP_SIZE_CALLS.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+    }
+
+    struct CountingSizeKey(u64);
+
+    impl CacheKey for CountingSizeKey {
+        type ValueType = CountingSizeValue;
+
+        fn key(&self) -> Cow<'_, str> {
+            self.0.to_string().into()
+        }
+
+        fn type_name() -> &'static str {
+            "test.CountingSize"
+        }
+
+        fn schema() -> CacheKeySchema {
+            CacheKeySchema::new("test.counting-size", 1)
+        }
+
+        fn write_key(&self, builder: &mut KeyBuilder) {
+            builder.write_u64(self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn no_cache_skips_entry_size_traversal() {
+        // A disabled backend drops entries (and their sizes) without
+        // accounting, so charging a deep-size traversal per load is pure
+        // waste on hot uncached paths.
+        DEEP_SIZE_CALLS.store(0, Ordering::Relaxed);
+        let cache = LanceCache::no_cache();
+        let (_value, was_cached) = cache
+            .get_or_insert_with_key_hit(CountingSizeKey(1), || async { Ok(CountingSizeValue) })
+            .await
+            .unwrap();
+        assert!(!was_cached);
+        assert_eq!(DEEP_SIZE_CALLS.load(Ordering::Relaxed), 0);
+
+        // A sized cache still traverses for eviction accounting.
+        let cache = LanceCache::with_capacity(1024);
+        let _ = cache
+            .get_or_insert_with_key_hit(CountingSizeKey(2), || async { Ok(CountingSizeValue) })
+            .await
+            .unwrap();
+        assert_eq!(DEEP_SIZE_CALLS.load(Ordering::Relaxed), 1);
     }
 
     #[derive(Clone)]
