@@ -4,7 +4,6 @@
 // NOTE: we only create one integration test binary, to keep compilation overhead down.
 
 mod count_pushdown;
-mod dict_value_type;
 mod mem_wal;
 #[cfg(feature = "slow_tests")]
 mod query;
