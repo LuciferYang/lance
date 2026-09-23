@@ -1370,6 +1370,10 @@ impl TakeOperation {
                 _ => {}
             }
         } else if let Expr::InList(in_expr) = expr
+            // A negated InList (`_rowid NOT IN (...)`) is the complement of
+            // the listed ids, not a take of them. Small lists are expanded
+            // into `!=` conjunctions by the expression simplifier before they
+            // get here, but larger ones arrive as `negated: true`.
             && !in_expr.negated
             && let Expr::Column(col) = in_expr.expr.as_ref()
             && let Some(u64s) = Self::extract_u64_list(&in_expr.list)
@@ -2857,13 +2861,33 @@ impl Scanner {
             .union_columns(filter_columns, OnMissing::Error)?
             .into_schema();
 
+        let mut late_ids = HashSet::new();
+        for field in self.dataset.schema().fields.iter() {
+            self.collect_late_field_ids(field, false, &mut late_ids);
+        }
+
         // Start with the desired fields
         Ok(desired_projection
             .clone()
             // Subtract columns that are expensive
-            .subtract_predicate(|f| !self.is_early_field(f))
+            .subtract_predicate(|f| late_ids.contains(&f.id))
             // Add back columns that we need for filtering
             .union_schema(&filter_schema))
+    }
+
+    // Collects the ids of the fields that should be materialized late (see calc_eager_projection).
+    //
+    // `forced` is true when a non-struct ancestor is late, in which case this field and all of
+    // its descendants are late regardless of their own width.
+    fn collect_late_field_ids(&self, field: &Field, forced: bool, late_ids: &mut HashSet<i32>) {
+        let is_late = forced || !self.is_early_field(field);
+        if is_late {
+            late_ids.insert(field.id);
+        }
+        let force_children = forced || (is_late && !field.logical_type.is_struct());
+        for child in field.children.iter() {
+            self.collect_late_field_ids(child, force_children, late_ids);
+        }
     }
 
     fn validate_options(&self) -> Result<()> {
@@ -3533,13 +3557,29 @@ impl Scanner {
         let result_format = self.index_expr_result_format();
         let index_input = match self.external_row_mask.as_deref() {
             Some(mask) if use_external_mask => Some(self.mask_as_take_input(mask.clone())?),
-            _ => filter_plan.index_query.clone().map(|index_query| {
-                Arc::new(ScalarIndexExec::new(
-                    self.dataset.clone(),
-                    index_query,
-                    result_format,
-                )) as Arc<dyn ExecutionPlan>
-            }),
+            _ => {
+                if let Some(index_query) = filter_plan.index_query.clone() {
+                    let target_fragments = read_options
+                        .fragments
+                        .as_ref()
+                        .unwrap_or_else(|| self.dataset.fragments())
+                        .iter()
+                        .map(|fragment| fragment.id as u32)
+                        .collect::<RoaringBitmap>();
+                    let fragment_scope = ScalarIndexExec::fragments_covered_by_index_query(
+                        &index_query,
+                        self.dataset.as_ref(),
+                    )
+                    .await?
+                        & target_fragments;
+                    Some(Arc::new(
+                        ScalarIndexExec::new(self.dataset.clone(), index_query, result_format)
+                            .with_fragment_scope(fragment_scope),
+                    ) as Arc<dyn ExecutionPlan>)
+                } else {
+                    None
+                }
+            }
         };
 
         let plan: Arc<dyn ExecutionPlan> = Arc::new(FilteredReadExec::try_new(
@@ -6953,7 +6993,7 @@ impl Scanner {
         // are not in the fragments we are scanning.
         if filter_plan.is_exact_index_search() && self.fragments.is_none() {
             let index_query = filter_plan.index_query.as_ref().expect_ok()?;
-            let (_, missing_frags, stale_rows) = self
+            let (relevant_frags, missing_frags, stale_rows) = self
                 .partition_frags_by_coverage(index_query, fragments.clone())
                 .await?;
 
@@ -6968,9 +7008,17 @@ impl Scanner {
                 // 2. The index search is an exact search with no recheck or refine
                 // 3. The indices cover at least the same fragments as the vector index,
                 //    unless fast_search allows skipping uncovered fragments.
-                return Ok(PreFilterSource::ScalarIndexQuery(Arc::new(
-                    ScalarIndexExec::new(self.dataset.clone(), index_query.clone(), result_format),
-                )));
+                let mut exec =
+                    ScalarIndexExec::new(self.dataset.clone(), index_query.clone(), result_format);
+                if missing_frags.is_empty() && !relevant_frags.is_empty() {
+                    exec = exec.with_fragment_scope(
+                        relevant_frags
+                            .iter()
+                            .map(|fragment| fragment.id as u32)
+                            .collect(),
+                    );
+                }
+                return Ok(PreFilterSource::ScalarIndexQuery(Arc::new(exec)));
             } else {
                 log::trace!("exact index search did not cover all fragments");
             }
@@ -7091,9 +7139,13 @@ impl Scanner {
             input.clone(),
             self.get_batch_size(),
         ));
-        if let Some(take_plan) =
-            TakeExec::try_new(self.dataset.clone(), coalesced, output_projection)?
-        {
+        if let Some(take_plan) = TakeExec::try_new_with_batch_size(
+            self.dataset.clone(),
+            coalesced,
+            output_projection,
+            self.resolved_file_reader_options()
+                .and_then(|o| o.batch_size_bytes),
+        )? {
             Ok(Arc::new(take_plan))
         } else {
             // No new columns needed
@@ -7477,6 +7529,25 @@ pub mod test_dataset {
             Ok(())
         }
 
+        pub async fn make_segmented_scalar_index(&mut self) -> Result<()> {
+            let params = ScalarIndexParams::default();
+            let mut segments = Vec::with_capacity(self.dataset.get_fragments().len());
+            for fragment in self.dataset.get_fragments() {
+                segments.push(
+                    self.dataset
+                        .create_index_builder(&["i"], IndexType::BTree, &params)
+                        .name("i_idx".to_string())
+                        .fragments(vec![fragment.id() as u32])
+                        .execute_uncommitted()
+                        .await?,
+                );
+            }
+            self.dataset
+                .commit_existing_index_segments("i_idx", "i", segments)
+                .await?;
+            Ok(())
+        }
+
         fn fts_index_params() -> InvertedIndexParams {
             // These scanner tests search for the token "s" (from the `s-{N}`
             // column values) to exercise fragment/append coverage, and "s" is
@@ -7565,6 +7636,7 @@ mod test {
     use arrow_schema::Fields;
     use arrow_select::take;
     use datafusion::logical_expr::{col, lit};
+    use datafusion::physical_plan::ExecutionPlanProperties;
     use half::f16;
     use lance_arrow::{FixedSizeListArrayExt, SchemaExt};
     use lance_core::utils::tempfile::TempStrDir;
@@ -7591,11 +7663,15 @@ mod test {
     use rstest::rstest;
 
     use super::*;
+    use crate::blob::{BlobArrayBuilder, blob_field};
     use crate::dataset::WriteMode;
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::dataset::scanner::test_dataset::TestVectorDataset;
     use crate::dataset::{NewColumnTransform, WriteParams};
     use crate::index::vector::{StageParams, VectorIndexParams};
+    // Imported through the public `io::exec` re-export rather than the crate-private
+    // `knn` module, so the tests below cover that surface too.
+    use crate::io::exec::{ANNIvfBatchExec, QUERY_INDEX_COL};
     use crate::utils::test::{
         DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper, assert_plan_node_equals,
     };
@@ -8562,6 +8638,163 @@ mod test {
                 .contains("strict_batch_size=true cannot be combined with batch_size_bytes=8192"),
             "unexpected error: {error}"
         );
+    }
+
+    // Builds a genuine `lance.blob.v2` logical array of `rows` 8KiB payloads.
+    // Payloads vary per row so they do not collapse under compression.
+    // The legacy `lance-encoding:blob` metadata marker is rejected for file
+    // version >= 2.2, so fixtures must use the v2 logical array.
+    fn v2_blob_array(rows: usize, base: usize) -> ArrayRef {
+        let mut builder = BlobArrayBuilder::new(rows);
+        for r in 0..rows {
+            let seed = (base + r).wrapping_mul(2654435761);
+            let payload: Vec<u8> = (0usize..8 * 1024)
+                .map(|i| (i.wrapping_mul(31).wrapping_add(seed) & 0xff) as u8)
+                .collect();
+            builder.push_bytes(&payload).unwrap();
+        }
+        builder.finish().unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_batch_size_bytes_blob_v2_late_materialization() {
+        use lance_core::datatypes::BlobHandling;
+        use lance_table::io::commit::RenameCommitHandler;
+
+        let rows_per_batch = 500usize;
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("filterme", DataType::Int32, false),
+            blob_field("blobs", true),
+        ]));
+        let batches: Vec<RecordBatch> = (0..8)
+            .map(|b| {
+                let base = b * rows_per_batch;
+                let filterme = Arc::new(Int32Array::from_iter_values(
+                    (base as i32)..(base as i32 + rows_per_batch as i32),
+                ));
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![filterme, v2_blob_array(rows_per_batch, base)],
+                )
+                .unwrap()
+            })
+            .collect();
+        let data = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+
+        let dataset = Dataset::write(
+            data,
+            "memory://test",
+            Some(WriteParams {
+                commit_handler: Some(Arc::new(RenameCommitHandler)),
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let target_bytes = 8 * 1024;
+        let mut scan = dataset.scan();
+        scan.project(&["blobs"])
+            .unwrap()
+            .blob_handling(BlobHandling::AllBinary)
+            .filter("filterme < 100")
+            .unwrap()
+            .batch_size_bytes(target_bytes);
+        let batches = scan
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 100);
+        for batch in &batches {
+            assert!(
+                batch.get_array_memory_size() <= (target_bytes * 2) as usize,
+                "batch has {} bytes, limit is {}",
+                batch.get_array_memory_size(),
+                target_bytes * 2
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_batch_size_bytes_blob_v2_vector_search() {
+        use lance_core::datatypes::BlobHandling;
+        use lance_table::io::commit::RenameCommitHandler;
+
+        let rows_per_batch = 500usize;
+        let item_field = Arc::new(ArrowField::new("item", DataType::Float32, true));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int32, false),
+            ArrowField::new("vec", DataType::FixedSizeList(item_field.clone(), 32), true),
+            blob_field("blobs", true),
+        ]));
+        let batches: Vec<RecordBatch> = (0..8)
+            .map(|b| {
+                let base = b * rows_per_batch;
+                let i = Arc::new(Int32Array::from_iter_values(
+                    (base as i32)..(base as i32 + rows_per_batch as i32),
+                ));
+                let vec = Arc::new(FixedSizeListArray::new(
+                    item_field.clone(),
+                    32,
+                    Arc::new(Float32Array::from_iter_values(
+                        (0..rows_per_batch * 32).map(|v| ((base + v) % 1024) as f32),
+                    )),
+                    None,
+                ));
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![i, vec, v2_blob_array(rows_per_batch, base)],
+                )
+                .unwrap()
+            })
+            .collect();
+        let data = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+
+        let dataset = Dataset::write(
+            data,
+            "memory://test",
+            Some(WriteParams {
+                commit_handler: Some(Arc::new(RenameCommitHandler)),
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let query = Float32Array::from_iter_values((0..32).map(|v| v as f32));
+        let target_bytes = 8 * 1024;
+        let k = 20;
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &query, k)
+            .unwrap()
+            .use_index(false)
+            .project(&["blobs"])
+            .unwrap()
+            .blob_handling(BlobHandling::AllBinary)
+            .batch_size_bytes(target_bytes);
+        let batches = scan
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), k);
+        for batch in &batches {
+            assert!(
+                batch.get_array_memory_size() <= (target_bytes * 2) as usize,
+                "batch has {} bytes, limit is {}",
+                batch.get_array_memory_size(),
+                target_bytes * 2
+            );
+        }
     }
 
     #[tokio::test]
@@ -10478,6 +10711,92 @@ mod test {
         }
     }
 
+    /// Finds the batch vector-search node in a physical plan.
+    fn find_ann_ivf_batch_exec(plan: &dyn ExecutionPlan) -> Option<&ANNIvfBatchExec> {
+        if let Some(batch_exec) = plan.downcast_ref::<ANNIvfBatchExec>() {
+            return Some(batch_exec);
+        }
+        plan.children()
+            .into_iter()
+            .find_map(|child| find_ann_ivf_batch_exec(child.as_ref()))
+    }
+
+    /// A caller that matches the batch node in a plan reads the search back out
+    /// of it through the public `io::exec` surface, so the accessors must return
+    /// what the scanner fed the constructor.
+    #[rstest]
+    #[case::no_prefilter(None)]
+    #[case::prefilter(Some("i > 100"))]
+    #[tokio::test]
+    async fn test_batch_knn_indexed_exposes_plan_inputs(#[case] filter: Option<&str>) {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        test_ds.make_vector_index().await.unwrap();
+        let dataset = &test_ds.dataset;
+        let (queries, query_values) = batch_knn_two_queries();
+
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &queries, 2).unwrap();
+        scan.nprobes(2);
+        if let Some(filter) = filter {
+            scan.filter(filter).unwrap();
+            scan.prefilter(true);
+        }
+        scan.project(&["i"]).unwrap();
+
+        let plan = scan.create_plan().await.unwrap();
+        let batch_exec = find_ann_ivf_batch_exec(plan.as_ref())
+            .expect("indexed batch KNN should plan an ANNIvfBatchExec");
+
+        let query = batch_exec.query();
+        assert_eq!(query.column, "vec");
+        assert_eq!(query.k, 2);
+        assert_eq!(query.minimum_nprobes, 2);
+        assert_eq!(query.maximum_nprobes, Some(2));
+        assert_eq!(query.metric_type, Some(DistanceType::L2));
+        assert_eq!(
+            query.key.as_primitive::<Float32Type>().values(),
+            query_values.as_slice(),
+            "query key must hold both query vectors concatenated"
+        );
+
+        assert_eq!(batch_exec.query_count(), 2);
+        assert_eq!(
+            query.key.len() / batch_exec.query_count(),
+            32,
+            "query count must divide the key into the column's vectors"
+        );
+
+        assert_eq!(batch_exec.dataset().uri(), dataset.uri());
+        assert_eq!(
+            batch_exec.dataset().version().version,
+            dataset.version().version
+        );
+
+        let expected_indices = dataset.load_indices_by_name("idx").await.unwrap();
+        assert!(!expected_indices.is_empty());
+        assert_eq!(
+            batch_exec
+                .indices()
+                .iter()
+                .map(|index| index.uuid)
+                .collect::<Vec<_>>(),
+            expected_indices
+                .iter()
+                .map(|index| index.uuid)
+                .collect::<Vec<_>>()
+        );
+
+        match (filter, batch_exec.prefilter_source()) {
+            (None, PreFilterSource::None) => {}
+            (Some(_), PreFilterSource::FilteredRowIds(_)) => {}
+            (_, source) => panic!("unexpected prefilter source {source:?} for filter {filter:?}"),
+        }
+
+        assert_eq!(batch_exec.schema().field(0).name(), QUERY_INDEX_COL);
+    }
+
     /// Batch indexed search must merge each query's top-k across multiple delta
     /// indices, not just within a single delta.
     #[tokio::test]
@@ -10819,55 +11138,97 @@ mod test {
         assert_eq!(expected_i, actual_i);
     }
 
+    #[rstest]
+    #[case::nearest_only(false, None, false)]
+    #[case::late_materialization(true, None, false)]
+    #[case::late_materialization_limit(true, Some(0), false)]
+    #[case::late_materialization_offset(true, Some(37), false)]
+    #[case::nulls_and_ties(true, Some(37), true)]
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_flat_knn_large_limit_preserves_global_order() {
-        // Regression test for https://github.com/lance-format/lance/issues/7865.
-        //
-        // An exact (flat, no vector index) KNN search with a limit larger than one
-        // output batch (BATCH_SIZE_FALLBACK = 8192 rows) used to be able to return
-        // results in the wrong global order: `execute_plan` coalesced the
-        // partitions the physical optimizer parallelizes above the top-k `SortExec`
-        // with a plain `CoalescePartitionsExec`, which does not preserve order.
-        // This only reproduces at real (> 1) parallelism, which is why the
-        // plan-shape tests elsewhere (pinned to `target_parallelism(1)`) never
-        // caught it.
-        let dim = 16u32;
-        let frag_count = 4u32;
-        let rows_per_fragment = 5_000u32;
-        let k = 12_000usize; // > BATCH_SIZE_FALLBACK, so results span multiple batches
-
+    async fn test_flat_knn_large_limit_preserves_global_order(
+        #[case] materialize_id: bool,
+        #[case] offset: Option<usize>,
+        #[case] nulls_and_ties: bool,
+    ) {
+        // Cover both the root merge (#7865) and a merge below GlobalLimitExec
+        // followed by late materialization (lancedb/lancedb#4214).
+        let rows = 12_288usize;
+        let k = 9_000usize; // Span multiple default-sized output batches.
+        let vector_value = |id: usize| {
+            if nulls_and_ties {
+                (rows - id).div_ceil(2)
+            } else {
+                rows - id
+            }
+        };
+        let mut vectors = array::cycle_vec(
+            array::cycle::<Float32Type>((0..rows).map(|id| vector_value(id) as f32).collect()),
+            Dimension::from(1),
+        );
+        if nulls_and_ties {
+            vectors = vectors.with_nulls(&[false, false, false, true]);
+        }
         let dataset = gen_batch()
-            .col("vec", array::rand_vec::<Float32Type>(Dimension::from(dim)))
-            .into_ram_dataset(
-                FragmentCount::from(frag_count),
-                FragmentRowCount::from(rows_per_fragment),
-            )
+            .col("id", array::step::<UInt32Type>())
+            .col("vec", vectors)
+            .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(4_096))
             .await
             .unwrap();
 
-        let query = Float32Array::from(vec![0.0_f32; dim as usize]);
+        let query = Float32Array::from(vec![0.0]);
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &query, k + offset.unwrap_or(0))
+            .unwrap();
+        scan.target_parallelism(8);
+        if materialize_id {
+            scan.project(&["id"]).unwrap();
+        } else {
+            scan.project(&["vec"]).unwrap();
+        }
+        if let Some(offset) = offset {
+            scan.limit(Some(k as i64), Some(offset as i64)).unwrap();
+        }
 
-        // The bug is a scheduling race between parallel partitions, so run
-        // several iterations to reliably catch it if the ordering guarantee
-        // regresses.
-        for _ in 0..10 {
-            let mut scan = dataset.scan();
-            scan.nearest("vec", &query, k).unwrap();
-            scan.target_parallelism(8);
-
-            let batch = scan.try_into_batch().await.unwrap();
-            assert_eq!(batch.num_rows(), k);
-
-            let distances = batch[DIST_COL].as_primitive::<Float32Type>();
-            for pair in distances.values().windows(2) {
-                assert!(
-                    pair[0] <= pair[1],
-                    "flat KNN results must be globally sorted by distance, found {} before {}",
-                    pair[0],
-                    pair[1]
+        let plan = scan.create_plan().await.unwrap();
+        let displayed = DisplayableExecutionPlan::new(plan.as_ref())
+            .indent(true)
+            .to_string();
+        assert_eq!(displayed.matches("SortExec:").count(), 1, "{displayed}");
+        assert_eq!(
+            displayed.contains("source=stream(_rowid)"),
+            materialize_id,
+            "{displayed}"
+        );
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), k);
+        let distances = batch[DIST_COL].as_primitive::<Float32Type>();
+        assert_eq!(distances.null_count(), 0);
+        let mut expected_ids = (0..rows)
+            .filter(|id| !nulls_and_ties || id % 4 != 3)
+            .collect::<Vec<_>>();
+        expected_ids.sort_by_key(|id| (vector_value(*id), *id));
+        for (rank, id) in expected_ids
+            .into_iter()
+            .skip(offset.unwrap_or(0))
+            .take(k)
+            .enumerate()
+        {
+            let value = vector_value(id) as f32;
+            assert_eq!(distances.value(rank), value * value);
+            if materialize_id {
+                // Distances decrease with row id; ties use ascending row id.
+                assert_eq!(
+                    batch["id"].as_primitive::<UInt32Type>().value(rank),
+                    id as u32
                 );
             }
         }
+        // Catch the ordering contract deterministically even if this execution
+        // happened to receive the parallel batches in distance order.
+        assert!(
+            plan.output_ordering().is_some(),
+            "flat KNN must retain its output ordering:\n{displayed}"
+        );
     }
 
     #[rstest]
@@ -14260,6 +14621,55 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         assert!(err.to_string().contains("with_deleted_rows"), "{err}");
     }
 
+    #[tokio::test]
+    async fn test_late_materialize_list_as_unit() {
+        // A list's `item` child is narrow, so deciding per field kept it eager and pulled the
+        // whole list back in.  A list must be deferred together with its children.
+        let struct_fields = Fields::from(vec![
+            ArrowField::new("count", DataType::Int32, true),
+            ArrowField::new(
+                "tokens",
+                DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
+                true,
+            ),
+        ]);
+        let data = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .col("toks", array::rand_list(&DataType::Int32, false))
+            .col("st", array::rand_struct(struct_fields))
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let dataset = Arc::new(Dataset::write(data, "memory://test", None).await.unwrap());
+        let scanner = dataset.scan();
+        let planner = Planner::new(Arc::new(dataset.schema().into()));
+        let eager = |filter: &str, project: [&str; 1]| {
+            let filter_plan =
+                ExprFilterPlan::new_refine_only(planner.parse_filter(filter).unwrap());
+            let desired = dataset
+                .empty_projection()
+                .union_columns(project, OnMissing::Error)
+                .unwrap();
+            scanner
+                .calc_eager_projection(&filter_plan, &desired)
+                .unwrap()
+                .to_bare_schema()
+        };
+
+        // Top-level list: only the narrow filter column is read eagerly
+        let schema = eager("i > 5", ["toks"]);
+        assert!(schema.field("i").is_some(), "{schema:?}");
+        assert!(schema.field("toks").is_none(), "{schema:?}");
+
+        // List nested in a struct: the narrow sibling is still read eagerly
+        let schema = eager("st.count IS NOT NULL", ["st.tokens"]);
+        let eager_children = schema.field("st").map(|st| {
+            st.children
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(eager_children, Some(vec!["count"]), "{schema:?}");
+    }
+
     #[rstest]
     #[tokio::test]
     async fn test_late_materialization(
@@ -16444,6 +16854,34 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         .await;
     }
 
+    // Unit-level companion to the NOT IN case in
+    // test_filter_to_take_with_stable_row_ids: exercises the lowering directly,
+    // independent of the expression simplifier's InList expansion threshold
+    // (which the end-to-end test depends on to keep the list unexpanded).
+    #[test]
+    fn take_operation_rejects_negated_in_list() {
+        // All three virtual columns share the one InList arm, so the guard has
+        // to hold for each of them.
+        for column in [ROW_ID, ROW_ADDR, ROW_OFFSET] {
+            let positive = col(column).in_list(vec![lit(0u64), lit(1u64)], false);
+            let lowered = TakeOperation::try_from_expr(&positive);
+            let ids = match lowered {
+                Some((TakeOperation::RowIds(ids), None))
+                | Some((TakeOperation::RowAddrs(ids), None))
+                | Some((TakeOperation::RowOffsets(ids), None)) => ids,
+                other => panic!("{column} IN (0, 1) must lower into a take, got {other:?}"),
+            };
+            assert_eq!(ids, vec![0, 1], "wrong ids lowered for {column}");
+
+            let negated = col(column).in_list(vec![lit(0u64), lit(1u64)], true);
+            assert!(
+                TakeOperation::try_from_expr(&negated).is_none(),
+                "a negated InList on {column} is the complement of the listed ids \
+                 and must not lower into a take of them"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_filter_to_take_with_stable_row_ids() {
         let ds = lance_datagen::gen_batch()
@@ -16508,6 +16946,45 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             .await
             .unwrap();
         assert_eq!(batch["idx"].as_primitive::<Int32Type>().values(), &[5, 9]);
+
+        // NOT IN is the complement of IN and must not be lowered into a take
+        // of the listed ids. The list must be large enough that DataFusion's
+        // expression simplifier does not expand it into a conjunction of
+        // `!=` comparisons first (it only expands small lists) — with the
+        // pre-fix code the negated InList reached the lowering and returned
+        // exactly the listed rows.
+        let not_in_list = (0..10)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let batch = ds
+            .scan()
+            .filter(&format!("{ROW_ID} NOT IN ({not_in_list})"))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(batch["idx"].as_primitive::<Int32Type>().values(), &[10, 11]);
+
+        // `_rowoffset` shares the arm, and the contract that matters is that a
+        // negated list never turns into a take of the listed values. It cannot
+        // be answered as a scan filter either: `_rowoffset` is only reachable
+        // through this lowering, so it is absent from the filterable read
+        // schema and any predicate that survives to the planner is rejected.
+        // Pin that it fails rather than returning the complement. Plain
+        // comparisons such as `_rowoffset > 2` fail the same way, so this is
+        // the column's existing limit, not something the guard introduced.
+        let err = ds
+            .scan()
+            .filter(&format!("{ROW_OFFSET} NOT IN (0, 1, 2, 4)"))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .expect_err("a negated _rowoffset list must not be answered from a take");
+        assert!(
+            err.to_string().contains(ROW_OFFSET),
+            "the error should name the column, got: {err}"
+        );
     }
 
     #[tokio::test]
@@ -17340,6 +17817,154 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             filtered_plan.contains("ANNSubIndex: name=idx, k=420, deltas=1, metric=L2"),
             "expected one ANN delta with fragment filter, plan was:\n{filtered_plan}"
         );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_vector_prefilter_prunes_scalar_segments(
+        #[values(false, true)] stable_row_ids: bool,
+        #[values(false, true)] explicit_fragments: bool,
+    ) {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, stable_row_ids)
+            .await
+            .unwrap();
+        let vector_segments = test_ds.make_segmented_vector_index().await.unwrap();
+        test_ds.make_segmented_scalar_index().await.unwrap();
+        let fragments = test_ds.dataset.fragments();
+        let query: Float32Array = (0..32).map(|value| value as f32).collect();
+
+        let mut scanner = test_ds.dataset.scan();
+        scanner.project(&["i"]).unwrap();
+        scanner
+            .nearest("vec", &query, 200)
+            .unwrap()
+            .nprobes(2)
+            .prefilter(true)
+            .with_index_segments(vec![vector_segments[1]])
+            .unwrap();
+        if explicit_fragments {
+            scanner.with_fragments(vec![fragments[1].clone()]);
+        }
+        scanner.filter("NOT (i < 250)").unwrap();
+
+        let analyzed = scanner.analyze_plan().await.unwrap();
+        let scalar_index_node = analyzed
+            .lines()
+            .find(|line| line.trim_start().starts_with("ScalarIndexQuery:"))
+            .unwrap_or_else(|| panic!("expected a scalar index query, plan was:\n{analyzed}"));
+        assert!(
+            scalar_index_node.contains("indices_loaded=1,"),
+            "expected one scalar segment to be loaded, plan was:\n{analyzed}"
+        );
+        if explicit_fragments {
+            assert!(
+                analyzed.contains("projection=[], num_fragments=1"),
+                "segment pruning must preserve the FilteredRead row-ID path, plan was:\n{analyzed}"
+            );
+        }
+
+        let actual = scanner.try_into_batch().await.unwrap();
+        let actual = actual["i"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+
+        let mut oracle = test_ds.dataset.scan();
+        oracle.project(&["i"]).unwrap();
+        oracle
+            .nearest("vec", &query, 200)
+            .unwrap()
+            .nprobes(2)
+            .prefilter(true)
+            .use_index(false)
+            .use_scalar_index(false)
+            .with_fragments(vec![fragments[1].clone()]);
+        oracle.filter("NOT (i < 250)").unwrap();
+        let expected = oracle.try_into_batch().await.unwrap();
+        let expected = expected["i"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(actual, expected);
+        assert!(!expected.is_empty());
+        let recall = actual.intersection(&expected).count() as f64 / expected.len() as f64;
+        assert_eq!(recall, 1.0);
+    }
+
+    #[rstest]
+    #[case::plain_all(false, false)]
+    #[case::plain_fragment(false, true)]
+    #[case::fts_fragment(true, true)]
+    #[tokio::test]
+    async fn test_filtered_read_prunes_scalar_segments(
+        #[values(false, true)] stable_row_ids: bool,
+        #[case] full_text_search: bool,
+        #[case] explicit_fragments: bool,
+    ) {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, stable_row_ids)
+            .await
+            .unwrap();
+        test_ds.make_segmented_scalar_index().await.unwrap();
+        if full_text_search {
+            test_ds.make_fts_index().await.unwrap();
+        }
+        let fragments = test_ds.dataset.fragments();
+        let mut scanner = test_ds.dataset.scan();
+        scanner.project(&["i"]).unwrap();
+        scanner.filter("NOT (i < 150)").unwrap();
+        if explicit_fragments {
+            scanner.with_fragments(vec![fragments[1].clone()]);
+        }
+        if full_text_search {
+            // Every fixture row contains the token "s", so the scalar-only scan is an oracle.
+            scanner
+                .full_text_search(FullTextSearchQuery::new("s".to_owned()))
+                .unwrap()
+                .prefilter(true);
+        }
+        let analyzed = scanner.analyze_plan().await.unwrap();
+        let scalar_index_node = analyzed
+            .lines()
+            .find(|line| line.trim_start().starts_with("ScalarIndexQuery:"))
+            .unwrap_or_else(|| panic!("expected a scalar index query, plan was:\n{analyzed}"));
+        let expected_segments = if explicit_fragments {
+            1
+        } else {
+            fragments.len()
+        };
+        assert!(
+            scalar_index_node.contains(&format!("indices_loaded={expected_segments},")),
+            "unexpected scalar segment count, plan was:\n{analyzed}"
+        );
+        let actual = scanner.try_into_batch().await.unwrap();
+        let actual = actual["i"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+
+        let mut oracle = test_ds.dataset.scan();
+        oracle.project(&["i"]).unwrap();
+        oracle.filter("NOT (i < 150)").unwrap();
+        oracle.use_scalar_index(false);
+        if explicit_fragments {
+            oracle.with_fragments(vec![fragments[1].clone()]);
+        }
+        let expected = oracle.try_into_batch().await.unwrap();
+        let expected = expected["i"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        assert!(!expected.is_empty());
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]
