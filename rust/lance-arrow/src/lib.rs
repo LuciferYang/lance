@@ -1558,7 +1558,7 @@ pub trait BufferExt {
 }
 
 fn is_pwr_two(n: u64) -> bool {
-    n & (n - 1) == 0
+    n != 0 && n & (n - 1) == 0
 }
 
 impl BufferExt for arrow_buffer::Buffer {
