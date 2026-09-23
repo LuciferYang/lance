@@ -242,6 +242,11 @@ pub struct Sbbf {
 
 impl Sbbf {
     /// Create a new SBBF from raw bitset data
+    ///
+    /// An empty bitset is accepted because the bloom filter index reader
+    /// feeds NULL `bloom_filter_data` rows here as an empty slice. Such a
+    /// filter contains nothing: `check_hash` is always false and
+    /// `insert_hash` is a no-op.
     pub fn new(bitset: &[u8]) -> Result<Self> {
         if !bitset.len().is_multiple_of(32) {
             return Err(SbbfError::InvalidData {
@@ -298,6 +303,9 @@ impl Sbbf {
 
     /// Insert a hash into the filter
     pub fn insert_hash(&mut self, hash: u64) {
+        if self.blocks.is_empty() {
+            return;
+        }
         let block_index = self.hash_to_block_index(hash);
         self.blocks[block_index].insert(hash as u32)
     }
@@ -311,6 +319,11 @@ impl Sbbf {
     /// true for values that were never inserted ("false positive")
     /// but will always return false if a hash has not been inserted.
     pub fn check_hash(&self, hash: u64) -> bool {
+        if self.blocks.is_empty() {
+            // An empty filter indexed no values (legacy empty blob), so the
+            // value is definitely absent. Indexing blocks[0] would panic.
+            return false;
+        }
         let block_index = self.hash_to_block_index(hash);
         self.blocks[block_index].check(hash as u32)
     }
@@ -480,6 +493,21 @@ impl Default for SbbfBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_empty_bitset_contains_nothing() {
+        // Legacy indexes store an empty blob for zones that indexed no
+        // values, and the index reader feeds NULL rows to Sbbf::new as an
+        // empty slice. Constructing must succeed and querying must not
+        // panic (it used to index blocks[0] out of bounds).
+        let mut sbbf = Sbbf::new(&[]).expect("empty bitset must be loadable");
+        assert!(!sbbf.check("anything"));
+        sbbf.insert_hash(42);
+        assert!(!sbbf.check_hash(42));
+        // Two empty filters share no elements.
+        let empty = Sbbf::new(&[]).unwrap();
+        assert!(!empty.might_intersect(&Sbbf::new(&[]).unwrap()).unwrap());
+    }
 
     #[test]
     fn test_hash_bytes() {
