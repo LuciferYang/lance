@@ -1096,6 +1096,19 @@ impl Clone for CloneableError {
             )))),
             Error::Timeout { message, .. } => Self(Error::timeout(message.clone())),
             Error::IO { source, .. } => Self(Error::io(source.to_string())),
+            // Callers react to these via `fence_reason` / `is_backpressure`
+            // rather than the message; collapsing them into a cloned string
+            // would silently drop that signal across the clone boundary.
+            Error::Fenced {
+                reason, message, ..
+            } => Self(
+                FencedSnafu {
+                    reason: *reason,
+                    message: message.clone(),
+                }
+                .build(),
+            ),
+            Error::Backpressure { message, .. } => Self(Error::backpressure(message.clone())),
             error => Self(Error::cloned(error.to_string())),
         }
     }
@@ -1115,6 +1128,22 @@ mod test {
     use super::*;
     use std::error::Error as _;
     use std::fmt;
+
+    #[test]
+    fn cloneable_error_preserves_fenced_and_backpressure_contract() {
+        // `fence_reason` and `is_backpressure` are the documented ways to
+        // react to these variants; collapsing them into a cloned string
+        // breaks that contract across clone boundaries.
+        let original = CloneableError(Error::fenced_by_peer("peer claimed epoch 7"));
+        let cloned = original.clone();
+        assert!(original.0.fence_reason().is_some());
+        assert_eq!(cloned.0.fence_reason(), Some(FenceReason::PeerClaimedEpoch));
+
+        let original = CloneableError(Error::backpressure("writer at memory ceiling"));
+        let cloned = original.clone();
+        assert!(original.0.is_backpressure());
+        assert!(cloned.0.is_backpressure());
+    }
 
     #[test]
     fn cloneable_error_preserves_not_found_contract() {
