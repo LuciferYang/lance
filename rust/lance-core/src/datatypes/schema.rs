@@ -2329,6 +2329,12 @@ mod tests {
             .intersection_ignore_types(&schema_with_large_list_struct)
             .unwrap();
         assert_eq!(intersection, with_missing_field);
+        // Strict mode must narrow as well: item child types are shared here,
+        // so the recursion is not gated behind ignore_types.
+        let intersection = schema_with_large_list_struct
+            .intersection(&with_missing_field)
+            .unwrap();
+        assert_eq!(intersection, with_missing_field);
     }
 
     #[test]

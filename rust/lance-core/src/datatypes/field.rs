@@ -935,6 +935,20 @@ impl Field {
                     }
                 })
                 .collect::<Vec<_>>();
+            // A list or map with no surviving children cannot be materialized:
+            // `data_type()` indexes children[0] for these logical types, so
+            // returning the field here would panic at the next type access.
+            if children.is_empty()
+                && matches!(
+                    self_type,
+                    DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _)
+                )
+            {
+                return Err(Error::arrow(format!(
+                    "Attempt to intersect fields with no shared children: {} ({})",
+                    self.name, self_type
+                )));
+            }
             let f = Self {
                 name: self.name.clone(),
                 id: if self.id >= 0 { self.id } else { other.id },
@@ -1734,6 +1748,91 @@ mod tests {
         .try_into()
         .unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_list_field_intersection_item_mismatch() {
+        // Arrow allows arbitrary item field names, so two lists can describe
+        // compatible data yet share no child by name. The intersection must
+        // error instead of returning a zero-children field, which would panic
+        // in `data_type()` (it indexes children[0] for list-like types).
+        fn assert_item_mismatch_err(
+            list_ctor: fn(Arc<ArrowField>) -> DataType,
+            self_item: &str,
+            self_type: DataType,
+            other_item: &str,
+            other_type: DataType,
+        ) {
+            let f1: Field = ArrowField::new(
+                "a",
+                list_ctor(Arc::new(ArrowField::new(
+                    self_item,
+                    self_type.clone(),
+                    true,
+                ))),
+                true,
+            )
+            .try_into()
+            .unwrap();
+            let f2: Field = ArrowField::new(
+                "a",
+                list_ctor(Arc::new(ArrowField::new(
+                    other_item,
+                    other_type.clone(),
+                    true,
+                ))),
+                true,
+            )
+            .try_into()
+            .unwrap();
+            assert!(
+                f1.intersection(&f2).is_err(),
+                "expected error for items ({self_item}:{self_type}) vs ({other_item}:{other_type})"
+            );
+        }
+        fn list_of(item: Arc<ArrowField>) -> DataType {
+            DataType::List(item)
+        }
+        fn large_list_of(item: Arc<ArrowField>) -> DataType {
+            DataType::LargeList(item)
+        }
+        fn map_entries(name: &str) -> Arc<ArrowField> {
+            Arc::new(ArrowField::new(
+                name,
+                DataType::Struct(Fields::from(vec![
+                    ArrowField::new("key", DataType::Int32, false),
+                    ArrowField::new("value", DataType::Int32, true),
+                ])),
+                false,
+            ))
+        }
+
+        assert_item_mismatch_err(list_of, "item", DataType::Int32, "element", DataType::Int32);
+        assert_item_mismatch_err(
+            large_list_of,
+            "item",
+            DataType::Int32,
+            "element",
+            DataType::Int32,
+        );
+        // Same for Map: the entries child is looked up by name, and Arrow
+        // does not fix that name, so mismatched entries names must error.
+        let f1: Field = ArrowField::new("a", DataType::Map(map_entries("entries"), false), true)
+            .try_into()
+            .unwrap();
+        let f2: Field = ArrowField::new("a", DataType::Map(map_entries("pairs"), false), true)
+            .try_into()
+            .unwrap();
+        assert!(f1.intersection(&f2).is_err());
+        // Names match but item types conflict: the recursive intersection
+        // error must not be swallowed into a zero-children field either.
+        assert_item_mismatch_err(
+            large_list_of,
+            "item",
+            DataType::Int32,
+            "item",
+            DataType::Utf8,
+        );
     }
 
     #[test]
