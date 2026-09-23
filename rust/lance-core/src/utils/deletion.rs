@@ -52,10 +52,16 @@ impl DeletionVector {
         }
     }
 
-    pub fn contains_range(&self, mut range: Range<u32>) -> bool {
+    pub fn contains_range(&self, range: Range<u32>) -> bool {
         match self {
             Self::NoDeletions => range.is_empty(),
-            Self::Set(set) => range.all(|i| set.contains(&i)),
+            // Same member-iteration reasoning as range_cardinality; callers
+            // pass full-fragment ranges (e.g. 0..physical_rows).
+            Self::Set(set) => {
+                let range_len = range.len();
+                range_len <= set.len()
+                    && set.iter().filter(|i| range.contains(i)).count() == range_len
+            }
             Self::Bitmap(bitmap) => bitmap.contains_range(range),
         }
     }
@@ -63,7 +69,11 @@ impl DeletionVector {
     fn range_cardinality(&self, range: Range<u32>) -> u64 {
         match self {
             Self::NoDeletions => 0,
-            Self::Set(set) => range.fold(0, |acc, i| acc + set.contains(&i) as u64),
+            // Iterate the set's members instead of the range: a set is
+            // bounded by BITMAP_THRESDHOLD while the range can span millions
+            // of rows, and OffsetMapper::map_offset calls this once per
+            // binary-search step.
+            Self::Set(set) => set.iter().filter(|i| range.contains(i)).count() as u64,
             Self::Bitmap(bitmap) => bitmap.range_cardinality(range),
         }
     }
@@ -379,6 +389,11 @@ mod test {
         let bm = bitmap_dv([5, 10, 15]);
         assert_eq!(bm.range_cardinality(0..20), 3);
         assert_eq!(bm.range_cardinality(6..14), 1);
+        let set = set_dv([5, 10, 15]);
+        assert_eq!(set.range_cardinality(0..20), 3);
+        assert_eq!(set.range_cardinality(6..14), 1);
+        assert_eq!(set.range_cardinality(0..u32::MAX), 3);
+        assert_eq!(set.range_cardinality(16..u32::MAX), 0);
     }
 
     #[rstest]
