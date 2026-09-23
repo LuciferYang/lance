@@ -913,6 +913,7 @@ impl Field {
             (&self_type, &other_type),
             (DataType::Struct(_), DataType::Struct(_))
                 | (DataType::List(_), DataType::List(_))
+                | (DataType::LargeList(_), DataType::LargeList(_))
                 | (DataType::Map(_, _), DataType::Map(_, _))
         ) {
             // Blob v2 uses a struct logical type for descriptors, which differs from the logical
