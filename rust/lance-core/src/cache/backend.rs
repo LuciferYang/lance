@@ -58,6 +58,10 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
     /// for eviction accounting. Backends that drop entries without
     /// accounting (e.g. a zero-capacity cache) return `false` so loaders can
     /// skip the deep-size traversal.
+    ///
+    /// Returning `false` also gives up per-entry size reporting, since the
+    /// traversal that registers a type's deep-size accessor is what gets
+    /// skipped. Only return `false` from a backend that retains nothing.
     fn uses_entry_sizes(&self) -> bool {
         true
     }

@@ -760,13 +760,13 @@ mod tests {
         .await
     }
 
-    static DEEP_SIZE_CALLS: AtomicUsize = AtomicUsize::new(0);
-
-    struct CountingSizeValue;
+    /// Counts its own deep-size traversals. The counter lives in the value so
+    /// that two tests using this type cannot disturb each other's count.
+    struct CountingSizeValue(Arc<AtomicUsize>);
 
     impl DeepSizeOf for CountingSizeValue {
         fn deep_size_of_children(&self, _context: &mut Context) -> usize {
-            DEEP_SIZE_CALLS.fetch_add(1, Ordering::Relaxed);
+            self.0.fetch_add(1, Ordering::Relaxed);
             0
         }
     }
@@ -793,27 +793,31 @@ mod tests {
         }
     }
 
+    /// A backend that discards entries without accounting them, so a deep-size
+    /// traversal per load would be charged and then thrown away. Each phase
+    /// gets its own counter; the assertion is the traversal count, not a
+    /// cumulative total.
     #[tokio::test]
-    async fn no_cache_skips_entry_size_traversal() {
-        // A disabled backend drops entries (and their sizes) without
-        // accounting, so charging a deep-size traversal per load is pure
-        // waste on hot uncached paths.
-        DEEP_SIZE_CALLS.store(0, Ordering::Relaxed);
-        let cache = LanceCache::no_cache();
-        let (_value, was_cached) = cache
-            .get_or_insert_with_key_hit(CountingSizeKey(1), || async { Ok(CountingSizeValue) })
-            .await
-            .unwrap();
-        assert!(!was_cached);
-        assert_eq!(DEEP_SIZE_CALLS.load(Ordering::Relaxed), 0);
+    async fn backends_that_ignore_entry_sizes_skip_the_traversal() {
+        async fn traversals(cache: LanceCache) -> usize {
+            let counter = Arc::new(AtomicUsize::new(0));
+            cache
+                .get_or_insert_with_key_hit(CountingSizeKey(1), || async {
+                    Ok(CountingSizeValue(counter.clone()))
+                })
+                .await
+                .unwrap();
+            counter.load(Ordering::Relaxed)
+        }
 
-        // A sized cache still traverses for eviction accounting.
-        let cache = LanceCache::with_capacity(1024);
-        let _ = cache
-            .get_or_insert_with_key_hit(CountingSizeKey(2), || async { Ok(CountingSizeValue) })
-            .await
-            .unwrap();
-        assert_eq!(DEEP_SIZE_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(traversals(LanceCache::no_cache()).await, 0);
+        assert_eq!(traversals(LanceCache::with_capacity(1024)).await, 1);
+        // The session caches use the quick backend, so it needs the same gate.
+        let quick = |capacity| {
+            LanceCache::with_backend(Arc::new(quick::QuickCacheBackend::with_capacity(capacity)))
+        };
+        assert_eq!(traversals(quick(0)).await, 0);
+        assert_eq!(traversals(quick(1024)).await, 1);
     }
 
     #[derive(Clone)]
