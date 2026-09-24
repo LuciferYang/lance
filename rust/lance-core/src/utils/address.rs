@@ -115,6 +115,16 @@ mod tests {
         let range = RowAddress::address_range(3);
         assert_eq!(range.start, 3 * RowAddress::FRAGMENT_SIZE);
 
+        // The final fragment's one-past-the-end address leaves the u64 space.
+        // Only the linux-arm job runs doc tests, so this branch needs a unit
+        // test to be seen by the others and by coverage.
+        let range = RowAddress::address_range(RowAddress::TOMBSTONE_FRAG);
+        assert_eq!(
+            range.start,
+            u64::from(RowAddress::TOMBSTONE_FRAG) * RowAddress::FRAGMENT_SIZE
+        );
+        assert_eq!(range.end, u64::MAX);
+
         // From impls with different values than doctest
         let addr2 = RowAddress::new_from_parts(7, 8);
         let raw: u64 = addr2.into();
