@@ -14,7 +14,7 @@
 /// assert!(!is_pwr_two(1000));
 /// ```
 pub fn is_pwr_two(n: u64) -> bool {
-    n.is_power_of_two()
+    n != 0 && n & (n - 1) == 0
 }
 
 /// Returns the number of padding bytes needed to align `n` to `ALIGN`.
