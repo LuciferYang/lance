@@ -243,10 +243,10 @@ pub struct Sbbf {
 impl Sbbf {
     /// Create a new SBBF from raw bitset data
     ///
-    /// An empty bitset is accepted because the bloom filter index reader
-    /// feeds NULL `bloom_filter_data` rows here as an empty slice. Such a
-    /// filter contains nothing: `check_hash` is always false and
-    /// `insert_hash` is a no-op.
+    /// A zero-length bitset is accepted: it is a multiple of 32, and the
+    /// bloom filter index reads one per zone whose `bloom_filter_data` value
+    /// is empty. Such a filter holds no blocks, so it represents the empty
+    /// set: `check_hash` is always false and `insert_hash` is a no-op.
     pub fn new(bitset: &[u8]) -> Result<Self> {
         if !bitset.len().is_multiple_of(32) {
             return Err(SbbfError::InvalidData {
@@ -304,6 +304,7 @@ impl Sbbf {
     /// Insert a hash into the filter
     pub fn insert_hash(&mut self, hash: u64) {
         if self.blocks.is_empty() {
+            // No blocks, so there is nowhere to record the hash.
             return;
         }
         let block_index = self.hash_to_block_index(hash);
@@ -320,8 +321,8 @@ impl Sbbf {
     /// but will always return false if a hash has not been inserted.
     pub fn check_hash(&self, hash: u64) -> bool {
         if self.blocks.is_empty() {
-            // An empty filter indexed no values (legacy empty blob), so the
-            // value is definitely absent. Indexing blocks[0] would panic.
+            // The empty set contains nothing. Without this, hash_to_block_index
+            // returns 0 and indexing blocks[0] panics.
             return false;
         }
         let block_index = self.hash_to_block_index(hash);
@@ -496,10 +497,9 @@ mod tests {
 
     #[test]
     fn test_empty_bitset_contains_nothing() {
-        // Legacy indexes store an empty blob for zones that indexed no
-        // values, and the index reader feeds NULL rows to Sbbf::new as an
-        // empty slice. Constructing must succeed and querying must not
-        // panic (it used to index blocks[0] out of bounds).
+        // A zero-length bitset passes the multiple-of-32 check, so it can be
+        // constructed and then queried. It used to index blocks[0] out of
+        // bounds; it now behaves as the empty set.
         let mut sbbf = Sbbf::new(&[]).expect("empty bitset must be loadable");
         assert!(!sbbf.check("anything"));
         sbbf.insert_hash(42);
