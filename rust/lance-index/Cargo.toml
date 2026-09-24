@@ -34,6 +34,7 @@ geoarrow-array = { workspace = true, optional = true }
 geoarrow-schema = { workspace = true, optional = true }
 geo-types = { workspace = true, optional = true }
 half.workspace = true
+hex.workspace = true
 itertools.workspace = true
 jieba-rs = { workspace = true, optional = true }
 jsonb.workspace = true
@@ -67,6 +68,7 @@ serde.workspace = true
 smallvec = "1.15"
 tokio.workspace = true
 tracing.workspace = true
+twox-hash.workspace = true
 tempfile.workspace = true
 crossbeam-queue.workspace = true
 bytes.workspace = true
@@ -77,13 +79,15 @@ rangemap.workspace = true
 [dev-dependencies]
 approx.workspace = true
 criterion.workspace = true
-env_logger = "0.11.6"
+env_logger.workspace = true
 geo-traits.workspace = true
 lance-datagen.workspace = true
 lance-datafusion = { workspace = true, features = ["datagen"] }
 lance-testing.workspace = true
+libc.workspace = true
 test-log.workspace = true
 rstest.workspace = true
+serial_test.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 
@@ -97,7 +101,7 @@ tokenizer-jieba = ["dep:jieba-rs", "lance-tokenizer/tokenizer-jieba"]
 
 [build-dependencies]
 prost-build.workspace = true
-protobuf-src = { version = "2.1", optional = true }
+protobuf-src = { workspace = true, optional = true }
 
 [package.metadata.docs.rs]
 # docs.rs uses an older version of Ubuntu that does not have the necessary protoc version
@@ -160,6 +164,10 @@ name = "bitmap"
 harness = false
 
 [[bench]]
+name = "stable_partition_row_map"
+harness = false
+
+[[bench]]
 name = "geo"
 harness = false
 required-features = ["geo"]
@@ -168,5 +176,13 @@ required-features = ["geo"]
 name = "residual_transform"
 harness = false
 
+[[bench]]
+name = "two_file_shuffle_read"
+harness = false
+
 [lints]
 workspace = true
+
+[[bench]]
+name = "inverted_request_cache"
+harness = false

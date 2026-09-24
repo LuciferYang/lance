@@ -37,7 +37,8 @@ use serde::{Deserialize, Serialize};
 
 use super::ProductQuantizer;
 use super::distance::{build_distance_table_dot, build_distance_table_l2, compute_pq_distance};
-use crate::frag_reuse::FragReuseIndex;
+use crate::frag_reuse::{FragReuseIndex, FragReuseIndexHandle};
+use crate::scalar::RowIdRemapper;
 use crate::vector::graph::{OrderedFloat, OrderedNode};
 use crate::{
     INDEX_METADATA_SCHEMA_KEY, IndexMetadata, pb,
@@ -89,6 +90,10 @@ impl PartialEq for ProductQuantizationMetadata {
 
 #[async_trait]
 impl QuantizerMetadata for ProductQuantizationMetadata {
+    fn is_transposed(&self) -> bool {
+        self.transposed
+    }
+
     fn buffer_index(&self) -> Option<u32> {
         if self.codebook_position > 0 {
             // the global buffer index starts from 1
@@ -196,13 +201,38 @@ impl ProductQuantizationStorage {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         codebook: FixedSizeListArray,
-        mut batch: RecordBatch,
+        batch: RecordBatch,
         num_bits: u32,
         num_sub_vectors: usize,
         dimension: usize,
         distance_type: DistanceType,
         transposed: bool,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Self> {
+        let frag_reuse_index = frag_reuse_index
+            .map(|index| Arc::new(FragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
+        Self::new_with_remapper(
+            codebook,
+            batch,
+            num_bits,
+            num_sub_vectors,
+            dimension,
+            distance_type,
+            transposed,
+            frag_reuse_index,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_remapper(
+        codebook: FixedSizeListArray,
+        mut batch: RecordBatch,
+        num_bits: u32,
+        num_sub_vectors: usize,
+        dimension: usize,
+        distance_type: DistanceType,
+        transposed: bool,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         if batch.num_columns() != 2 {
             log::warn!(
@@ -533,6 +563,36 @@ impl QuantizerStorage for ProductQuantizationStorage {
         };
 
         Self::new(
+            codebook,
+            batch,
+            metadata.nbits,
+            metadata.num_sub_vectors,
+            metadata.dimension,
+            distance_type,
+            metadata.transposed,
+            frag_reuse_index,
+        )
+    }
+
+    fn try_from_batch_with_remapper(
+        batch: RecordBatch,
+        metadata: &Self::Metadata,
+        distance_type: DistanceType,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    ) -> Result<Self> {
+        let distance_type = match distance_type {
+            DistanceType::Cosine => DistanceType::L2,
+            _ => distance_type,
+        };
+        let codebook = match &metadata.codebook {
+            Some(codebook) => codebook.clone(),
+            None => {
+                debug_assert!(!metadata.codebook_tensor.is_empty());
+                let codebook_tensor = pb::Tensor::decode(metadata.codebook_tensor.as_slice())?;
+                FixedSizeListArray::try_from(&codebook_tensor)?
+            }
+        };
+        Self::new_with_remapper(
             codebook,
             batch,
             metadata.nbits,

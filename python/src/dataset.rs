@@ -6,8 +6,6 @@ use std::str;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 
-use arrow::array::AsArray;
-use arrow::datatypes::UInt8Type;
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::*;
 use arrow_array::Array;
@@ -19,6 +17,7 @@ use async_trait::async_trait;
 use blob::LanceBlobFile;
 use chrono::{Duration, TimeDelta, Utc};
 use futures::{StreamExt, TryFutureExt};
+use lance_index::scalar::minhash_lsh::MinHashQuery;
 use lance_index::vector::bq::RQBuildParams;
 use lance_index::vector::bq::storage::RabitQuantizationMetadata;
 use log::error;
@@ -41,19 +40,19 @@ use lance::dataset::cleanup::{CleanupFileKind, CleanupPolicyBuilder};
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::scanner::{
     AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback,
-    MaterializationStyle, QueryFilter,
+    MaterializationStyle, QueryFilter, RowAddrMask, RowAddrTreeMap,
 };
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::{
     BatchInfo, BatchUDF, CommitBuilder, MergeStats, NewColumnTransform, UDFCheckpointStore,
     WriteDestination,
 };
-use lance::dataset::{ColumnAlteration, ProjectionRequest};
+use lance::dataset::{ColumnAlteration, ProjectionRequest, validate_dataset_root_for_drop};
 use lance::dataset::{
     Dataset as LanceDataset, DeleteBuilder, ExternalBlobMode,
-    MergeInsertBuilder as LanceMergeInsertBuilder, ReadParams, UncommittedMergeInsert,
-    UpdateBuilder, Version, VersionRef, WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
-    WriteMode, WriteParams,
+    MergeInsertBuilder as LanceMergeInsertBuilder, MergeInsertWriteMode, ReadParams,
+    UncommittedMergeInsert, UpdateBuilder, Version, VersionRef, WhenMatched, WhenNotMatched,
+    WhenNotMatchedBySource, WriteMode, WriteParams,
     fragment::FileFragment as LanceFileFragment,
     progress::WriteFragmentProgress,
     scanner::Scanner as LanceScanner,
@@ -71,6 +70,7 @@ use lance_core::datatypes::BlobHandling;
 use lance_datafusion::utils::reader_to_stream;
 use lance_encoding::decoder::DecoderConfig;
 use lance_file::reader::FileReaderOptions;
+use lance_file::writer::FileWriterOptions;
 use lance_index::scalar::inverted::query::Occur;
 use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
@@ -423,8 +423,33 @@ impl MergeInsertBuilder {
         Ok(slf)
     }
 
+    pub fn data_storage_version<'a>(
+        mut slf: PyRefMut<'a, Self>,
+        version: &str,
+    ) -> PyResult<PyRefMut<'a, Self>> {
+        slf.builder
+            .data_storage_version(version.parse().infer_error()?);
+        Ok(slf)
+    }
+
     pub fn use_index(mut slf: PyRefMut<'_, Self>, use_index: bool) -> PyResult<PyRefMut<'_, Self>> {
         slf.builder.use_index(use_index);
+        Ok(slf)
+    }
+
+    pub fn write_mode<'a>(mut slf: PyRefMut<'a, Self>, mode: &str) -> PyResult<PyRefMut<'a, Self>> {
+        let mode = match mode {
+            "auto" => MergeInsertWriteMode::Auto,
+            "rewrite_rows" => MergeInsertWriteMode::RewriteRows,
+            "rewrite_columns" => MergeInsertWriteMode::RewriteColumns,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "Invalid write_mode: {other}. Expected one of \
+                     'auto', 'rewrite_rows', 'rewrite_columns'"
+                )));
+            }
+        };
+        slf.builder.write_mode(mode);
         Ok(slf)
     }
 
@@ -570,6 +595,25 @@ impl MergeInsertBuilder {
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
         rt().block_on(None, job.analyze_plan(new_data_stream))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))
+    }
+
+    /// [`Self::analyze_plan`] for fully-materialized data.
+    ///
+    /// Routed to the same in-memory table `execute_batches` uses, so the reported
+    /// plan is the one such a source actually runs.
+    pub fn analyze_plan_batches(&mut self, new_data: &Bound<PyAny>) -> PyResult<String> {
+        let reader = convert_reader(new_data)?;
+        let batches = reader
+            .collect::<std::result::Result<Vec<RecordBatch>, _>>()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let job = self
+            .builder
+            .clone()
+            .try_build()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        rt().block_on(None, job.analyze_plan_batches(batches))?
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
@@ -796,6 +840,7 @@ impl Dataset {
         delete_unverified: Option<bool>,
         error_if_tagged_old_versions: Option<bool>,
         delete_rate_limit: Option<u64>,
+        versions: Option<Vec<u64>>,
     ) -> lance_core::Result<lance::dataset::cleanup::CleanupPolicy> {
         let mut builder = CleanupPolicyBuilder::default();
         if let Some(v) = older_than_micros {
@@ -814,6 +859,9 @@ impl Dataset {
         if let Some(v) = delete_rate_limit {
             builder = builder.delete_rate_limit(v)?;
         }
+        if let Some(v) = versions {
+            builder = builder.versions(v)?;
+        }
         Ok(builder.build())
     }
 }
@@ -826,6 +874,7 @@ fn cleanup_stats(stats: lance::dataset::cleanup::RemovalStats) -> CleanupStats {
         transaction_files_removed: stats.transaction_files_removed,
         index_files_removed: stats.index_files_removed,
         deletion_files_removed: stats.deletion_files_removed,
+        failed_deletes: stats.failed_deletes,
     }
 }
 
@@ -1178,7 +1227,7 @@ impl Dataset {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, search_filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, batch_size_bytes=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, index_segments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, blob_handling=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None, substrait_aggregate=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, search_filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, batch_size_bytes=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, index_segments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, blob_handling=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None, substrait_aggregate=None, row_addr_allowlist=None, row_addr_blocklist=None, minhash_query=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -1212,6 +1261,9 @@ impl Dataset {
         order_by: Option<Vec<PyLance<ColumnOrdering>>>,
         disable_scoring_autoprojection: Option<bool>,
         substrait_aggregate: Option<Vec<u8>>,
+        row_addr_allowlist: Option<Vec<u8>>,
+        row_addr_blocklist: Option<Vec<u8>>,
+        minhash_query: Option<&Bound<PyDict>>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
 
@@ -1347,6 +1399,18 @@ impl Dataset {
         if let Some(prefilter) = prefilter {
             scanner.prefilter(prefilter);
         }
+        // Serialized RowAddrTreeMap payloads rather than an object: a mask built by
+        // another extension module cannot hand over a Rust value, but both sides
+        // agree on this encoding. RowAddrMask::from_serialized_parts is the shared
+        // entry point, so no binding has to reimplement the allow/block combination.
+        if let Some(mask) = RowAddrMask::from_serialized_parts(
+            row_addr_allowlist.as_deref(),
+            row_addr_blocklist.as_deref(),
+        )
+        .infer_error()?
+        {
+            scanner.with_row_addr_prefilter(mask);
+        }
 
         scanner
             .limit(limit, offset)
@@ -1480,17 +1544,21 @@ impl Dataset {
             let (_, element_type) = get_vector_type(self_.ds.schema(), &column)
                 .map_err(|e| PyValueError::new_err(e.to_string()))?;
             let scanner = match element_type {
-                DataType::UInt8
-                    if !matches!(
-                        q.data_type(),
-                        DataType::List(_) | DataType::FixedSizeList(_, _)
-                    ) =>
-                {
-                    let q = arrow::compute::cast(&q, &DataType::UInt8).map_err(|e| {
+                DataType::UInt8 => {
+                    let query_type = match q.data_type() {
+                        DataType::List(field) => DataType::List(Arc::new(
+                            field.as_ref().clone().with_data_type(DataType::UInt8),
+                        )),
+                        DataType::FixedSizeList(field, dimension) => DataType::FixedSizeList(
+                            Arc::new(field.as_ref().clone().with_data_type(DataType::UInt8)),
+                            *dimension,
+                        ),
+                        _ => DataType::UInt8,
+                    };
+                    let q = arrow::compute::cast(&q, &query_type).map_err(|e| {
                         PyValueError::new_err(format!("Failed to cast q to binary vector: {}", e))
                     })?;
-                    let q = q.as_primitive::<UInt8Type>();
-                    scanner.nearest(&column, q, k)
+                    scanner.nearest(&column, q.as_ref(), k)
                 }
                 _ => scanner.nearest(&column, &q, k),
             };
@@ -1558,6 +1626,25 @@ impl Dataset {
         if let Some(aggregate_bytes) = substrait_aggregate {
             scanner
                 .aggregate(AggregateExpr::substrait(aggregate_bytes))
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+        if let Some(minhash_query) = minhash_query {
+            let column: String = minhash_query
+                .get_item("column")?
+                .ok_or_else(|| PyKeyError::new_err("MinHash query must specify a column"))?
+                .extract()?;
+            let text: String = minhash_query
+                .get_item("text")?
+                .ok_or_else(|| PyKeyError::new_err("MinHash query must specify text"))?
+                .extract()?;
+            if limit.is_none() {
+                // Same default as the vector `nearest` path when no limit is given
+                scanner
+                    .limit(Some(10), offset)
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            }
+            scanner
+                .minhash_search(MinHashQuery::new(text, column))
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         let scan = Arc::new(scanner);
@@ -1941,13 +2028,14 @@ impl Dataset {
         Ok(dict.into())
     }
 
-    #[pyo3(signature=(updates, predicate=None, conflict_retries=None, retry_timeout=None))]
+    #[pyo3(signature=(updates, predicate=None, conflict_retries=None, retry_timeout=None, data_storage_version=None))]
     fn update(
         &mut self,
         updates: &Bound<'_, PyDict>,
         predicate: Option<&str>,
         conflict_retries: Option<u32>,
         retry_timeout: Option<std::time::Duration>,
+        data_storage_version: Option<&str>,
     ) -> PyResult<Py<PyAny>> {
         let mut builder = UpdateBuilder::new(self.ds.clone());
         if let Some(predicate) = predicate {
@@ -1962,6 +2050,10 @@ impl Dataset {
 
         if let Some(timeout) = retry_timeout {
             builder = builder.retry_timeout(timeout);
+        }
+
+        if let Some(version) = data_storage_version {
+            builder = builder.data_storage_version(version.parse().infer_error()?);
         }
 
         for (key, value) in updates {
@@ -2129,6 +2221,38 @@ impl Dataset {
         })
     }
 
+    /// Deep clone the selected version into a new dataset.
+    #[pyo3(signature = (target_path, reference, storage_options=None))]
+    fn deep_clone(
+        &mut self,
+        py: Python,
+        target_path: String,
+        reference: Option<Bound<PyAny>>,
+        storage_options: Option<HashMap<String, String>>,
+    ) -> PyResult<Self> {
+        let store_params = storage_options.as_ref().map(|opts| ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(
+                lance::io::StorageOptionsAccessor::with_static_options(opts.clone()),
+            )),
+            ..Default::default()
+        });
+
+        let mut new_self = self.ds.as_ref().clone();
+        let reference = self.transform_ref(reference)?;
+        let ds = rt()
+            .block_on(
+                Some(py),
+                new_self.deep_clone(&target_path, reference, store_params),
+            )?
+            .map_err(|err: Error| PyIOError::new_err(err.to_string()))?;
+
+        let uri = ds.uri().to_string();
+        Ok(Self {
+            ds: Arc::new(ds),
+            uri,
+        })
+    }
+
     fn restore(&mut self) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
         rt().block_on(None, new_self.restore())?
@@ -2147,7 +2271,7 @@ impl Dataset {
     }
 
     /// Cleanup old versions from the dataset
-    #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None, delete_rate_limit = None))]
+    #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None, delete_rate_limit = None, versions = None))]
     fn cleanup_old_versions(
         &self,
         older_than_micros: Option<i64>,
@@ -2155,6 +2279,7 @@ impl Dataset {
         delete_unverified: Option<bool>,
         error_if_tagged_old_versions: Option<bool>,
         delete_rate_limit: Option<u64>,
+        versions: Option<Vec<u64>>,
     ) -> PyResult<CleanupStats> {
         let stats = rt()
             .block_on(None, async {
@@ -2165,6 +2290,7 @@ impl Dataset {
                         delete_unverified,
                         error_if_tagged_old_versions,
                         delete_rate_limit,
+                        versions,
                     )
                     .await?;
                 self.ds.cleanup_with_policy(policy).await
@@ -2175,7 +2301,7 @@ impl Dataset {
 
     /// Explain cleanup old versions from the dataset without deleting files
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None, delete_rate_limit = None, include_files = false, max_files = 1000))]
+    #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None, delete_rate_limit = None, versions = None, include_files = false, max_files = 1000))]
     fn explain_cleanup_old_versions(
         &self,
         older_than_micros: Option<i64>,
@@ -2183,6 +2309,7 @@ impl Dataset {
         delete_unverified: Option<bool>,
         error_if_tagged_old_versions: Option<bool>,
         delete_rate_limit: Option<u64>,
+        versions: Option<Vec<u64>>,
         include_files: bool,
         max_files: usize,
     ) -> PyResult<CleanupExplanation> {
@@ -2195,6 +2322,7 @@ impl Dataset {
                         delete_unverified,
                         error_if_tagged_old_versions,
                         delete_rate_limit,
+                        versions,
                     )
                     .await?;
                 self.ds
@@ -2444,6 +2572,9 @@ impl Dataset {
         if let Some(kwargs) = kwargs {
             if let Some(num_indices_to_merge) = kwargs.get_item("num_indices_to_merge")? {
                 options.num_indices_to_merge = num_indices_to_merge.extract()?;
+            }
+            if let Some(retrain) = kwargs.get_item("retrain")? {
+                options.retrain = retrain.extract()?;
             }
             if let Some(index_names) = kwargs.get_item("index_names")? {
                 options.index_names = Some(
@@ -2912,6 +3043,9 @@ impl Dataset {
         rt().spawn(None, async move {
             let (object_store, path) =
                 object_store_from_uri_or_path(&dest, storage_options).await?;
+            validate_dataset_root_for_drop(&object_store, &path)
+                .await
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
             let result = object_store.remove_dir_all(path).await;
 
             match result {
@@ -3178,7 +3312,7 @@ impl Dataset {
                 new_self.add_columns(transforms, None, batch_size).await?;
                 Ok(new_self)
             })?
-            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+            .io_or_commit_conflict_error()?;
         self.ds = Arc::new(new_self);
 
         Ok(())
@@ -3202,7 +3336,7 @@ impl Dataset {
                     .await?;
                 Ok(new_self)
             })?
-            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+            .io_or_commit_conflict_error()?;
         self.ds = Arc::new(new_self);
 
         Ok(())
@@ -3220,7 +3354,7 @@ impl Dataset {
                 new_self.add_columns(transform, None, None).await?;
                 Ok(new_self)
             })?
-            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+            .io_or_commit_conflict_error()?;
         self.ds = Arc::new(new_self);
         Ok(())
     }
@@ -3244,6 +3378,55 @@ impl Dataset {
             stream,
         )));
         Ok(PyArrowType(reader))
+    }
+
+    fn find_duplicate_pairs(
+        &self,
+        py: Python<'_>,
+        column: &str,
+        distance_threshold: f32,
+    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        let stream = rt()
+            .block_on(
+                Some(py),
+                lance::index::vector::dedup::find_duplicate_pairs(
+                    self.ds.clone(),
+                    column,
+                    distance_threshold,
+                ),
+            )?
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        Ok(PyArrowType(Box::new(LanceReader::from_stream(
+            DatasetRecordBatchStream::new(stream),
+        ))))
+    }
+
+    fn find_duplicate_pairs_in_partition(
+        &self,
+        py: Python<'_>,
+        column: &str,
+        segment_id: &str,
+        partition_id: usize,
+        distance_threshold: f32,
+    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        let segment_id = uuid::Uuid::parse_str(segment_id).map_err(|err| {
+            PyValueError::new_err(format!("invalid segment_id '{segment_id}': {err}"))
+        })?;
+        let stream = rt()
+            .block_on(
+                Some(py),
+                lance::index::vector::dedup::find_duplicate_pairs_in_partition(
+                    self.ds.clone(),
+                    column,
+                    segment_id,
+                    partition_id,
+                    distance_threshold,
+                ),
+            )?
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        Ok(PyArrowType(Box::new(LanceReader::from_stream(
+            DatasetRecordBatchStream::new(stream),
+        ))))
     }
 
     #[pyo3(signature = (*, min_version=None, progress=None))]
@@ -4106,6 +4289,20 @@ impl SqlQueryBuilder {
         })
     }
 
+    #[pyo3(signature = (batch_size))]
+    fn batch_size(&self, batch_size: usize) -> Self {
+        Self {
+            builder: self.builder.clone().batch_size(batch_size),
+        }
+    }
+
+    #[pyo3(signature = (batch_size_bytes))]
+    fn batch_size_bytes(&self, batch_size_bytes: u64) -> Self {
+        Self {
+            builder: self.builder.clone().batch_size_bytes(batch_size_bytes),
+        }
+    }
+
     /// Build the SQL query.
     fn build(&self) -> PyResult<SqlQuery> {
         Ok(SqlQuery {
@@ -4150,6 +4347,18 @@ impl DatasetDelta {
         use arrow_array::RecordBatchReader;
         let stream = rt()
             .block_on(None, self.inner.get_updated_rows())?
+            .infer_error()?;
+        let reader: Box<dyn RecordBatchReader + Send> = Box::new(LanceReader::from_stream(stream));
+        reader.into_pyarrow(py)
+    }
+    /// Get the row ids deleted between begin_version (exclusive) and end_version (inclusive) as a stream reader.
+    ///
+    /// Requires stable row ids on the dataset.
+    fn get_deleted_row_ids<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        use arrow::pyarrow::IntoPyArrow;
+        use arrow_array::RecordBatchReader;
+        let stream = rt()
+            .block_on(None, self.inner.get_deleted_row_ids())?
             .infer_error()?;
         let reader: Box<dyn RecordBatchReader + Send> = Box::new(LanceReader::from_stream(stream));
         reader.into_pyarrow(py)
@@ -4571,6 +4780,21 @@ impl Dataset {
     }
 }
 
+/// Serialize row addresses into the payload the scanner's `row_addr_allowlist` /
+/// `row_addr_blocklist` parameters accept.
+///
+/// Without this those parameters are unusable from Python: they take the roaring
+/// `RowAddrTreeMap` encoding, which nothing else exposed here can produce. The
+/// result stays plain bytes, so a mask may equally be built by another extension
+/// module and handed in.
+#[pyfunction(name = "_serialize_row_addrs")]
+pub fn serialize_row_addrs(py: Python<'_>, addrs: Vec<u64>) -> PyResult<Py<PyBytes>> {
+    let treemap = RowAddrTreeMap::from_iter(addrs);
+    let mut buf = Vec::with_capacity(treemap.serialized_size());
+    treemap.serialize_into(&mut buf).infer_error()?;
+    Ok(PyBytes::new(py, &buf).unbind())
+}
+
 #[pyfunction(name = "_write_dataset")]
 pub fn write_dataset(
     reader: &Bound<'_, PyAny>,
@@ -4668,6 +4892,15 @@ pub fn get_write_params(
         }
         if let Some(maybe_nbytes) = get_dict_opt::<usize>(options, "max_bytes_per_file")? {
             p.max_bytes_per_file = maybe_nbytes;
+        }
+        let data_cache_bytes = get_dict_opt::<u64>(options, "data_cache_bytes")?;
+        let max_page_bytes = get_dict_opt::<u64>(options, "max_page_bytes")?;
+        if data_cache_bytes.is_some() || max_page_bytes.is_some() {
+            p.file_writer_options = Some(FileWriterOptions {
+                data_cache_bytes,
+                max_page_bytes,
+                ..Default::default()
+            });
         }
         if let Some(data_storage_version) = get_dict_opt::<String>(options, "data_storage_version")?
         {

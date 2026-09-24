@@ -15,6 +15,8 @@ use lance_table::io::commit::ManifestNamingScheme;
 use crate::dataset::write::{CommitBuilder, WriteMode, WriteParams};
 use arrow_array::RecordBatch;
 use arrow_array::RecordBatchReader;
+use arrow_array::cast::AsArray;
+use arrow_array::types::UInt64Type;
 use arrow_array::{RecordBatchIterator, UInt32Array, types::Int32Type};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_core::utils::tempfile::{TempDir, TempStdDir, TempStrDir};
@@ -300,6 +302,94 @@ async fn test_stale_checks_cover_fast_successor_and_latest_version(
     );
     assert!(historical.is_stale().await.unwrap());
     assert!(historical.has_successor_version().await.unwrap());
+}
+
+/// All row ids visible in `dataset`, in scan order.
+async fn scan_row_ids(dataset: &Dataset) -> Vec<u64> {
+    let batch = dataset
+        .scan()
+        .with_row_id()
+        .project(&["i"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    batch["_rowid"]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .to_vec()
+}
+
+fn u32_batch(values: std::ops::Range<u32>) -> RecordBatch {
+    arrow_array::record_batch!(("i", UInt32, values.collect::<Vec<u32>>())).unwrap()
+}
+
+/// Restoring past activation would turn stable row ids off, putting row
+/// addresses back into a namespace this table has already issued ids from.
+#[tokio::test]
+async fn test_restore_rejects_crossing_stable_id_activation() {
+    let test_uri = TempStrDir::default();
+    let batch = u32_batch(0..10);
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        test_uri.as_str(),
+        None,
+    )
+    .await
+    .unwrap();
+    dataset.migrate_to_stable_row_ids().await.unwrap();
+
+    let mut restored = dataset.checkout_version(1).await.unwrap();
+    let err = restored.restore().await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("stable row ids were enabled after"),
+        "{err}"
+    );
+}
+
+/// A restore must not rewind the row-id high-water mark, or the next append reuses old ids.
+#[tokio::test]
+async fn test_restore_preserves_row_id_high_water_mark() {
+    let test_uri = TempStrDir::default();
+    let write = |values: std::ops::Range<u32>, mode| {
+        let uri = test_uri.as_str().to_string();
+        async move {
+            let batch = u32_batch(values);
+            Dataset::write(
+                RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+                &uri,
+                Some(WriteParams {
+                    mode,
+                    enable_stable_row_ids: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    write(0..10, WriteMode::Create).await;
+    let appended = write(10..20, WriteMode::Append).await;
+    let mark = appended.manifest.next_row_id;
+
+    let mut restored = appended.checkout_version(1).await.unwrap();
+    restored.restore().await.unwrap();
+    assert!(
+        restored.manifest.next_row_id >= mark,
+        "restore rewound the row id high-water mark: {} < {mark}",
+        restored.manifest.next_row_id
+    );
+
+    // The rows appended after the restore must not reuse the dropped rows' ids.
+    let reused = write(20..30, WriteMode::Append).await;
+    let ids = scan_row_ids(&reused).await;
+    assert_eq!(
+        ids.iter().filter(|id| **id >= mark).count(),
+        10,
+        "appended rows did not all take fresh ids past {mark}: {ids:?}"
+    );
 }
 
 #[rstest]
@@ -838,14 +928,14 @@ async fn test_commit_on_dataset_with_mixed_file_versions() {
     // A v0.16 dataset that has both v1 and v2 files also has two fragments with
     // id 1, because the id allocation of that era could hand out an id a caller
     // had already supplied. The mixture is the more actionable diagnosis, so the
-    // duplicate check must not preempt it.
+    // duplicate check must not preempt it during commit.
     let test_dir = copy_test_data_to_tmp("v0.16.0/wrong_data_version_no_fix.lance").unwrap();
     let mut dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
     let ids = dataset
         .manifest
         .fragments
         .iter()
-        .map(|f| f.id)
+        .map(|fragment| fragment.id)
         .collect::<Vec<_>>();
     assert_eq!(ids, vec![0, 1, 1, 2]);
 
@@ -1210,6 +1300,21 @@ async fn test_branch() {
     assert_eq!(tag_open.version().version, 3);
     assert_eq!(tag_open.count_rows(None).await.unwrap(), 100);
 
+    // Opening a branch URI with a tag pointing to a non-latest version on that same branch must check out the tag's version.
+    main_dataset
+        .tags()
+        .create("tag_branch1_v1", ("branch1", 1))
+        .await
+        .unwrap();
+    let branch_tag_open = DatasetBuilder::from_uri(branch1_dataset.uri())
+        .with_tag("tag_branch1_v1")
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(branch_tag_open.manifest.branch.as_deref(), Some("branch1"));
+    assert_eq!(branch_tag_open.version().version, 1);
+    assert_eq!(branch_tag_open.count_rows(None).await.unwrap(), 50);
+
     // Malformed branch names are rejected at the boundary
     for bad_name in ["", "branch1/"] {
         let err = main_dataset
@@ -1299,6 +1404,7 @@ async fn test_branch() {
     assert!(!dataset.object_store.exists(&cleaned_path).await.unwrap());
 
     dataset.tags().delete("tag1").await.unwrap();
+    dataset.tags().delete("tag_branch1_v1").await.unwrap();
     dataset.delete_branch("dev/branch2").await.unwrap();
     dataset.delete_branch("branch1").await.unwrap();
 

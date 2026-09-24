@@ -18,6 +18,7 @@ import org.lance.cleanup.CleanupPolicy;
 import org.lance.cleanup.RemovalStats;
 import org.lance.compaction.CompactionOptions;
 import org.lance.delta.DatasetDelta;
+import org.lance.file.FileWriteOptions;
 import org.lance.index.Index;
 import org.lance.index.IndexBuildProgress;
 import org.lance.index.IndexCriteria;
@@ -70,6 +71,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 
 /**
@@ -90,7 +92,13 @@ public class Dataset implements Closeable {
   private Session session;
   private boolean ownsSession = false;
 
-  private final LockManager lockManager = new LockManager();
+  /**
+   * Serializes create/merge index builds on this Dataset handle. Always acquire the lifecycle read
+   * lock first so a queued close cannot deadlock a reentrant read-lock owner.
+   */
+  private final ReentrantLock indexBuildLock = new ReentrantLock();
+
+  private final LockManager lockManager = new LockManager(this);
 
   private Dataset() {}
 
@@ -164,7 +172,8 @@ public class Dataset implements Closeable {
               params.getInitialBases(),
               params.getTargetBases(),
               params.getAllowExternalBlobOutsideBases(),
-              params.getBlobPackFileSizeThreshold());
+              params.getBlobPackFileSizeThreshold(),
+              params.getFileWriteOptions());
       dataset.allocator = allocator;
       return dataset;
     }
@@ -213,7 +222,8 @@ public class Dataset implements Closeable {
       Optional<List<BasePath>> initialBases,
       Optional<List<String>> targetBases,
       Optional<Boolean> allowExternalBlobOutsideBases,
-      Optional<Long> blobPackFileSizeThreshold);
+      Optional<Long> blobPackFileSizeThreshold,
+      FileWriteOptions fileWriteOptions);
 
   /**
    * Creates a dataset from an FFI arrow stream.
@@ -252,6 +262,7 @@ public class Dataset implements Closeable {
       Optional<List<String>> targetBases,
       Optional<Boolean> allowExternalBlobOutsideBases,
       Optional<Long> blobPackFileSizeThreshold,
+      FileWriteOptions fileWriteOptions,
       LanceNamespace namespaceClient,
       List<String> tableId,
       boolean namespaceClientManagedVersioning);
@@ -304,6 +315,7 @@ public class Dataset implements Closeable {
             params.getTargetBases(),
             params.getAllowExternalBlobOutsideBases(),
             params.getBlobPackFileSizeThreshold(),
+            params.getFileWriteOptions(),
             namespaceClient,
             tableId,
             namespaceClientManagedVersioning);
@@ -665,10 +677,19 @@ public class Dataset implements Closeable {
   }
 
   /**
-   * Drop a Dataset.
+   * Drop a Dataset, deleting everything under {@code path} recursively.
+   *
+   * <p>To limit the damage a mistyped or misconfigured path can do, {@code path} must be a dataset
+   * root, meaning it holds a manifest that can be read, or a namespace declare/deregister marker.
+   * Anything else throws {@link IllegalArgumentException}, including a path that holds only data
+   * files or only unreadable manifests: such leftovers need an explicit storage-level delete.
+   *
+   * <p>Note that a path which passes this check is deleted in full, including any unmanaged files
+   * kept next to the dataset.
    *
    * @param path The file path of the dataset
    * @param storageOptions Storage options
+   * @throws IllegalArgumentException if {@code path} is not a Lance dataset root
    */
   public static native void drop(String path, Map<String, String> storageOptions);
 
@@ -1040,7 +1061,7 @@ public class Dataset implements Closeable {
    * @return the latest version of the dataset.
    */
   public long latestVersion() {
-    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
       return nativeGetLatestVersionId();
     }
@@ -1105,13 +1126,7 @@ public class Dataset implements Closeable {
     Preconditions.checkArgument(version > 0, "version number must be greater than 0");
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      Dataset newDataset = nativeCheckoutVersion(version);
-      if (selfManagedAllocator) {
-        newDataset.allocator = new RootAllocator(Long.MAX_VALUE);
-      } else {
-        newDataset.allocator = allocator;
-      }
-      return newDataset;
+      return initializeCheckoutDataset(nativeCheckoutVersion(version));
     }
   }
 
@@ -1128,17 +1143,22 @@ public class Dataset implements Closeable {
     Preconditions.checkArgument(tag != null, "Tag can not be null");
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      Dataset newDataset = nativeCheckoutTag(tag);
-      if (selfManagedAllocator) {
-        newDataset.allocator = new RootAllocator(Long.MAX_VALUE);
-      } else {
-        newDataset.allocator = allocator;
-      }
-      return newDataset;
+      return initializeCheckoutDataset(nativeCheckoutTag(tag));
     }
   }
 
   private native Dataset nativeCheckoutTag(String tag);
+
+  private Dataset initializeCheckoutDataset(Dataset checkedOutDataset) {
+    if (selfManagedAllocator) {
+      checkedOutDataset.allocator = new RootAllocator(Long.MAX_VALUE);
+    } else {
+      checkedOutDataset.allocator = allocator;
+    }
+    checkedOutDataset.session = Session.fromHandle(checkedOutDataset.nativeGetSessionHandle());
+    checkedOutDataset.ownsSession = true;
+    return checkedOutDataset;
+  }
 
   /**
    * Restore the currently checked out version of the dataset as the latest version. This operation
@@ -1181,22 +1201,93 @@ public class Dataset implements Closeable {
   /**
    * Creates a new index on the dataset.
    *
+   * <p>Concurrent {@link #createIndex} / {@link #mergeIndexMetadata} calls on the same Dataset
+   * handle are serialized.
+   *
    * @param options options for building index
    * @return the metadata of the created index
    */
   public Index createIndex(IndexOptions options) {
+    Preconditions.checkNotNull(options, "options cannot be null");
+    return createIndexInternal(options, null);
+  }
+
+  /**
+   * Creates a new index on the dataset while reporting stage-level progress.
+   *
+   * <p>Stage names, work units, and whether a total is available depend on the index type. The
+   * callback must be thread-safe because Lance may invoke it concurrently from native runtime
+   * threads. Callbacks may re-enter read-only methods on this Dataset. Conflicting write re-entry
+   * from a callback is rejected; unrelated concurrent callers keep their normal wait behavior.
+   * Concurrent {@link #createIndex} / {@link #mergeIndexMetadata} calls on the same Dataset handle
+   * are serialized.
+   *
+   * <pre>{@code
+   * Index index = dataset.createIndex(options, new IndexBuildProgress() {
+   *   public void stageStart(String stage, Optional<Long> total, String unit) { }
+   *   public void stageProgress(String stage, long completed) { }
+   *   public void stageComplete(String stage) { }
+   * });
+   * }</pre>
+   *
+   * @param options options for building index
+   * @param progress thread-safe progress callback
+   * @return the metadata of the created index
+   */
+  public Index createIndex(IndexOptions options, IndexBuildProgress progress) {
+    Preconditions.checkNotNull(options, "options cannot be null");
+    Preconditions.checkNotNull(progress, "progress cannot be null");
+    return createIndexInternal(options, progress);
+  }
+
+  private Index createIndexInternal(IndexOptions options, IndexBuildProgress progress) {
+    if (ContextIndexBuildProgress.isActive(this)) {
+      throw new IllegalStateException("Dataset is busy in an index progress callback");
+    }
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeCreateIndex(
-          options.getColumns(),
-          options.getIndexType().getValue(),
-          options.getIndexName(),
-          options.getIndexParams(),
-          options.isReplace(),
-          options.isTrain(),
-          options.getFragmentIds(),
-          options.getIndexUUID(),
-          options.getPreprocessedData().map(ArrowArrayStream::memoryAddress));
+      acquireIndexBuildLock();
+      try {
+        if (progress == null) {
+          return nativeCreateIndex(
+              options.getColumns(),
+              options.getIndexType().getValue(),
+              options.getIndexName(),
+              options.getIndexParams(),
+              options.isReplace(),
+              options.isTrain(),
+              options.getFragmentIds(),
+              options.getIndexUUID(),
+              options.getPreprocessedData().map(ArrowArrayStream::memoryAddress));
+        }
+        return nativeCreateIndexWithProgress(
+            options.getColumns(),
+            options.getIndexType().getValue(),
+            options.getIndexName(),
+            options.getIndexParams(),
+            options.isReplace(),
+            options.isTrain(),
+            options.getFragmentIds(),
+            options.getIndexUUID(),
+            options.getPreprocessedData().map(ArrowArrayStream::memoryAddress),
+            new ContextIndexBuildProgress(this, progress));
+      } finally {
+        indexBuildLock.unlock();
+      }
+    }
+  }
+
+  private void acquireIndexBuildLock() {
+    if (ContextIndexBuildProgress.isCallbackActive()) {
+      // An outer index build waits for its callback to return, so waiting here could create a
+      // cross-Dataset lock cycle between two concurrent builds.
+      if (!indexBuildLock.tryLock()) {
+        throw new IllegalStateException(
+            "Dataset is busy with an index build and cannot start another build "
+                + "from an index progress callback");
+      }
+    } else {
+      indexBuildLock.lock();
     }
   }
 
@@ -1210,6 +1301,18 @@ public class Dataset implements Closeable {
       Optional<List<Integer>> fragments,
       Optional<String> indexUUID,
       Optional<Long> arrowStreamMemoryAddress);
+
+  private native Index nativeCreateIndexWithProgress(
+      List<String> columns,
+      int indexTypeCode,
+      Optional<String> name,
+      IndexParams params,
+      boolean replace,
+      boolean train,
+      Optional<List<Integer>> fragments,
+      Optional<String> indexUUID,
+      Optional<Long> arrowStreamMemoryAddress,
+      IndexBuildProgress progress);
 
   /**
    * Drop an index by name.
@@ -1228,7 +1331,7 @@ public class Dataset implements Closeable {
 
   public void mergeIndexMetadata(
       String indexUUID, IndexType indexType, Optional<Integer> batchReadHead) {
-    innerMergeIndexMetadata(indexUUID, indexType.getValue(), batchReadHead);
+    mergeIndexMetadataInternal(indexUUID, indexType, batchReadHead, null);
   }
 
   private native void innerMergeIndexMetadata(
@@ -1236,6 +1339,10 @@ public class Dataset implements Closeable {
 
   /**
    * Merge distributed index metadata while reporting stage-level progress.
+   *
+   * <p>Callback re-entry semantics match {@link #createIndex(IndexOptions, IndexBuildProgress)}:
+   * read-only Dataset methods are allowed, conflicting write re-entry is rejected, and concurrent
+   * create/merge builds on this handle are serialized.
    *
    * @param indexUUID shared UUID used by the distributed index parts
    * @param indexType type of index metadata to merge
@@ -1248,7 +1355,34 @@ public class Dataset implements Closeable {
       Optional<Integer> batchReadHead,
       IndexBuildProgress progress) {
     Preconditions.checkNotNull(progress, "progress cannot be null");
-    innerMergeIndexMetadataWithProgress(indexUUID, indexType.getValue(), batchReadHead, progress);
+    mergeIndexMetadataInternal(indexUUID, indexType, batchReadHead, progress);
+  }
+
+  private void mergeIndexMetadataInternal(
+      String indexUUID,
+      IndexType indexType,
+      Optional<Integer> batchReadHead,
+      IndexBuildProgress progress) {
+    if (ContextIndexBuildProgress.isActive(this)) {
+      throw new IllegalStateException("Dataset is busy in an index progress callback");
+    }
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      acquireIndexBuildLock();
+      try {
+        if (progress == null) {
+          innerMergeIndexMetadata(indexUUID, indexType.getValue(), batchReadHead);
+        } else {
+          innerMergeIndexMetadataWithProgress(
+              indexUUID,
+              indexType.getValue(),
+              batchReadHead,
+              new ContextIndexBuildProgress(this, progress));
+        }
+      } finally {
+        indexBuildLock.unlock();
+      }
+    }
   }
 
   private native void innerMergeIndexMetadataWithProgress(
@@ -1408,34 +1542,38 @@ public class Dataset implements Closeable {
   private native List<FragmentMetadata> getFragmentsNative();
 
   /**
+   * Returns the storage bases registered by the current manifest.
+   *
+   * <p>Files without a base id resolve against this dataset's own URI. Files with a base id resolve
+   * against the matching entry in this list.
+   */
+  public List<BasePath> getBasePaths() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetBasePaths();
+    }
+  }
+
+  private native List<BasePath> nativeGetBasePaths();
+
+  /**
    * Get per-fragment statistics for all fragments in this dataset version.
    *
    * <p>Unlike {@link #getFragments()}, this is a metadata-only bulk operation: no per-fragment Java
-   * objects are materialized, making it suitable for planning over datasets with a very large
-   * number of fragments. Row counts match {@link FragmentMetadata#getNumRows()} (physical rows
-   * minus deleted rows).
+   * objects are materialized, and native code fills the returned primitive arrays directly. This
+   * makes it suitable for planning over datasets with a very large number of fragments. Row counts
+   * match {@link FragmentMetadata#getNumRows()} (physical rows minus deleted rows).
    *
    * @return per-fragment statistics as parallel arrays, in manifest order
    */
   public FragmentStatistics getFragmentStatistics() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      // Flattened as [id0, rowCount0, dataFileNum0, id1, ...] to keep the JNI surface primitive
-      long[] flat = nativeGetFragmentStatistics();
-      int count = flat.length / 3;
-      int[] ids = new int[count];
-      long[] rowCounts = new long[count];
-      int[] dataFileNums = new int[count];
-      for (int i = 0; i < count; i++) {
-        ids[i] = (int) flat[3 * i];
-        rowCounts[i] = flat[3 * i + 1];
-        dataFileNums[i] = (int) flat[3 * i + 2];
-      }
-      return new FragmentStatistics(ids, rowCounts, dataFileNums);
+      return nativeGetFragmentStatistics();
     }
   }
 
-  private native long[] nativeGetFragmentStatistics();
+  private native FragmentStatistics nativeGetFragmentStatistics();
 
   /**
    * Gets the arrow schema of the dataset.
@@ -1693,6 +1831,9 @@ public class Dataset implements Closeable {
    */
   @Deprecated
   public void updateConfig(Map<String, String> tableConfig) {
+    if (ContextIndexBuildProgress.isActive(this)) {
+      throw new IllegalStateException("Dataset is busy in an index progress callback");
+    }
     UpdateMap configUpdate = UpdateMap.builder().updates(tableConfig).replace(true).build();
 
     UpdateConfig operation = UpdateConfig.builder().configUpdates(configUpdate).build();
@@ -1709,6 +1850,9 @@ public class Dataset implements Closeable {
    */
   @Deprecated
   public void deleteConfigKeys(Set<String> deleteKeys) {
+    if (ContextIndexBuildProgress.isActive(this)) {
+      throw new IllegalStateException("Dataset is busy in an index progress callback");
+    }
     Map<String, String> deleteMap = new HashMap<>();
     deleteKeys.forEach(key -> deleteMap.put(key, null));
     UpdateMap configUpdate = UpdateMap.builder().updates(deleteMap).replace(false).build();
@@ -1734,6 +1878,26 @@ public class Dataset implements Closeable {
 
     // Prevent the new dataset from closing the handle when it gets GC'd
     newDataset.nativeDatasetHandle = 0;
+  }
+
+  /**
+   * Acquires a shared read lock that pins the native dataset handle, blocking a concurrent {@link
+   * #close()} until the lock is released.
+   *
+   * <p>Any code that passes this {@link Dataset} into a native method must hold this lock for the
+   * whole native call; otherwise {@code close()} can release the native dataset mid-call and crash
+   * the JVM. The lock is reentrant and intended for try-with-resources use.
+   *
+   * @return the acquired read lock
+   * @throws IllegalArgumentException if the dataset is already closed
+   */
+  public LockManager.ReadLock acquireReadLock() {
+    LockManager.ReadLock readLock = lockManager.acquireReadLock();
+    if (nativeDatasetHandle == 0) {
+      readLock.close();
+      throw new IllegalArgumentException("Dataset is closed");
+    }
+    return readLock;
   }
 
   /**
@@ -1770,6 +1934,33 @@ public class Dataset implements Closeable {
 
   private native List<BlobFile> nativeTakeBlobsByIndices(List<Long> rowIndices, String column);
 
+  private static void checkReadBufferSize(long bufferSize) {
+    if (bufferSize < 0) {
+      throw new IllegalArgumentException("bufferSize must be non-negative");
+    }
+  }
+
+  static void setBlobReadBufferSize(List<BlobFile> blobs, long bufferSize) throws IOException {
+    try {
+      for (BlobFile blob : blobs) {
+        if (blob != null) {
+          blob.setReadBufferSize(bufferSize);
+        }
+      }
+    } catch (IOException | RuntimeException e) {
+      for (BlobFile blob : blobs) {
+        if (blob != null) {
+          try {
+            blob.close();
+          } catch (IOException | RuntimeException closeError) {
+            e.addSuppressed(closeError);
+          }
+        }
+      }
+      throw e;
+    }
+  }
+
   /**
    * Open {@link BlobFile} handles for given row IDs on a blob column. Names and semantics align
    * with Rust/Python.
@@ -1805,6 +1996,19 @@ public class Dataset implements Closeable {
   }
 
   /**
+   * Open {@link BlobFile} handles and set sequential read-ahead size.
+   *
+   * @param bufferSize sequential read-ahead size in bytes. {@code 0} disables read-ahead
+   */
+  public List<BlobFile> takeBlobs(List<Long> rowIds, String column, long bufferSize)
+      throws IOException {
+    checkReadBufferSize(bufferSize);
+    List<BlobFile> blobs = takeBlobs(rowIds, column);
+    setBlobReadBufferSize(blobs, bufferSize);
+    return blobs;
+  }
+
+  /**
    * Open {@link BlobFile} handles for given row indices on a blob column.
    *
    * <pre>{@code
@@ -1831,6 +2035,19 @@ public class Dataset implements Closeable {
           column != null && !column.isEmpty(), "column cannot be null or empty");
       return nativeTakeBlobsByIndices(rowIndices, column);
     }
+  }
+
+  /**
+   * Open {@link BlobFile} handles by row index and set sequential read-ahead size.
+   *
+   * @param bufferSize sequential read-ahead size in bytes. {@code 0} disables read-ahead
+   */
+  public List<BlobFile> takeBlobsByIndices(List<Long> rowIndices, String column, long bufferSize)
+      throws IOException {
+    checkReadBufferSize(bufferSize);
+    List<BlobFile> blobs = takeBlobsByIndices(rowIndices, column);
+    setBlobReadBufferSize(blobs, bufferSize);
+    return blobs;
   }
 
   /**
@@ -1915,13 +2132,7 @@ public class Dataset implements Closeable {
     Preconditions.checkNotNull(ref);
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      Dataset newDataset = nativeCheckout(ref);
-      if (selfManagedAllocator) {
-        newDataset.allocator = new RootAllocator(Long.MAX_VALUE);
-      } else {
-        newDataset.allocator = allocator;
-      }
-      return newDataset;
+      return initializeCheckoutDataset(nativeCheckout(ref));
     }
   }
 

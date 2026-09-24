@@ -27,7 +27,7 @@ pub use crate::metrics::MetricsCollector;
 pub use lance_index_core::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexFile, IndexReader, IndexStore, IndexWriter,
     LANCE_SCALAR_INDEX, OldIndexDataFilter, RowIdRemapper, ScalarIndex, ScalarIndexParams,
-    SearchResult, TrainingCriteria, TrainingOrdering, UpdateCriteria,
+    SearchOptions, SearchResult, TrainingCriteria, TrainingOrdering, UpdateCriteria,
 };
 
 pub mod bitmap;
@@ -39,6 +39,7 @@ pub mod inverted;
 pub mod json;
 pub mod label_list;
 pub mod lance_format;
+pub mod minhash_lsh;
 pub mod ngram;
 pub mod registry;
 #[cfg(feature = "geo")]

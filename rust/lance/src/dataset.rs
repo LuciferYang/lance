@@ -14,7 +14,6 @@ use lance_core::deepsize::DeepSizeOf;
 
 use crate::dataset::metadata::UpdateFieldMetadataBuilder;
 use crate::dataset::transaction::translate_schema_metadata_updates;
-use crate::index::DatasetIndexExt;
 use crate::session::caches::{DSMetadataCache, ManifestKey, TransactionKey};
 use crate::session::index_caches::DSIndexCache;
 use itertools::Itertools;
@@ -35,14 +34,13 @@ use lance_io::object_store::{
     WrappingObjectStore,
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
-use lance_io::traits::{WriteExt, Writer};
 use lance_io::utils::{
     CachedFileSize, read_last_block, read_message, read_metadata_offset, read_struct,
 };
 use lance_namespace::LanceNamespace;
 use lance_table::format::{
-    DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, MAGIC, Manifest, RowIdMeta,
-    pb, populate_manifest_schema_dictionaries,
+    DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, MAGIC, Manifest,
+    ManifestBuildConfig, RowIdMeta, pb, populate_manifest_schema_dictionaries,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation, ManifestNamingScheme,
@@ -65,12 +63,14 @@ use std::num::NonZero;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
 pub(crate) mod blob;
 pub(crate) mod branch_location;
 pub mod builder;
 pub mod cleanup;
+mod data_file;
+mod data_file_part;
 pub mod delta;
 pub mod files;
 pub mod fragment;
@@ -88,12 +88,36 @@ mod schema_evolution;
 pub mod sql;
 pub mod statistics;
 mod take;
-pub mod transaction;
+/// Transaction definitions for updating datasets
+///
+/// Prior to creating a new manifest, a transaction must be created representing
+/// the changes being made to the dataset. By representing them as incremental
+/// changes, we can detect whether concurrent operations are compatible with
+/// one another. We can also rebuild manifests when retrying committing a
+/// manifest.
+///
+/// The definitions live in [`lance_table::transaction`]: building a manifest from
+/// a transaction reads and writes only table metadata, so it belongs at the table
+/// layer. This module re-exports them at the path callers have always used.
+///
+/// For more details please refer to the
+/// [Transaction Specification](https://lance.org/format/table/transaction/#transaction-types).
+pub mod transaction {
+    pub use lance_table::transaction::{
+        DataOverlayGroup, DataReplacementGroup, Operation, ReadVersionState, RewriteGroup,
+        RewrittenIndex, Transaction, TransactionBuilder, UpdateMap, UpdateMapEntry, UpdateMode,
+        UpdatedFragmentOffsets, translate_config_updates, translate_schema_metadata_updates,
+        validate_operation,
+    };
+}
 pub mod udtf;
 pub mod updater;
 mod utils;
 pub(crate) mod versions;
 pub mod write;
+
+pub use data_file::DataFileTarget;
+pub use data_file_part::DataFilePart;
 
 pub(crate) use take::row_offsets_to_row_addresses;
 
@@ -104,16 +128,15 @@ use self::refs::Refs;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::statistics::DatasetStatistics;
 use self::transaction::{Operation, Transaction, TransactionBuilder, UpdateMapEntry};
-use self::write::{cleanup_data_fragments, write_fragments_internal};
+use self::write::cleanup_data_fragments;
 use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::cleanup::{CleanupOperation, CleanupPolicy, CleanupPolicyBuilder};
 use crate::dataset::refs::{BranchContents, BranchIdentifier, Branches, Tags};
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
-use crate::index::retain_supported_indices;
 use crate::io::commit::{
-    DEFAULT_COMMIT_RETRY_TIMEOUT, commit_detached_transaction, commit_new_dataset,
-    commit_transaction, detect_overlapping_fragments,
+    commit_detached_transaction, commit_new_dataset, commit_transaction,
+    default_commit_retry_timeout, detect_overlapping_fragments,
 };
 use crate::session::Session;
 use crate::utils::temporal::{SystemTime, timestamp_to_nanos, utc_now};
@@ -128,17 +151,20 @@ use lance_core::box_error;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_namespace::models::{DeclareTableRequest, DescribeTableRequest};
 use lance_table::feature_flags::{
-    apply_feature_flags, can_read_dataset, validate_mem_wal_index_catchup_flags,
+    apply_feature_flags, ensure_can_read_manifest, ensure_can_write_manifest,
+    validate_paired_feature_flags,
 };
 use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
+use lance_table::rowids::{RowIdSequence, write_row_ids};
+pub use overlay::writer::{OverlayWriter, WriteOverlayError};
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
 };
 pub use take::TakeBuilder;
 use uuid::Uuid;
 pub use write::merge_insert::{
-    MergeInsertBuilder, MergeInsertJob, MergeStats, UncommittedMergeInsert, WhenMatched,
-    WhenNotMatched, WhenNotMatchedBySource,
+    MergeInsertBuilder, MergeInsertJob, MergeInsertWriteMode, MergeStats, UncommittedMergeInsert,
+    WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
 };
 
 use crate::dataset::index::LanceIndexStoreExt;
@@ -153,6 +179,32 @@ pub use write::{
 pub(crate) const INDICES_DIR: &str = "_indices";
 pub(crate) const DATA_DIR: &str = "data";
 pub(crate) const TRANSACTIONS_DIR: &str = "_transactions";
+const DEFAULT_MAX_STREAM_COPY_PARALLELISM: usize = 4;
+
+fn parse_deep_clone_stream_concurrency(value: &str) -> Result<usize> {
+    value
+        .parse::<NonZero<usize>>()
+        .map(NonZero::get)
+        .map_err(|_| {
+            Error::invalid_input(format!(
+                "LANCE_DEEP_CLONE_STREAM_CONCURRENCY must be a positive integer, got {value:?}"
+            ))
+        })
+}
+
+fn deep_clone_copy_parallelism(
+    configured_io_parallelism: usize,
+    uses_streaming_copy: bool,
+    stream_copy_parallelism: Option<usize>,
+) -> usize {
+    if !uses_streaming_copy {
+        configured_io_parallelism
+    } else if let Some(value) = stream_copy_parallelism {
+        value
+    } else {
+        configured_io_parallelism.min(DEFAULT_MAX_STREAM_COPY_PARALLELISM)
+    }
+}
 
 // We default to 6GB for the index cache, since indices are often large but
 // worth caching.
@@ -197,7 +249,8 @@ pub struct Dataset {
     pub(crate) store_params: Option<Box<ObjectStoreParams>>,
     /// Optional runtime-only object store parameters keyed by base path URI.
     pub(crate) base_store_params: Option<Arc<HashMap<String, ObjectStoreParams>>>,
-    /// Object stores for additional base paths, shared across clones.
+    /// Object stores for additional base paths, normally shared across clones.
+    /// Applying new object store wrappers starts a fresh cache scope.
     pub(crate) base_object_stores: BaseObjectStores,
 }
 
@@ -740,19 +793,14 @@ impl Dataset {
             let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
             Manifest::try_from(lance_table::format::pb::Manifest::decode(message_data)?)
         } else {
-            read_struct(object_reader.as_ref(), offset).await
+            let mut manifest: Manifest = read_struct(object_reader.as_ref(), offset).await?;
+            manifest.detach_sparse_inline_row_ids(manifest_size - offset);
+            Ok(manifest)
         }?;
 
-        validate_mem_wal_index_catchup_flags(&manifest)?;
+        ensure_can_read_manifest(&manifest)?;
 
-        if !can_read_dataset(manifest.reader_feature_flags) {
-            let message = format!(
-                "This dataset cannot be read by this version of Lance. \
-                 Please upgrade Lance to read this dataset.\n Flags: {}",
-                manifest.reader_feature_flags
-            );
-            return Err(Error::not_supported_source(message.into()));
-        }
+        versions::check_manifest_storage_version(&mut manifest)?;
 
         // If indices were also in the last block, we can take the opportunity to
         // decode them now and cache them.
@@ -764,16 +812,21 @@ impl Dataset {
                 LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4]) as usize;
             let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
             let section = lance_table::format::pb::IndexSection::decode(message_data)?;
-            let mut indices: Vec<IndexMetadata> = section
+            // Cached unfiltered: this is the same cache the commit path reads
+            // from, and an index this build cannot decode still has to survive
+            // into the next manifest. Version filtering happens on the way out,
+            // in `DatasetIndexExt::load_indices`.
+            let indices: Vec<IndexMetadata> = section
                 .indices
                 .into_iter()
                 .map(IndexMetadata::try_from)
                 .collect::<Result<Vec<_>>>()?;
-            retain_supported_indices(&mut indices);
+            crate::index::warn_about_unsupported_indices(&indices);
             let ds_index_cache = session.index_cache.for_dataset(uri);
             let metadata_key = crate::session::index_caches::IndexMetadataKey {
                 version: manifest_location.version,
                 store_identity: &object_store.store_prefix,
+                e_tag: manifest_location.e_tag.as_deref(),
             };
             ds_index_cache
                 .insert_with_key(&metadata_key, Arc::new(indices))
@@ -789,16 +842,17 @@ impl Dataset {
             let message_len =
                 LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4]) as usize;
             let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
-            let transaction: Transaction =
-                lance_table::format::pb::Transaction::decode(message_data)?.try_into()?;
-
-            let metadata_cache = session.metadata_cache.for_dataset(uri);
-            let metadata_key = TransactionKey {
-                version: manifest_location.version,
-            };
-            metadata_cache
-                .insert_with_key(&metadata_key, Arc::new(transaction))
-                .await;
+            if let Some(transaction) =
+                decode_inline_transaction(message_data, manifest_location.version)
+            {
+                let metadata_cache = session.metadata_cache.for_dataset(uri);
+                let metadata_key = TransactionKey {
+                    version: manifest_location.version,
+                };
+                metadata_cache
+                    .insert_with_key(&metadata_key, Arc::new(transaction))
+                    .await;
+            }
         }
 
         populate_manifest_schema_dictionaries(&mut manifest, object_reader.as_ref()).await?;
@@ -825,6 +879,7 @@ impl Dataset {
             e_tag: manifest_location.e_tag.as_deref(),
         };
         if let Some(cached) = metadata_cache.get_with_key(&manifest_key).await {
+            ensure_can_read_manifest(&cached)?;
             return Ok(cached);
         }
         let loaded =
@@ -1184,35 +1239,13 @@ impl Dataset {
             .resolve_latest_location(&self.base, &self.object_store)
             .await?;
 
-        // Check if manifest is in cache before reading from storage
-        let manifest_key = ManifestKey {
-            version: location.version,
-            e_tag: location.e_tag.as_deref(),
-        };
-        let cached_manifest = self.metadata_cache.get_with_key(&manifest_key).await;
-        if let Some(cached_manifest) = cached_manifest {
-            return Ok((cached_manifest, location));
-        }
-
         if self.already_checked_out(&location, self.manifest.branch.as_deref()) {
+            ensure_can_read_manifest(&self.manifest)?;
             return Ok((self.manifest.clone(), self.manifest_location.clone()));
         }
-        let mut manifest = read_manifest(&self.object_store, &location.path, location.size).await?;
-        if manifest.schema.has_dictionary_types() {
-            let reader = if let Some(size) = location.size {
-                self.object_store
-                    .open_with_size(&location.path, size as usize)
-                    .await?
-            } else {
-                self.object_store.open(&location.path).await?
-            };
-            populate_manifest_schema_dictionaries(&mut manifest, reader.as_ref()).await?;
-        }
-        let manifest_arc = Arc::new(manifest);
-        self.metadata_cache
-            .insert_with_key(&manifest_key, manifest_arc.clone())
-            .await;
-        Ok((manifest_arc, location))
+        let manifest =
+            Self::get_manifest(&self.object_store, &location, &self.uri, &self.session).await?;
+        Ok((manifest, location))
     }
 
     /// Read the transaction file for this version of the dataset.
@@ -1684,7 +1717,7 @@ impl Dataset {
             &transaction,
             write_config,
             commit_config,
-            DEFAULT_COMMIT_RETRY_TIMEOUT,
+            default_commit_retry_timeout(),
             self.manifest_location.naming_scheme,
             None,
         )
@@ -2098,10 +2131,13 @@ impl Dataset {
         }
 
         let mut cloned = self.clone();
+        // Each wrapper application defines a new store lifetime. Keep base
+        // stores alive within the derived dataset without sharing stateful
+        // provider layers (such as an AIMD throttle) with other scopes.
+        cloned.base_object_stores = Default::default();
         let mut object_store = self.object_store.as_ref().clone();
         for wrapper in &wrappers {
-            object_store.inner =
-                wrapper.wrap(&object_store.store_prefix, object_store.inner.clone());
+            object_store.apply_wrapper(wrapper.as_ref());
         }
         cloned.object_store = Arc::new(object_store);
         cloned.refs = Refs::new(
@@ -2469,35 +2505,37 @@ impl Dataset {
         let base_path = self.manifest.base_paths.get(&base_id).ok_or_else(|| {
             Error::invalid_input(format!("Dataset base path with ID {} not found", base_id))
         })?;
-        // Cores are cached without wrappers; each resolution decorates the
-        // shared core with the caller's wrapper.
-        let mut core_params = self.store_params_for_base(Some(base_path));
-        let wrapper = core_params.object_store_wrapper.take();
+        let store_params = self.store_params_for_base(Some(base_path));
 
         let cell = {
             let mut stores = self.base_object_stores.lock().unwrap();
             stores.entry(base_id).or_default().clone()
         };
-        let core = cell
+        let store = cell
             .get_or_try_init(|| async {
-                let (store, _) = ObjectStore::from_uri_and_params(
-                    self.session.store_registry(),
-                    &base_path.path,
-                    &core_params,
-                )
-                .await?;
+                // Wrappers define a request or execution scope. Keep the
+                // fully resolved store in this dataset's OnceCell, but do not
+                // also put it in the global registry: provider-local state
+                // such as GCS AIMD token buckets must not cross that scope.
+                let (store, _) = if store_params.object_store_wrapper.is_some() {
+                    ObjectStore::from_uri_and_params_uncached(
+                        self.session.store_registry(),
+                        &base_path.path,
+                        &store_params,
+                    )
+                    .await?
+                } else {
+                    ObjectStore::from_uri_and_params(
+                        self.session.store_registry(),
+                        &base_path.path,
+                        &store_params,
+                    )
+                    .await?
+                };
                 Ok::<_, Error>(store)
             })
             .await?;
-
-        match wrapper {
-            Some(wrapper) => {
-                let mut store = core.as_ref().clone();
-                store.inner = wrapper.wrap(&store.store_prefix, store.inner.clone());
-                Ok(Arc::new(store))
-            }
-            None => Ok(core.clone()),
-        }
+        Ok(store.clone())
     }
 
     /// Resolve the object store for the primary dataset or an additional base.
@@ -2772,13 +2810,8 @@ impl Dataset {
     }
 
     pub fn get_fragment(&self, fragment_id: usize) -> Option<FileFragment> {
-        let dataset = Arc::new(self.clone());
-        let fragment = self
-            .manifest
-            .fragments
-            .iter()
-            .find(|f| f.id == fragment_id as u64)?;
-        Some(FileFragment::new(dataset, fragment.clone()))
+        let metadata = self.find_fragment(fragment_id as u64)?.clone();
+        Some(FileFragment::new(Arc::new(self.clone()), metadata))
     }
 
     pub fn fragments(&self) -> &Arc<Vec<Fragment>> {
@@ -2887,6 +2920,27 @@ impl Dataset {
                 Some(FileFragment::new(dataset.clone(), fragment.clone()))
             })
             .collect()
+    }
+
+    /// Look up the fragment with `id` in the manifest.
+    ///
+    /// `Manifest::fragments` is kept sorted by id, so this binary searches
+    /// rather than scanning. Two kinds of manifest predate that invariant and
+    /// are still readable: those written before fragments were forced into id
+    /// order (Lance 0.10 and earlier), and those with duplicate fragment ids
+    /// (Lance 0.16 and earlier). Neither is rejected on read, so the search
+    /// result is checked and a scan takes over when it does not match --
+    /// returning some other fragment's data would be silent corruption.
+    fn find_fragment(&self, id: u64) -> Option<&Fragment> {
+        if !u32::try_from(id).is_ok_and(|id| self.fragment_bitmap.contains(id)) {
+            return None;
+        }
+        let fragments = self.manifest.fragments.as_slice();
+        let index = fragments.partition_point(|fragment| fragment.id < id);
+        match fragments.get(index) {
+            Some(fragment) if fragment.id == id => Some(fragment),
+            _ => fragments.iter().find(|fragment| fragment.id == id),
+        }
     }
 
     // This method filters deleted items from `addr_or_ids` using `addrs` as a reference
@@ -3018,7 +3072,7 @@ impl Dataset {
             let mut live_ids = Vec::with_capacity(ids.len());
             let mut addresses = Vec::with_capacity(ids.len());
             for id in ids {
-                if let Some(address) = row_id_index.get(*id) {
+                if let Some(address) = row_id_index.get(*id)? {
                     live_ids.push(*id);
                     addresses.push(u64::from(address));
                 }
@@ -3092,8 +3146,12 @@ impl Dataset {
 
         rowids::validate_stable_row_ids(self).await?;
 
-        // Validate indices
-        let indices = self.load_indices().await?;
+        // Validate indices. Over the complete list: these checks are about what
+        // the manifest says, not about what this build can use, and duplicate
+        // uuids or overlapping coverage are no less corrupt for involving an
+        // index this build has no reader for. `migrate_indices` already runs the
+        // same overlap check over the complete list on every commit.
+        let indices = crate::index::load_all_indices(self).await?;
         self.validate_indices(&indices)?;
 
         Ok(())
@@ -3174,6 +3232,80 @@ impl Dataset {
         Ok(())
     }
 
+    /// Assign stable row ID sequences to fragments that do not yet have them,
+    /// contiguously from `start`, and return the resulting `next_row_id`
+    /// high-water mark.
+    fn assign_stable_row_ids_for_migration(fragments: &mut [Fragment], start: u64) -> Result<u64> {
+        let mut next_row_id = start;
+        for fragment in fragments.iter_mut() {
+            let physical_rows = fragment.physical_rows.ok_or_else(|| {
+                Error::internal(format!(
+                    "Fragment {} is missing physical_rows; cannot assign stable row IDs",
+                    fragment.id
+                ))
+            })? as u64;
+            let end = next_row_id
+                .checked_add(physical_rows)
+                .ok_or_else(|| Error::internal("Row ID overflow during stable row ID migration"))?;
+            let sequence = RowIdSequence::from(next_row_id..end);
+            fragment.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&sequence).into()));
+            next_row_id = end;
+        }
+        Ok(next_row_id)
+    }
+
+    /// Migrate a table to use stable row IDs.
+    ///
+    /// Stable row IDs assign a persistent identifier to each row that remains
+    /// stable across compaction operations. This enables more efficient updates
+    /// to secondary indices.
+    ///
+    /// A single Merge commit assigns row ID sequences to all fragments and
+    /// activates the stable row ID feature flag atomically. Because `Merge`
+    /// conflicts with all data-modifying operations, a successful commit
+    /// guarantees no concurrent write occurred — no separate validation step
+    /// is needed.
+    ///
+    /// **No retries are attempted.** Callers should quiesce concurrent writes
+    /// before running this migration. If a conflicting write is detected, this
+    /// method returns an error and the caller must retry.
+    ///
+    /// This method is idempotent: if the table already uses stable row IDs,
+    /// it returns `Ok(())` immediately.
+    pub async fn migrate_to_stable_row_ids(&mut self) -> Result<()> {
+        if self.manifest.uses_stable_row_ids() {
+            return Ok(());
+        }
+
+        let mut fragments = self.manifest.fragments.as_ref().clone();
+        // Restore carries the high-water mark forward across a version that
+        // predates activation, so a re-migration must allocate above it rather
+        // than reissue ids the earlier versions still hold.
+        let next_row_id =
+            Self::assign_stable_row_ids_for_migration(&mut fragments, self.manifest.next_row_id)?;
+        let schema = self.manifest.schema.clone();
+        let read_version = self.manifest.version;
+
+        let transaction = Transaction::new(
+            read_version,
+            Operation::Merge {
+                fragments,
+                schema,
+                preserves_nullability: true,
+            },
+            None,
+        );
+
+        let new_ds = CommitBuilder::new(Arc::new(self.clone()))
+            .with_max_retries(0)
+            .with_stable_row_id_migration_activation(next_row_id)
+            .execute(transaction)
+            .await?;
+
+        *self = new_ds;
+        Ok(())
+    }
+
     /// Shallow clone the target version into a new dataset at target_path.
     /// 'target_path': the uri string to clone the dataset into.
     /// 'version': the version cloned from, could be a version number or tag.
@@ -3207,13 +3339,15 @@ impl Dataset {
 
     /// Deep clone the target version into a new dataset at target_path.
     /// This copies all relevant dataset files (data files, deletion files, and
-    /// index files) into the target dataset without loading data into memory.
+    /// index files) into the target dataset with bounded memory use.
     ///
     /// The source files are read through this dataset's own object store while the
     /// copies are written through the target object store built from `store_params`.
     /// This makes the clone work across accounts/stores (e.g. between two abfss
-    /// accounts): when the source and target stores are the same the copy stays
-    /// server-side, otherwise the data is streamed through this process.
+    /// accounts). Object-store files are streamed through this process by default;
+    /// `LANCE_IO_SERVER_SIDE_COPY_ENABLED` opts same-store copies into
+    /// provider-native copy operations. Cross-store copies continue to stream, and
+    /// local files retain their filesystem copy path.
     ///
     /// Parameters:
     /// - `target_path`: the URI string to clone the dataset into.
@@ -3224,6 +3358,8 @@ impl Dataset {
     /// Note: external `base_paths` referenced by the source manifest are read through
     /// this dataset's object store; per-base distinct source credentials are not yet
     /// supported (see <https://github.com/lance-format/lance/issues/6093>).
+    /// Object-store streaming defaults to at most four concurrent file copies;
+    /// `LANCE_DEEP_CLONE_STREAM_CONCURRENCY` overrides that limit for this operation.
     pub async fn deep_clone(
         &mut self,
         target_path: &str,
@@ -3234,6 +3370,13 @@ impl Dataset {
 
         // Resolve source dataset and its manifest using checkout_version
         let src_ds = self.checkout_version(version).await?;
+        ensure_can_write_manifest(&src_ds.manifest)?;
+        lance_table::system_index::frag_reuse::metadata::ensure_clone_supported(
+            &src_ds.object_store,
+            &src_ds.manifest_location,
+            &src_ds.manifest,
+        )
+        .await?;
         let src_paths = src_ds.collect_paths().await?;
 
         // Prepare target object store and base path
@@ -3264,18 +3407,28 @@ impl Dataset {
             path
         };
 
-        // When the source and target live in the same store we can keep the copy
-        // server-side. Otherwise (e.g. cloning across accounts) we stream each file
-        // from the source store to the target store.
-        let same_store = src_ds.object_store.store_prefix == target_store.store_prefix;
-
-        // TODO: Leverage object store bulk copy for efficient same-store deep_clone.
-        //
-        // All cloud storage providers support batch copy APIs that would provide significant
-        // performance improvements. We use single file copy before we have upstream support.
-        //
-        // Tracked by: https://github.com/lance-format/lance/issues/5435
-        let io_parallelism = self.object_store.io_parallelism();
+        let configured_io_parallelism = src_ds.object_store.io_parallelism();
+        // Provider-native copy can fall back to streaming for large objects, so every
+        // non-direct-local transfer stays within the bounded file-copy window.
+        let uses_streaming_copy = !(src_ds.object_store.has_direct_local_paths()
+            && target_store.has_direct_local_paths());
+        let stream_copy_parallelism = match std::env::var("LANCE_DEEP_CLONE_STREAM_CONCURRENCY") {
+            Ok(value) => Some(parse_deep_clone_stream_concurrency(&value)?),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(value)) => {
+                return Err(Error::invalid_input(format!(
+                    "LANCE_DEEP_CLONE_STREAM_CONCURRENCY must be valid UTF-8 and a positive \
+                     integer, got {value:?}"
+                )));
+            }
+        };
+        // Limit the number of concurrently buffered transfers by default while
+        // preserving efficient local copies and the operation-specific override.
+        let io_parallelism = deep_clone_copy_parallelism(
+            configured_io_parallelism,
+            uses_streaming_copy,
+            stream_copy_parallelism,
+        );
         let copy_futures = src_paths
             .iter()
             .map(|(relative_path, base)| {
@@ -3284,14 +3437,9 @@ impl Dataset {
                 let src_path = build_absolute_path(relative_path, base);
                 let target_path = build_absolute_path(relative_path, &target_base);
                 async move {
-                    if same_store {
-                        target_store.copy(&src_path, &target_path).await?;
-                    } else {
-                        let reader = source_store.open(&src_path).await?;
-                        let mut writer = target_store.create(&target_path).await?;
-                        writer.copy_from_reader(reader.as_ref()).await?;
-                        writer.shutdown().await?;
-                    }
+                    source_store
+                        .copy_bulk(&src_path, &target_store, &target_path)
+                        .await?;
                     Result::Ok(())
                 }
             })
@@ -3353,13 +3501,8 @@ impl Dataset {
     /// Collect all (relative_path, path) of the dataset files.
     async fn collect_paths(&self) -> Result<Vec<(String, Path)>> {
         let mut file_paths: Vec<(String, Path)> = Vec::new();
+        let mut blob_dirs = HashSet::new();
         for fragment in self.manifest.fragments.iter() {
-            if let Some(RowIdMeta::External(external_file)) = &fragment.row_id_meta {
-                return Err(Error::internal(format!(
-                    "External row_id_meta is not supported yet. external file path: {}",
-                    external_file.path
-                )));
-            }
             for data_file in fragment.referenced_lance_files() {
                 let base_root = if let Some(base_id) = data_file.base_id {
                     let base_path =
@@ -3372,8 +3515,36 @@ impl Dataset {
                 };
                 file_paths.push((
                     format!("{}/{}", DATA_DIR, data_file.path.clone()),
-                    base_root,
+                    base_root.clone(),
                 ));
+
+                if !data_file
+                    .schema(self.schema())
+                    .fields_pre_order()
+                    .any(|field| field.is_blob_v2())
+                {
+                    continue;
+                }
+
+                // Blob v2 sidecars are not listed in the manifest. Their directory is
+                // derived from the owning data file, so enumerate it to copy packed and
+                // dedicated payloads without decoding blob descriptors. External blobs
+                // remain caller-owned references and are deliberately not collected.
+                let data_file_key = blob::data_file_key_from_path(data_file.path.as_str());
+                let relative_blob_dir = format!("{}/{}", DATA_DIR, data_file_key);
+                let blob_dir = base_root.clone().join(DATA_DIR).join(data_file_key);
+                // Overlays can make the same data file reachable from multiple fragments.
+                if blob_dirs.insert(blob_dir.clone()) {
+                    let mut stream = self.object_store.read_dir_all(&blob_dir, None);
+                    while let Some(meta) = stream.next().await.transpose()? {
+                        if let Some(filename) = meta.location.filename() {
+                            file_paths.push((
+                                format!("{}/{}", relative_blob_dir, filename),
+                                base_root.clone(),
+                            ));
+                        }
+                    }
+                }
             }
             if let Some(deletion_file) = &fragment.deletion_file {
                 let base_root = if let Some(base_id) = deletion_file.base_id {
@@ -3591,6 +3762,15 @@ impl Dataset {
     /// underlying storage. In order to remove the data, you must subsequently
     /// call [optimize::compact_files()] to rewrite the data without the removed columns and
     /// then call [cleanup::cleanup_old_versions()] to remove the old files.
+    /// The schema a [`Self::drop_columns`] of `columns` would project to,
+    /// with every validation that drop performs and no mutation of its own.
+    ///
+    /// For a caller that must not write anything until the whole projection
+    /// is known to be valid against this revision.
+    pub fn plan_drop_columns(&self, columns: &[&str]) -> Result<Schema> {
+        schema_evolution::plan_drop_columns(self, columns)
+    }
+
     pub async fn drop_columns(&mut self, columns: &[&str]) -> Result<()> {
         info!(target: TRACE_DATASET_EVENTS, event=DATASET_DROPPING_COLUMN_EVENT, uri = &self.uri, columns = columns.join(","));
         schema_evolution::drop_columns(self, columns).await
@@ -3977,6 +4157,10 @@ pub(crate) struct ManifestWriteConfig {
     use_legacy_format: Option<bool>,           // default None
     storage_format: Option<DataStorageFormat>, // default None
     disable_transaction_file: bool,            // default false
+    /// When `Some`, this commit is the second step of `migrate_to_stable_row_ids`.
+    /// It bypasses the "cannot enable stable row ids on existing dataset" guard and
+    /// sets `manifest.next_row_id` to the provided value before activating the flag.
+    migration_next_row_id: Option<u64>, // default None
 }
 
 impl Default for ManifestWriteConfig {
@@ -3988,6 +4172,7 @@ impl Default for ManifestWriteConfig {
             disable_transaction_file: false,
             use_legacy_format: None,
             storage_format: None,
+            migration_next_row_id: None,
         }
     }
 }
@@ -4002,6 +4187,47 @@ impl ManifestWriteConfig {
         self.disable_transaction_file = true;
         self
     }
+
+    /// Resolve into the config `Transaction::build_manifest` consumes.
+    ///
+    /// The timestamp is resolved here rather than during the build so it goes
+    /// through this crate's mockable `SystemTime`.
+    pub(crate) fn to_build_config(&self) -> ManifestBuildConfig {
+        ManifestBuildConfig {
+            auto_set_feature_flags: self.auto_set_feature_flags,
+            timestamp_nanos: timestamp_to_nanos(self.timestamp),
+            use_stable_row_ids: self.use_stable_row_ids,
+            use_legacy_format: self.use_legacy_format,
+            storage_format: self.storage_format.clone(),
+            disable_transaction_file: self.disable_transaction_file,
+            migration_next_row_id: self.migration_next_row_id,
+        }
+    }
+}
+
+/// Decode an inline transaction section for opportunistic caching.
+///
+/// Returns `None` instead of failing when the transaction cannot be decoded:
+/// the section may have been written by a newer version of Lance with an
+/// operation type this version does not know, and that must not prevent
+/// opening the dataset. Paths that need the transaction contents surface the
+/// error at their call sites instead.
+fn decode_inline_transaction(message_data: &[u8], version: u64) -> Option<Transaction> {
+    match lance_table::format::pb::Transaction::decode(message_data)
+        .map_err(Error::from)
+        .and_then(Transaction::try_from)
+    {
+        Ok(transaction) => Some(transaction),
+        Err(err) => {
+            log::warn!(
+                "Failed to decode the inline transaction of version {}; \
+                 it may have been written by a newer version of Lance: {}",
+                version,
+                err
+            );
+            None
+        }
+    }
 }
 
 /// Commit a manifest file and create a copy at the latest manifest path.
@@ -4015,7 +4241,37 @@ pub(crate) async fn write_manifest_file(
     config: &ManifestWriteConfig,
     naming_scheme: ManifestNamingScheme,
     transaction: Option<lance_table::format::Transaction>,
+    may_change_schema: bool,
 ) -> std::result::Result<ManifestLocation, CommitError> {
+    validate_paired_feature_flags(manifest)?;
+    if let Some(indices) = &indices {
+        lance_table::system_index::frag_reuse::metadata::validate_flags(manifest, indices)?;
+    }
+    // Every manifest write funnels through here, including restore and clone,
+    // which rebuild a manifest from a stored one rather than from an Arrow
+    // schema, so this is where the invariant holds for a schema that never
+    // passed through that conversion.
+    //
+    // Only for transactions that can change the schema. Released versions could
+    // install a key on a nullable column through the metadata path, and
+    // validating every write would make such a table read-only on upgrade --
+    // including through the delete that removes the offending rows, which is
+    // the first step of repairing it. A repair still has to pass: it changes
+    // the schema, and the schema it produces is valid.
+    //
+    // The caller classifies the operation, rather than this reading it off
+    // `transaction`, which is None whenever the encoded bytes were too large
+    // to inline. Deriving it here would make the verdict depend on payload
+    // size, so the same operation would be exempt while small and validated
+    // once it spilled -- and a MemWAL table spills routinely, since its
+    // transactions carry mem-table state.
+    if may_change_schema {
+        manifest
+            .schema
+            .verify_primary_key()
+            .map_err(CommitError::OtherError)?;
+    }
+
     if config.auto_set_feature_flags {
         // build_manifest may have already set FLAG_STABLE_ROW_IDS on the manifest.
         // Preserve it here so this second apply_feature_flags call does not clear it
@@ -4027,6 +4283,8 @@ pub(crate) async fn write_manifest_file(
             config.disable_transaction_file,
         )?;
     }
+
+    versions::finalize_manifest_storage_version(manifest)?;
 
     manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
 
@@ -4048,6 +4306,131 @@ pub(crate) async fn write_manifest_file(
 impl Projectable for Dataset {
     fn schema(&self) -> &Schema {
         self.schema()
+    }
+}
+
+/// Marker files that `DirectoryNamespace` writes for a table that is declared or
+/// deregistered but was never materialized. Spelled out here because
+/// `lance-namespace-impls` depends on this crate, not the other way around.
+const NAMESPACE_TABLE_MARKERS: &[&str] = &[".lance-reserved", ".lance-deregistered"];
+
+/// Check that `base` is a Lance dataset root before deleting it recursively.
+///
+/// Dropping a dataset removes whatever the caller pointed at, so a mistyped or
+/// misconfigured URI — a warehouse root, a bucket root, a home directory — destroys
+/// unrelated data with no way back. Requiring the target to actually be a dataset
+/// turns that class of mistake into an error instead of silent data loss.
+///
+/// A path qualifies on positive evidence only, which is one of:
+///
+/// * a file under `_versions/` that both parses as a manifest location and deserializes
+///   as a manifest, attached or detached. Every dataset that has ever committed has one,
+///   whatever naming scheme or commit handler produced it.
+/// * a `DirectoryNamespace` declare or deregister marker, for a table that a namespace
+///   reserved but never wrote.
+///
+/// Nothing weaker qualifies. A non-empty `_versions/` is not evidence, because any file
+/// can be put there; neither are data files, which look identical to a storage root whose
+/// only prefix happens to be `data/`. Leftovers from a write that never committed,
+/// manifests that are corrupt, and the staging manifest an external store writes before
+/// it materializes the canonical path therefore need an explicit storage-level delete
+/// rather than a weaker default guard here. That costs little: leftovers do not block
+/// re-creating the dataset, because creation only refuses a path that already holds a
+/// manifest, and [`Dataset::cleanup_old_versions`] removes data files no manifest
+/// references.
+///
+/// Unmanaged files that a user keeps next to a committed dataset do not change the
+/// answer, matching the way cleanup leaves them alone. Note that the recursive delete
+/// this guards still removes them.
+///
+/// A missing or empty path also qualifies, so callers keep whatever not-found behavior
+/// they have today rather than seeing a new error kind.
+///
+/// This cannot protect files that another dataset references through `base_paths`;
+/// shallow-clone sources still need the reference tracking discussed in
+/// [#7514](https://github.com/lance-format/lance/issues/7514).
+pub async fn validate_dataset_root_for_drop(object_store: &ObjectStore, base: &Path) -> Result<()> {
+    if holds_readable_manifest(object_store, base).await? {
+        return Ok(());
+    }
+
+    for marker in NAMESPACE_TABLE_MARKERS {
+        if object_store.exists(&base.clone().join(*marker)).await? {
+            return Ok(());
+        }
+    }
+
+    // Rejecting a path that holds nothing would replace the not-found error callers
+    // already handle, and `ignore_not_found` relies on, with a different error kind.
+    if !has_any_entry(object_store, base).await? {
+        return Ok(());
+    }
+
+    Err(Error::invalid_input(format!(
+        "Refusing to drop '{base}': no readable Lance manifest was found under \
+         '{VERSIONS_DIR}', so this is not a dataset root. Check that the path points at a \
+         dataset and not at a parent directory, and check the logs for manifests that \
+         could not be read. A path holding only data files, or only manifests that cannot \
+         be read, needs an explicit storage-level delete instead: such leftovers neither \
+         block re-creating the dataset nor survive cleanup."
+    )))
+}
+
+/// Whether `base` holds a manifest that actually deserializes, which is the only proof
+/// that a dataset was ever committed here.
+///
+/// Returns on the first manifest that reads, so a real dataset costs one listing plus one
+/// manifest read no matter how many versions it has.
+async fn holds_readable_manifest(object_store: &ObjectStore, base: &Path) -> Result<bool> {
+    let mut entries = object_store.list(Some(base.clone().join(VERSIONS_DIR)));
+    loop {
+        let meta = match entries.try_next().await {
+            Ok(Some(meta)) => meta,
+            Ok(None) => return Ok(false),
+            // Local filesystems report a missing directory as an error where object stores
+            // return an empty listing. Neither holds a manifest.
+            Err(e) if e.is_not_found() => return Ok(false),
+            Err(e) => return Err(e),
+        };
+
+        if !is_manifest_location(&meta) {
+            continue;
+        }
+
+        match read_manifest(object_store, &meta.location, Some(meta.size)).await {
+            Ok(_) => return Ok(true),
+            // A file that only looks like a manifest proves nothing, so keep looking
+            // rather than authorizing the delete. The reason is logged because a read
+            // that failed for an unrelated cause, such as a transient storage error,
+            // otherwise leaves no trace of why the path was refused.
+            Err(e) => warn!(
+                "Ignoring '{}' while checking whether '{base}' is a dataset root: {e}",
+                meta.location
+            ),
+        }
+    }
+}
+
+/// Whether `meta` names a manifest, using the same parsing that manifest discovery uses.
+fn is_manifest_location(meta: &object_store::ObjectMeta) -> bool {
+    if ManifestLocation::try_from(meta.clone()).is_ok() {
+        return true;
+    }
+    meta.location
+        .filename()
+        .and_then(ManifestNamingScheme::parse_detached_version)
+        .is_some()
+}
+
+/// Whether anything at all lives under `prefix`. Stops at the first entry, so this stays
+/// cheap even on a storage root holding millions of objects.
+async fn has_any_entry(object_store: &ObjectStore, prefix: &Path) -> Result<bool> {
+    match object_store.list(Some(prefix.clone())).try_next().await {
+        Ok(entry) => Ok(entry.is_some()),
+        // Local filesystems report a missing directory as an error where object stores
+        // return an empty listing. Neither has anything to protect.
+        Err(e) if e.is_not_found() => Ok(false),
+        Err(e) => Err(e),
     }
 }
 

@@ -198,6 +198,33 @@ def train_pq_codebook_on_accelerator(
     return pq_codebook, kmeans_list
 
 
+def _sample_init_centroids(
+    ds: Iterable["torch.Tensor"], k: int, filter_nan: bool
+) -> "torch.Tensor":
+    """Take up to k vectors from ds to seed kmeans, skipping non-finite ones."""
+    # `column is not null` does not exclude NaN vectors, so they can still be
+    # sampled here.  Training drops them (distance returns id -1), but a NaN
+    # centroid never recovers and leaves every partition NaN.
+    sampled = []
+    num_sampled = 0
+    for batch in ds:
+        if filter_nan:
+            batch = batch[batch.isfinite().flatten(1).all(dim=1)]
+        if batch.shape[0] == 0:
+            continue
+        sampled.append(batch)
+        num_sampled += batch.shape[0]
+        if num_sampled >= k:
+            break
+
+    if num_sampled == 0:
+        raise ValueError(
+            "Cannot initialize centroids: the sampled vectors are all null or "
+            "non-finite"
+        )
+    return torch.cat(sampled)[:k]
+
+
 def train_ivf_centroids_on_accelerator(
     dataset: LanceDataset,
     column: str,
@@ -245,7 +272,7 @@ def train_ivf_centroids_on_accelerator(
         filter=filt,
     )
 
-    init_centroids = next(iter(ds))
+    init_centroids = _sample_init_centroids(ds, k, filter_nan)
     LOGGER.info("Done sampling: centroids shape: %s", init_centroids.shape)
 
     ds = TorchDataset(
@@ -750,6 +777,89 @@ def one_pass_assign_ivf_pq_on_accelerator(
         data_file.path for frag in ds.get_fragments() for data_file in frag.data_files()
     ]
     return dst_dataset_uri, shuffle_buffers
+
+
+# =============================================================================
+# Embedding Duplicate Pairs
+# =============================================================================
+
+
+def find_duplicate_pairs(
+    dataset: LanceDataset,
+    column: str,
+    distance_threshold: float,
+) -> pa.RecordBatchReader:
+    """Stream embedding duplicate pairs from an existing vector index.
+
+    The column must have exactly one current-format vector index covering all
+    dataset fragments. Segments and partitions are evaluated independently;
+    cross-partition and cross-segment pairs are omitted. No search or top-k
+    truncation is performed. For quantized indices, distances are computed
+    between vectors reconstructed from index codes, not source-table vectors
+    or asymmetric query-to-code estimates. Thresholds use the index metric:
+    squared L2, cosine distance, dot distance, or Hamming distance.
+
+    Returns a reader with non-null ``row_id_a: uint64``, ``row_id_b: uint64``
+    and ``distance: float32`` columns, containing every qualifying unordered
+    pair once (distance <= threshold). Direction follows stable index traversal,
+    not numerical row-ID order. All pairs for one a occur contiguously, even
+    across Arrow batches. Deleted rows are excluded at this dataset snapshot.
+    Close the reader to cancel further work. This operation does not delete rows.
+
+    Each partition's compact index codes are prepared once. Small partitions
+    are buffered in memory; larger ones are read in 8,192-row batches into
+    temporary session spill storage, reclaimed when the reader advances or
+    closes. Decoding uses 1,024-row vector batches and output remains batched.
+    This avoids rereading the source index for every anchor.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        from lance.vector import find_duplicate_pairs
+
+        with find_duplicate_pairs(dataset, "embedding", 0.05) as pairs:
+            for batch in pairs:
+                consume(batch)
+
+    See Also
+    --------
+    find_duplicate_pairs_in_partition : Execute one segment/partition.
+    """
+    return dataset._ds.find_duplicate_pairs(column, distance_threshold)
+
+
+def find_duplicate_pairs_in_partition(
+    dataset: LanceDataset,
+    column: str,
+    segment_id: Union[str, uuid.UUID],
+    partition_id: int,
+    distance_threshold: float,
+) -> pa.RecordBatchReader:
+    """Stream duplicate pairs from one physical index segment and partition.
+
+    Uses the same output schema, distance and ordering semantics as
+    :func:`find_duplicate_pairs`. ``segment_id`` is a physical index UUID,
+    not an index name or fragment ID. ``partition_id`` is local to that segment.
+    Other dataset fragments need not be indexed for this scoped operation.
+    Distributed callers must open the same dataset version on every worker.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        from lance.vector import find_duplicate_pairs_in_partition
+
+        segment_id = dataset.describe_indices()[0].segments[0].uuid
+        with find_duplicate_pairs_in_partition(
+            dataset, "embedding", segment_id, 0, 0.05
+        ) as pairs:
+            for batch in pairs:
+                consume(batch)
+    """
+    return dataset._ds.find_duplicate_pairs_in_partition(
+        column, str(segment_id), partition_id, distance_threshold
+    )
 
 
 # =============================================================================

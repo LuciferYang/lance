@@ -54,6 +54,7 @@ from ..progress import FragmentWriteProgress as FragmentWriteProgress
 from ..progress import IndexProgress as IndexProgress
 from ..types import ReaderLike as ReaderLike
 from ..udf import BatchUDF as BatchUDF
+from .bitmap import Bitmap as Bitmap
 from .debug import format_fragment as format_fragment
 from .debug import format_manifest as format_manifest
 from .debug import format_schema as format_schema
@@ -148,6 +149,7 @@ class CleanupStats:
     transaction_files_removed: int
     index_files_removed: int
     deletion_files_removed: int
+    failed_deletes: int
 
 class CleanupCandidateFile:
     path: str
@@ -206,7 +208,13 @@ class PackedBlobWriter:
     def write_blob(self, data: bytes) -> None: ...
     def write_blobs(
         self,
-        payloads: Union[pa.BinaryArray, pa.LargeBinaryArray, pa.ChunkedArray],
+        payloads: Union[
+            pa.BinaryArray,
+            pa.LargeBinaryArray,
+            pa.BinaryViewArray,
+            pa.FixedSizeBinaryArray,
+            pa.ChunkedArray,
+        ],
     ) -> None: ...
     def finish(self) -> List[BlobDescriptor]: ...
     def finish_array(self, field_name: str) -> pa.StructArray: ...
@@ -349,6 +357,8 @@ class LanceBlobFile:
     def read_range(self, offset: int, length: int) -> bytes: ...
     def read_ranges(self, ranges: List[Tuple[int, int]]) -> List[bytes]: ...
     def read_into(self, b: bytearray) -> int: ...
+    def set_buffer_size(self, buffer_size: int) -> None: ...
+    def _range_submission_count(self) -> int: ...
 
 class _Dataset:
     @property
@@ -379,6 +389,7 @@ class _Dataset:
     def has_stable_row_ids(self) -> bool: ...
     def index_statistics(self, index_name: str) -> str: ...
     def serialized_manifest(self) -> bytes: ...
+    def base_paths(self) -> Dict[int, DatasetBasePath]: ...
     def describe_indices(self) -> List[IndexDescription]: ...
     def remap_row_addrs(self, addrs: pa.Array) -> Optional[pa.Array]: ...
     def scanner(
@@ -413,6 +424,9 @@ class _Dataset:
         order_by: Optional[List[Any]] = None,
         disable_scoring_autoprojection: Optional[bool] = None,
         substrait_aggregate: Optional[bytes] = None,
+        row_addr_allowlist: Optional[bytes] = None,
+        row_addr_blocklist: Optional[bytes] = None,
+        minhash_query: Optional[Dict[str, str]] = None,
     ) -> _Scanner: ...
     def count_rows(self, filter: Optional[str] = None) -> int: ...
     def take(
@@ -484,6 +498,9 @@ class _Dataset:
         self,
         updates: Dict[str, str],
         predicate: Optional[str] = None,
+        conflict_retries: Optional[int] = None,
+        retry_timeout: Optional[timedelta] = None,
+        data_storage_version: Optional[str] = None,
     ) -> UpdateResult: ...
     def count_deleted_rows(self) -> int: ...
     def versions(self) -> List[Version]: ...
@@ -639,6 +656,16 @@ class _Dataset:
     def get_transactions(
         self, recent_transactions=10
     ) -> List[Optional[Transaction]]: ...
+    def find_duplicate_pairs(
+        self, column: str, distance_threshold: float
+    ) -> pa.RecordBatchReader: ...
+    def find_duplicate_pairs_in_partition(
+        self,
+        column: str,
+        segment_id: str,
+        partition_id: int,
+        distance_threshold: float,
+    ) -> pa.RecordBatchReader: ...
     def hamming_clustering_for_ivf_partition(
         self,
         index_name: str,
@@ -672,6 +699,10 @@ class _MergeInsertBuilder:
     def when_matched_fail(self) -> Self: ...
     def when_not_matched_insert_all(self) -> Self: ...
     def when_not_matched_by_source_delete(self, expr: Optional[str] = None) -> Self: ...
+    def write_mode(
+        self, mode: Literal["auto", "rewrite_rows", "rewrite_columns"]
+    ) -> Self: ...
+    def data_storage_version(self, version: str) -> Self: ...
     def target_bases(self, bases: list[str]) -> Self: ...
     def target_all_bases(self, include_primary: bool = True) -> Self: ...
     def execute(self, new_data: pa.RecordBatchReader) -> ExecuteResult: ...
@@ -726,6 +757,12 @@ class _Fragment:
         batch_readahead: Optional[int] = None,
         blob_handling: Optional[str] = None,
         order_by: Optional[List[Any]] = None,
+        use_scalar_index: Optional[bool] = None,
+        io_buffer_size: Optional[int] = None,
+        late_materialization: Optional[bool | List[str]] = None,
+        include_deleted_rows: Optional[bool] = None,
+        batch_size_bytes: Optional[int] = None,
+        strict_batch_size: Optional[bool] = None,
     ) -> _Scanner: ...
     def add_columns_from_reader(
         self,
@@ -993,6 +1030,14 @@ class DatasetBasePath:
         is_dataset_root: bool = False,
         id: Optional[int] = None,
     ) -> None: ...
+    @property
+    def id(self) -> int: ...
+    @property
+    def name(self) -> Optional[str]: ...
+    @property
+    def path(self) -> str: ...
+    @property
+    def is_dataset_root(self) -> bool: ...
 
 __version__: str
 language_model_home: Callable[[], str]

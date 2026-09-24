@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use chrono::prelude::*;
 use lance_core::deepsize::DeepSizeOf;
 use lance_file::datatypes::{Fields, FieldsWithMeta};
@@ -17,8 +18,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
 
-use super::Fragment;
-use crate::feature_flags::FLAG_MEM_WAL_INDEX_CATCHUP;
+use super::{Fragment, InlineRowIds, RowIdMeta};
+use crate::feature_flags::{FLAG_COVERED_INDEX_METADATA, STICKY_PAIRED_FLAGS};
 use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
 use crate::format::fragment::DataFileFieldInterner;
 use crate::format::pb;
@@ -188,8 +189,8 @@ impl Manifest {
             index_section: None,
             timestamp_nanos: 0,
             tag: None,
-            reader_feature_flags: 0,
-            writer_feature_flags: 0,
+            reader_feature_flags: 0, // These will be set on commit
+            writer_feature_flags: 0, // These will be set on commit
             max_fragment_id: None,
             transaction_file: None,
             transaction_section: None,
@@ -219,8 +220,8 @@ impl Manifest {
             index_section: None, // Caller should update index if they want to keep them.
             timestamp_nanos: 0,  // This will be set on commit
             tag: None,
-            reader_feature_flags: 0, // These will be set on commit
-            writer_feature_flags: 0, // These will be set on commit
+            reader_feature_flags: previous.reader_feature_flags & STICKY_PAIRED_FLAGS,
+            writer_feature_flags: previous.writer_feature_flags & STICKY_PAIRED_FLAGS,
             max_fragment_id: previous.max_fragment_id,
             transaction_file: None,
             transaction_section: None,
@@ -276,11 +277,19 @@ impl Manifest {
             index_section: None, // These will be set on commit
             timestamp_nanos: self.timestamp_nanos,
             tag: None,
-            // Not derivable from the manifest, so it would be lost like any
-            // other zeroed word -- and a clone of a table that requires index
-            // catch-up would silently come back as legacy.
-            reader_feature_flags: self.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP,
-            writer_feature_flags: self.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP,
+            // Not derivable from the manifest, so it would be lost like any other
+            // zeroed word: a clone of a table with covering indexes would come
+            // back unfenced, and since the clone copies the index metadata
+            // wholesale -- `covering_fields` included -- a build that predates
+            // covering could then open it and read carried columns as keyed ones.
+            // Kept unconditionally rather than derived from the cloned indexes:
+            // over-fencing a clone is harmless, under-fencing one is not.
+            // Sticky capabilities are also retained because the clone keeps the
+            // source file identities that require them.
+            reader_feature_flags: self.reader_feature_flags
+                & (FLAG_COVERED_INDEX_METADATA | STICKY_PAIRED_FLAGS),
+            writer_feature_flags: self.writer_feature_flags
+                & (FLAG_COVERED_INDEX_METADATA | STICKY_PAIRED_FLAGS),
             max_fragment_id: self.max_fragment_id,
             transaction_file: Some(transaction_file),
             transaction_section: None,
@@ -376,6 +385,36 @@ impl Manifest {
                 "Field with id {} does not exist for replace_field_metadata",
                 field_id
             )))
+        }
+    }
+
+    /// Copy inline row ids out of the manifest buffer they were decoded from
+    /// when they are a small share of it.
+    ///
+    /// Inline row ids decoded from a `Bytes` buffer are slices of that buffer
+    /// (see [`InlineRowIds`]), and a slice keeps the whole allocation alive.
+    /// That is the right trade when the row ids are most of the manifest, as
+    /// they are for a compacted stable-row-id table, but a manifest whose row
+    /// ids are a few percent of its bytes would pin the rest for nothing.
+    /// `buffer_len` is the size of the decoded buffer.
+    pub fn detach_sparse_inline_row_ids(&mut self, buffer_len: usize) {
+        let inline_bytes: usize = self
+            .fragments
+            .iter()
+            .filter_map(|fragment| match &fragment.row_id_meta {
+                Some(RowIdMeta::Inline(data)) => Some(data.len()),
+                _ => None,
+            })
+            .sum();
+        // Keep the slices while the row ids are at least a quarter of the buffer.
+        if inline_bytes == 0 || inline_bytes.saturating_mul(4) >= buffer_len {
+            return;
+        }
+        for fragment in Arc::make_mut(&mut self.fragments) {
+            if let Some(RowIdMeta::Inline(data)) = &fragment.row_id_meta {
+                let copied = InlineRowIds::from(Bytes::copy_from_slice(data));
+                fragment.row_id_meta = Some(RowIdMeta::Inline(copied));
+            }
         }
     }
 
@@ -681,6 +720,36 @@ impl TryFrom<pb::manifest::DataStorageFormat> for DataStorageFormat {
             version: ConcreteFileVersion::from_manifest_string(&pb.version)?,
         })
     }
+}
+
+/// Options controlling how a new [`Manifest`] is assembled from a transaction.
+///
+/// The timestamp arrives already resolved to nanoseconds since the Unix epoch.
+/// Callers own the clock so that a caller wanting a mockable one keeps it: the
+/// `lance` crate mocks `SystemTime` under `cfg(test)`, which only takes effect in
+/// that crate.
+#[derive(Debug, Clone)]
+pub struct ManifestBuildConfig {
+    /// Recompute the manifest's feature flags from the fragments and settings
+    /// below. False leaves whatever flags the previous manifest carried.
+    pub auto_set_feature_flags: bool,
+    /// Value for the new manifest's timestamp, in nanoseconds since the Unix epoch.
+    pub timestamp_nanos: u128,
+    /// Request the stable row id feature. The flag is also inherited from the
+    /// previous manifest, so false does not turn it off for a dataset that has it.
+    pub use_stable_row_ids: bool,
+    /// Overwrite only: force the legacy (true) or v2 (false) file format. `None`
+    /// keeps the format the dataset already had.
+    pub use_legacy_format: Option<bool>,
+    /// Overwrite only: force this storage format, taking precedence over
+    /// `use_legacy_format`. `None` keeps the format the dataset already had.
+    pub storage_format: Option<DataStorageFormat>,
+    /// Skip writing a detached transaction file for this commit.
+    pub disable_transaction_file: bool,
+    /// When `Some`, this commit is the second step of `migrate_to_stable_row_ids`.
+    /// It bypasses the "cannot enable stable row ids on existing dataset" guard and
+    /// sets `manifest.next_row_id` to the provided value before activating the flag.
+    pub migration_next_row_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1113,7 +1182,7 @@ mod tests {
 
     use super::*;
 
-    use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::Field;
     use roaring::RoaringBitmap;
 
@@ -1252,6 +1321,41 @@ mod tests {
                 .to_string()
                 .contains("All data files must have the same version")
         );
+    }
+
+    #[test]
+    fn test_detach_sparse_inline_row_ids_copies_only_small_shares() {
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("a", DataType::Int32, false)]);
+        // Two 10 byte row id sequences sliced out of one buffer.
+        let buffer = Bytes::from(vec![7u8; 64]);
+        let fragments = [0..10, 20..30].into_iter().enumerate().map(|(id, range)| {
+            let mut fragment = Fragment::new(id as u64);
+            fragment.row_id_meta = Some(RowIdMeta::Inline(InlineRowIds::from(buffer.slice(range))));
+            fragment
+        });
+        let mut manifest = Manifest::new(
+            Schema::try_from(&arrow_schema).unwrap(),
+            Arc::new(fragments.collect()),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        let ptr = |manifest: &Manifest, i: usize| match &manifest.fragments[i].row_id_meta {
+            Some(RowIdMeta::Inline(data)) => data.bytes().as_ptr(),
+            _ => unreachable!(),
+        };
+        let in_buffer = |p: *const u8| buffer.as_ptr_range().contains(&p);
+
+        // 20 of 80 bytes is a quarter: the slices stay.
+        manifest.detach_sparse_inline_row_ids(80);
+        assert!(in_buffer(ptr(&manifest, 0)) && in_buffer(ptr(&manifest, 1)));
+
+        // 20 of 81 bytes is below a quarter: copied out, contents intact.
+        manifest.detach_sparse_inline_row_ids(81);
+        assert!(!in_buffer(ptr(&manifest, 0)) && !in_buffer(ptr(&manifest, 1)));
+        let Some(RowIdMeta::Inline(copied)) = &manifest.fragments[1].row_id_meta else {
+            unreachable!()
+        };
+        assert_eq!(&**copied, &buffer[20..30]);
     }
 
     #[test]
