@@ -1562,7 +1562,7 @@ pub trait BufferExt {
 }
 
 fn is_pwr_two(n: u64) -> bool {
-    n != 0 && n & (n - 1) == 0
+    n.is_power_of_two()
 }
 
 impl BufferExt for arrow_buffer::Buffer {
@@ -1611,8 +1611,8 @@ mod tests {
     use arrow_buffer::OffsetBuffer;
 
     /// `lance-arrow` keeps its own copy of this helper, so it needs its own
-    /// pin: `0 - 1` underflows, which panicked in a debug build and reported 0
-    /// as a power of two in release.
+    /// pin. The hand-rolled form underflowed at zero: a debug build panicked
+    /// and release reported zero as a power of two.
     #[test]
     fn is_pwr_two_rejects_zero() {
         assert!(!is_pwr_two(0));
