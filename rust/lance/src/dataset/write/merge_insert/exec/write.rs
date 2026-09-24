@@ -485,20 +485,38 @@ impl FullSchemaMergeInsertExec {
         }
 
         let dataset_arrow_schema: arrow_schema::Schema = self.dataset.schema().into();
-        let dataset_fields = dataset_arrow_schema.fields();
-        let mut data_column_indices: Vec<usize> = Vec::with_capacity(dataset_fields.len());
-        for dataset_field in dataset_fields {
-            let idx = *name_to_idx
-                .get(dataset_field.name().as_str())
-                .ok_or_else(|| {
-                    datafusion::error::DataFusionError::Internal(format!(
+        // `create_plan` deliberately leaves a Model A defaulted column that is absent from every
+        // fragment out of the rewrite, so that its live default is not frozen into the rewritten
+        // fragments. Such a column may be missing from the input; any other missing dataset field
+        // is a pruning bug.
+        let absent_model_a = crate::dataset::default_values::model_a_absent_columns(
+            self.dataset.as_ref(),
+            &self.dataset.manifest.fragments,
+        );
+        let mut data_column_indices: Vec<usize> =
+            Vec::with_capacity(dataset_arrow_schema.fields().len());
+        let mut write_fields: Vec<arrow_schema::FieldRef> =
+            Vec::with_capacity(dataset_arrow_schema.fields().len());
+        for dataset_field in dataset_arrow_schema.fields() {
+            match name_to_idx.get(dataset_field.name().as_str()) {
+                Some(idx) => {
+                    data_column_indices.push(*idx);
+                    write_fields.push(dataset_field.clone());
+                }
+                None if absent_model_a.contains(&dataset_field.name().as_str()) => {}
+                None => {
+                    return Err(datafusion::error::DataFusionError::Internal(format!(
                         "Dataset field {:?} missing from merge insert input schema \
                      — this indicates a logical plan pruning bug",
                         dataset_field.name()
-                    ))
-                })?;
-            data_column_indices.push(idx);
+                    )));
+                }
+            }
         }
+        let write_arrow_schema = arrow_schema::Schema::new_with_metadata(
+            write_fields,
+            dataset_arrow_schema.metadata().clone(),
+        );
 
         if data_column_indices.is_empty() {
             return Err(datafusion::error::DataFusionError::Internal(
@@ -513,7 +531,7 @@ impl FullSchemaMergeInsertExec {
                 .collect::<Vec<_>>(),
         );
         let output_schema = Arc::new(
-            canonical_source_schema(&source_data_schema, &dataset_arrow_schema)
+            canonical_source_schema(&source_data_schema, &write_arrow_schema)
                 .map_err(datafusion::error::DataFusionError::from)?,
         );
 
@@ -992,12 +1010,29 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             let target_bases_info = resolve_target_bases(&dataset, &params).await?;
             // Keep a copy so failures after the write can clean up routed files.
             let cleanup_bases = target_bases_info.clone();
+            // A Model A defaulted column left out of the rewrite must also be left out of the
+            // write schema, so the rewritten fragments keep it structurally absent.
+            let stream_schema = write_data_stream.schema();
+            let write_schema = if dataset
+                .schema()
+                .fields
+                .iter()
+                .all(|f| stream_schema.field_with_name(&f.name).is_ok())
+            {
+                dataset.schema().clone()
+            } else {
+                dataset.schema().project_by_schema(
+                    stream_schema.as_ref(),
+                    lance_core::datatypes::OnMissing::Error,
+                    lance_core::datatypes::OnTypeMismatch::Error,
+                )?
+            };
             let (mut new_fragments, _) = write_fragments_internal(
                 params.write_version(&dataset),
                 Some(&dataset),
                 dataset.object_store.clone(),
                 &dataset.base,
-                dataset.schema().clone(),
+                write_schema,
                 write_data_stream,
                 WriteParams::default(),
                 target_bases_info,

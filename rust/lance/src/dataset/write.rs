@@ -1,17 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{ArrayRef, RecordBatch, UInt32Array};
+use arrow_schema::Schema as ArrowSchema;
 use bytes::Bytes;
 use chrono::TimeDelta;
 use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{Stream, StreamExt};
 use lance_arrow::{
     ARROW_EXT_NAME_KEY, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY,
     BLOB_INLINE_SIZE_THRESHOLD_META_KEY, BLOB_META_KEY, BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY,
-    BLOB_V2_EXT_NAME,
+    BLOB_V2_EXT_NAME, RecordBatchExt,
 };
-use lance_core::datatypes::{NullabilityComparison, OnMissing, OnTypeMismatch};
+use lance_core::datatypes::{NullabilityComparison, OnMissing, OnTypeMismatch, decode_default};
 use lance_core::utils::tracing::{
     AUDIT_MODE_CREATE, AUDIT_MODE_DELETE, AUDIT_TYPE_DATA, TRACE_FILE_AUDIT,
 };
@@ -692,6 +694,12 @@ pub struct WriteParams {
     /// when writing legacy V1 files. If not set, the file writer uses its
     /// configured defaults.
     pub file_writer_options: Option<FileWriterOptions>,
+
+    /// When true, the writer will materialise write-time defaults (Model B) for columns
+    /// that are omitted from the incoming batch but carry a `lance-schema:write-default`
+    /// metadata key.  Must only be set on genuine insert/append paths — rewrite callers
+    /// (Update, MergeInsert, compaction) must leave this false.
+    pub inject_write_defaults: bool,
 }
 
 impl Default for WriteParams {
@@ -723,6 +731,7 @@ impl Default for WriteParams {
             external_blob_mode: ExternalBlobMode::Reference,
             blob_pack_file_size_threshold: None,
             file_writer_options: None,
+            inject_write_defaults: false,
         }
     }
 }
@@ -854,6 +863,127 @@ impl WriteParams {
             blob_pack_file_size_threshold: Some(max_bytes),
             ..self
         }
+    }
+}
+
+/// Replicate a length-1 Arrow array to `num_rows` rows.
+fn broadcast_default(arr1: &ArrayRef, num_rows: usize) -> Result<ArrayRef> {
+    let indices = UInt32Array::from(vec![0u32; num_rows]);
+    arrow_select::take::take(arr1.as_ref(), &indices, None)
+        .map_err(|e| Error::arrow(format!("failed to broadcast default value: {e}")))
+}
+
+/// For every field in `default_fields` that is absent from `schema` by name and carries a
+/// `lance-schema:write-default` metadata key, append a constant column to every batch of
+/// `data` and extend `schema` with that field.
+///
+/// Fields already present in `schema` are left untouched, as are absent fields without a
+/// write-default -- read-backfill governs those.
+fn augment_with_write_defaults_from_fields(
+    data: SendableRecordBatchStream,
+    schema: Schema,
+    default_fields: &[lance_core::datatypes::Field],
+) -> Result<(SendableRecordBatchStream, Schema)> {
+    let existing_names: std::collections::HashSet<&str> =
+        schema.fields.iter().map(|f| f.name.as_str()).collect();
+
+    let mut inject: Vec<(lance_core::datatypes::Field, ArrayRef)> = vec![];
+
+    for field in default_fields {
+        if existing_names.contains(field.name.as_str()) {
+            continue;
+        }
+        if let Some(json) = field.write_default_raw() {
+            let arr1 = decode_default(&json, &field.data_type()).map_err(|e| {
+                Error::invalid_input(format!(
+                    "failed to decode write-default for field '{}': {e}",
+                    field.name
+                ))
+            })?;
+            inject.push((field.clone(), arr1));
+        }
+    }
+
+    if inject.is_empty() {
+        return Ok((data, schema));
+    }
+
+    let mut aug_fields = schema.fields.clone();
+    let num_existing = aug_fields.len();
+    for (f, _) in &inject {
+        // Injected fields are cloned from the source-of-truth `default_fields`
+        // (the existing dataset schema on the Overwrite path), so they still carry
+        // their OLD field ids.  Those ids would collide with the freshly assigned
+        // ids of the incoming batch columns once committed.  Reset them to -1 so
+        // `set_field_id` assigns fresh, non-colliding ids below.
+        let mut f = f.clone();
+        f.id = -1;
+        aug_fields.push(f);
+    }
+    let mut aug_lance_schema = Schema {
+        fields: aug_fields,
+        metadata: schema.metadata.clone(),
+    };
+    // Assign fresh ids to the injected (id == -1) fields starting after the
+    // current maximum, then validate to guarantee no duplicate ids/names leak
+    // into the committed manifest.
+    aug_lance_schema.set_field_id(None);
+    aug_lance_schema.validate()?;
+
+    let aug_arrow_schema = Arc::new(ArrowSchema::from(&aug_lance_schema));
+
+    // Re-derive the injected arrow fields from the id-reassigned schema so the
+    // data stream's column metadata matches the committed schema exactly.
+    let inject_arc: Arc<Vec<(arrow_schema::Field, ArrayRef)>> = Arc::new(
+        aug_lance_schema.fields[num_existing..]
+            .iter()
+            .zip(inject.into_iter().map(|(_, arr1)| arr1))
+            .map(|(lf, arr1)| (arrow_schema::Field::from(lf), arr1))
+            .collect(),
+    );
+
+    let mapped = data.map(move |batch_res| {
+        let batch = batch_res?;
+        let num_rows = batch.num_rows();
+        let mut augmented = batch;
+        for (arrow_field, arr1) in inject_arc.as_ref() {
+            let col = broadcast_default(arr1, num_rows)?;
+            augmented = augmented.try_with_column(arrow_field.clone(), col)?;
+        }
+        Ok(augmented)
+    });
+
+    let out: SendableRecordBatchStream =
+        Box::pin(RecordBatchStreamAdapter::new(aug_arrow_schema, mapped));
+
+    Ok((out, aug_lance_schema))
+}
+
+/// Materialise write-time defaults for columns omitted from the incoming batch on the
+/// Append path.  Defaults are read from the **existing dataset schema** so that prior
+/// declarations are honoured.
+fn augment_with_write_defaults(
+    data: SendableRecordBatchStream,
+    schema: Schema,
+    dataset: &Dataset,
+) -> Result<(SendableRecordBatchStream, Schema)> {
+    augment_with_write_defaults_from_fields(data, schema, &dataset.schema().fields)
+}
+
+/// Drop from `expected` the top-level fields that `incoming` omits and that carry a column
+/// default, so a schema-compatibility check does not demand them.
+fn drop_omitted_defaulted_fields(expected: &Schema, incoming: &Schema) -> Schema {
+    let incoming_names: HashSet<&str> = incoming.fields.iter().map(|f| f.name.as_str()).collect();
+    Schema {
+        fields: expected
+            .fields
+            .iter()
+            .filter(|f| {
+                incoming_names.contains(f.name.as_str()) || f.effective_default_raw().is_none()
+            })
+            .cloned()
+            .collect(),
+        metadata: expected.metadata.clone(),
     }
 }
 
@@ -1760,6 +1890,14 @@ pub(crate) async fn write_fragments_internal_with_file_row_counts(
     // Make sure the max rows per group is not larger than the max rows per file
     params.max_rows_per_group = std::cmp::min(params.max_rows_per_group, params.max_rows_per_file);
     validate_external_blob_write_params(&params)?;
+
+    // Materialise write-time defaults for columns the incoming data omits. The declarations
+    // live in the existing dataset schema, so a brand-new dataset injects nothing.
+    let (data, schema) = match dataset {
+        Some(ds) if params.inject_write_defaults => augment_with_write_defaults(data, schema, ds)?,
+        _ => (data, schema),
+    };
+
     let normalized_schema = prepared_to_logical_blob_schema(&schema)?;
 
     versions::write_fragments(
@@ -1801,8 +1939,14 @@ pub(super) fn prepare_write_schema(
             &normalized_converted_schema,
             dataset.schema(),
         )?;
+        // A defaulted column may be omitted from the incoming data: a write-default was
+        // materialised above, and an initial-default is backfilled on read. Compare against
+        // a schema with those columns dropped -- `allow_missing_if_nullable` would otherwise
+        // reject the non-nullable ones.
+        let expected_schema =
+            drop_omitted_defaulted_fields(dataset.schema(), &normalized_converted_schema);
         if normalized_converted_schema
-            .check_compatible(dataset.schema(), &schema_compare_options)
+            .check_compatible(&expected_schema, &schema_compare_options)
             .is_ok()
         {
             return dataset.schema().project_by_schema(
@@ -1813,7 +1957,10 @@ pub(super) fn prepare_write_schema(
         }
         let comparison_schema = promote_legacy_blob_schema(&normalized_converted_schema)?;
         let dataset_schema = promote_legacy_blob_schema(dataset.schema())?;
-        comparison_schema.check_compatible(&dataset_schema, &schema_compare_options)?;
+        comparison_schema.check_compatible(
+            &drop_omitted_defaulted_fields(&dataset_schema, &comparison_schema),
+            &schema_compare_options,
+        )?;
         let mut projected = dataset_schema.project_by_schema(
             &comparison_schema,
             OnMissing::Error,

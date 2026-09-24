@@ -919,6 +919,11 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             };
 
             let indices = indices_containing_frag(fragment.id as u32);
+            // Model A defaulted columns absent from this fragment. Co-compacting fragments with
+            // different absent-sets would give such a column mixed physical presence in the
+            // group, which one rewritten file cannot represent without either freezing the absent
+            // rows or dropping the explicit values.
+            let absent_default_fields = model_a_absent_field_ids(dataset, &fragment);
 
             match (candidacy, &mut current_bin) {
                 (None, None) => {} // keep searching
@@ -930,19 +935,22 @@ impl CompactionPlanner for DefaultCompactionPlanner {
                         candidacy: vec![candidacy],
                         row_counts: vec![metrics.num_rows()],
                         indices,
+                        absent_default_fields,
                     });
                 }
                 (Some(candidacy), Some(bin)) => {
                     // We cannot mix "indexed" and "non-indexed" fragments and so we only consider
-                    // the existing bin if it contains the same indices
-                    if bin.indices == indices {
+                    // the existing bin if it contains the same indices. We likewise cannot mix
+                    // fragments whose Model A defaulted columns differ in physical presence.
+                    if bin.indices == indices && bin.absent_default_fields == absent_default_fields
+                    {
                         // Add to current bin
                         bin.fragments.push(fragment);
                         bin.pos_range.end += 1;
                         bin.candidacy.push(candidacy);
                         bin.row_counts.push(metrics.num_rows());
                     } else {
-                        // Index set is different.  Complete previous bin and start new one
+                        // Discriminator is different. Complete previous bin and start new one
                         candidate_bins.push(current_bin.take().unwrap());
                         current_bin = Some(CandidateBin {
                             fragments: vec![fragment],
@@ -950,6 +958,7 @@ impl CompactionPlanner for DefaultCompactionPlanner {
                             candidacy: vec![candidacy],
                             row_counts: vec![metrics.num_rows()],
                             indices,
+                            absent_default_fields,
                         });
                     }
                 }
@@ -1992,6 +2001,7 @@ async fn prepare_reader(
     io_buffer_size: Option<u64>,
     with_frags: bool,
     capture_row_ids: bool,
+    excluded_columns: &[&str],
 ) -> Result<(
     SendableRecordBatchStream,
     Option<std::sync::mpsc::Receiver<CapturedRowIds>>,
@@ -2022,6 +2032,9 @@ async fn prepare_reader(
         scanner
             .with_fragments(fragments.to_vec())
             .scan_in_order(true);
+    }
+    if !excluded_columns.is_empty() {
+        scanner.project(&kept_column_names(dataset, excluded_columns))?;
     }
     if capture_row_ids {
         scanner.with_row_id();
@@ -2108,6 +2121,9 @@ struct CandidateBin {
     pub candidacy: Vec<CompactionCandidacy>,
     pub row_counts: Vec<usize>,
     pub indices: Vec<usize>,
+    /// Sorted ids of Model A defaulted columns physically absent from these fragments. Only
+    /// fragments sharing the same set may be co-compacted (see `model_a_absent_field_ids`).
+    pub absent_default_fields: Vec<i32>,
 }
 
 impl CandidateBin {
@@ -2165,6 +2181,9 @@ impl CandidateBin {
                 row_counts: row_counts.by_ref().take(bin_len).collect(),
                 // By the time we are splitting for size we are done considering indices
                 indices: Vec::new(),
+                // Splitting only divides an already-uniform bin; the discriminator is unused
+                // past this point.
+                absent_default_fields: Vec::new(),
             });
             pos_start += bin_len;
         }
@@ -2175,10 +2194,49 @@ impl CandidateBin {
             candidacy: candidacy.collect(),
             row_counts: row_counts.collect(),
             indices: self.indices,
+            absent_default_fields: self.absent_default_fields,
         });
 
         bins
     }
+}
+
+/// Return the sorted set of "Model A" field ids (initial-default set, no write-default) that are
+/// physically **absent** from `fragment` -- not materialized in any of its data files.
+///
+/// Such columns are read-backfilled at scan time and must stay structurally absent across
+/// compaction (see `rewrite_files`), so the planner uses this set as a binning discriminator:
+/// two fragments may only be co-compacted when it matches.
+fn model_a_absent_field_ids(dataset: &Dataset, fragment: &Fragment) -> Vec<i32> {
+    let present: HashSet<i32> = fragment
+        .files
+        .iter()
+        .flat_map(|file| file.fields.iter().copied())
+        .collect();
+    let mut absent: Vec<i32> = dataset
+        .schema()
+        .fields
+        .iter()
+        .filter(|f| {
+            f.initial_default_raw().is_some()
+                && f.write_default_raw().is_none()
+                && !present.contains(&f.id)
+        })
+        .map(|f| f.id)
+        .collect();
+    absent.sort_unstable();
+    absent
+}
+
+/// The top-level column names of `dataset`'s schema, minus `excluded`.
+fn kept_column_names<'a>(dataset: &'a Dataset, excluded: &[&str]) -> Vec<&'a str> {
+    dataset
+        .schema()
+        .fields
+        .iter()
+        .map(|f| f.name.as_str())
+        .filter(|name| !excluded.contains(name))
+        .collect()
 }
 
 async fn load_index_fragmaps(dataset: &Dataset) -> Result<Vec<RoaringBitmap>> {
@@ -2436,6 +2494,23 @@ async fn rewrite_files(
     let mut row_ids_rx: Option<std::sync::mpsc::Receiver<CapturedRowIds>> = None;
     let mut reader: Option<SendableRecordBatchStream> = None;
 
+    // A Model A column -- a mutable initial-default and no write-default -- that is absent from
+    // every fragment in this group is read-backfilled at scan time, so scanning the full schema
+    // would materialize the *current* default into the rewritten files and freeze it. Leave such
+    // a column out of both the scan and the write schema so it stays absent and keeps tracking
+    // the live default. The binary-copy path copies data files verbatim and preserves absence on
+    // its own.
+    let absent_default_columns =
+        super::default_values::model_a_absent_columns(dataset.as_ref(), &fragments);
+    let write_schema = if absent_default_columns.is_empty() {
+        dataset.schema().clone()
+    } else {
+        dataset.schema().project(&kept_column_names(
+            dataset.as_ref(),
+            &absent_default_columns,
+        ))?
+    };
+
     if !can_binary_copy {
         let (prepared_reader, rx_initial, has_blob_v2_columns) = prepare_reader(
             dataset.as_ref(),
@@ -2444,6 +2519,7 @@ async fn rewrite_files(
             options.io_buffer_size,
             true,
             capture_row_addrs,
+            &absent_default_columns,
         )
         .await?;
         row_ids_rx = rx_initial;
@@ -2463,7 +2539,7 @@ async fn rewrite_files(
         if has_blob_v2_columns {
             let dataset_arc = Arc::new(dataset.as_ref().clone());
             let rewrite_plan = Arc::new(BlobV2BatchRewritePlan::try_new(
-                dataset.schema(),
+                &write_schema,
                 schema.as_ref(),
                 false,
             )?);
@@ -2596,7 +2672,7 @@ async fn rewrite_files(
             Some(dataset.as_ref()),
             dataset.object_store.clone(),
             &dataset.base,
-            dataset.schema().clone(),
+            write_schema,
             reader.expect("reader must be prepared for non-binary-copy path"),
             params,
             None,
@@ -3192,6 +3268,7 @@ mod tests {
             candidacy: vec![],
             row_counts: vec![],
             indices: vec![],
+            absent_default_fields: vec![],
         };
         assert!(empty_bin.is_noop());
 
@@ -3211,6 +3288,7 @@ mod tests {
             candidacy: vec![CompactionCandidacy::CompactWithNeighbors],
             row_counts: vec![100],
             indices: vec![],
+            absent_default_fields: vec![],
         };
         assert!(single_bin.is_noop());
 
@@ -3220,6 +3298,7 @@ mod tests {
             candidacy: vec![CompactionCandidacy::CompactItself],
             row_counts: vec![100],
             indices: vec![],
+            absent_default_fields: vec![],
         };
         // Not a no-op because it's CompactItself
         assert!(!single_bin.is_noop());
@@ -3230,6 +3309,7 @@ mod tests {
             candidacy: std::iter::repeat_n(CompactionCandidacy::CompactItself, 8).collect(),
             row_counts: vec![100, 400, 200, 200, 400, 300, 300, 100],
             indices: vec![],
+            absent_default_fields: vec![],
             // Will group into: [[100, 400], [200, 200, 400], [300, 300, 100]]
             // with size = 500
         };
@@ -3259,6 +3339,7 @@ mod tests {
             candidacy: std::iter::repeat_n(CompactionCandidacy::CompactItself, 3).collect(),
             row_counts: vec![100, 200, 300],
             indices: vec![],
+            absent_default_fields: vec![],
         };
         let split = zero_min_split_bin.split_for_size(0);
         assert_eq!(split.len(), 3);
@@ -10751,5 +10832,275 @@ mod tests {
         scanner.filter("val = 0").unwrap().project(&["id"]).unwrap();
         let batch = scanner.try_into_batch().await.unwrap();
         assert_eq!(batch.num_rows(), 0, "stale value 0 must no longer match");
+    }
+
+    /// Regression: compaction must NOT freeze the live initial-default of a Model A column
+    /// (initial-default set, no write-default) that is structurally absent in the source
+    /// fragments.  After compacting absent-defaulted rows, a later `set_column_default` must
+    /// still change the value read for those rows.
+    #[tokio::test]
+    async fn test_compaction_preserves_mutable_initial_default() {
+        use super::super::schema_evolution::NewColumnTransform;
+        use arrow_array::{Array, cast::AsArray};
+        use lance_core::datatypes::LANCE_INITIAL_DEFAULT_META_KEY;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        // Two fragments of column `a` only (so compaction has something to merge).
+        let schema_a = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+        let batch1 = RecordBatch::try_new(
+            schema_a.clone(),
+            vec![Arc::new(Int32Array::from(vec![1_i32, 2]))],
+        )
+        .unwrap();
+        let batch2 = RecordBatch::try_new(
+            schema_a.clone(),
+            vec![Arc::new(Int32Array::from(vec![3_i32, 4]))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch1)], schema_a.clone());
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch2)], schema_a);
+        Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                mode: WriteMode::Append,
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.checkout_latest().await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        // Add Model A column `c` (initial-default only, no write-default), absent in all rows.
+        let c_field =
+            Field::new("c", DataType::Int32, true).with_metadata(std::collections::HashMap::from(
+                [(LANCE_INITIAL_DEFAULT_META_KEY.to_string(), "42".to_string())],
+            ));
+        dataset
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(Schema::new(vec![c_field]))),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let read_c = |ds: &Dataset| {
+            let ds = ds.clone();
+            async move {
+                let batch = ds
+                    .scan()
+                    .project(&["a", "c"])
+                    .unwrap()
+                    .scan_in_order(true)
+                    .try_into_batch()
+                    .await
+                    .unwrap();
+                batch
+                    .column_by_name("c")
+                    .unwrap()
+                    .as_primitive::<Int32Type>()
+                    .clone()
+            }
+        };
+
+        // Before compaction, all rows read the live initial-default 42.
+        let c = read_c(&dataset).await;
+        assert_eq!(c.null_count(), 0);
+        assert!((0..c.len()).all(|i| c.value(i) == 42));
+
+        // Compact the two fragments into one.
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1024,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        dataset.checkout_latest().await.unwrap();
+
+        // After compaction the rows must STILL be structurally absent, so changing the
+        // default retroactively updates the read value.
+        dataset.set_column_default("c", "77").await.unwrap();
+        dataset.checkout_latest().await.unwrap();
+        let c = read_c(&dataset).await;
+        assert_eq!(c.null_count(), 0, "compaction must not introduce nulls");
+        assert!(
+            (0..c.len()).all(|i| c.value(i) == 77),
+            "compacted absent rows must reflect the new default 77, got {c:?}"
+        );
+    }
+
+    /// Regression: compaction must NOT freeze the live initial-default of a Model A column
+    /// when that column has MIXED physical presence across the compaction group — absent in
+    /// some source fragments (added via `add_columns(AllNulls)`) and present in others (an
+    /// append that explicitly carried the column).  The originally-absent rows must remain
+    /// structurally absent after compaction so a later `set_column_default` still updates them,
+    /// while the explicitly-written values are preserved.
+    #[tokio::test]
+    async fn test_compaction_preserves_mutable_initial_default_mixed_presence() {
+        use super::super::schema_evolution::NewColumnTransform;
+        use arrow_array::{Array, cast::AsArray};
+        use lance_core::datatypes::LANCE_INITIAL_DEFAULT_META_KEY;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        // Old fragment of column `a` only (will be absent in `c`).
+        let schema_a = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+        let batch_a = RecordBatch::try_new(
+            schema_a.clone(),
+            vec![Arc::new(Int32Array::from(vec![1_i32, 2]))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch_a)], schema_a.clone());
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 1024,
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Add Model A column `c` (initial-default only, no write-default).  Absent in the
+        // old fragment (metadata-only AllNulls).
+        let c_field =
+            Field::new("c", DataType::Int32, true).with_metadata(std::collections::HashMap::from(
+                [(LANCE_INITIAL_DEFAULT_META_KEY.to_string(), "42".to_string())],
+            ));
+        dataset
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(Schema::new(vec![c_field]))),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Append a batch that explicitly includes `c` → `c` is now physically present in the
+        // new fragment, while still absent in the old one (mixed presence).
+        let schema_ac = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("c", DataType::Int32, true),
+        ]));
+        let batch_ac = RecordBatch::try_new(
+            schema_ac.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![3_i32, 4])),
+                Arc::new(Int32Array::from(vec![100_i32, 200])),
+            ],
+        )
+        .unwrap();
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch_ac)], schema_ac),
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 1024,
+                mode: WriteMode::Append,
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.checkout_latest().await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let read_ac = |ds: &Dataset| {
+            let ds = ds.clone();
+            async move {
+                let batch = ds
+                    .scan()
+                    .project(&["a", "c"])
+                    .unwrap()
+                    .scan_in_order(true)
+                    .try_into_batch()
+                    .await
+                    .unwrap();
+                let a = batch
+                    .column_by_name("a")
+                    .unwrap()
+                    .as_primitive::<Int32Type>()
+                    .clone();
+                let c = batch
+                    .column_by_name("c")
+                    .unwrap()
+                    .as_primitive::<Int32Type>()
+                    .clone();
+                (a, c)
+            }
+        };
+
+        // Before compaction: absent rows (a=1,2) read live default 42; explicit rows preserved.
+        let (a, c) = read_ac(&dataset).await;
+        assert_eq!(c.null_count(), 0);
+        for i in 0..a.len() {
+            let expected = match a.value(i) {
+                1 | 2 => 42,
+                3 => 100,
+                4 => 200,
+                other => panic!("unexpected a value {other}"),
+            };
+            assert_eq!(c.value(i), expected, "pre-compaction row a={}", a.value(i));
+        }
+
+        // Compact.  The planner must NOT co-bin the mixed-presence fragments (the present-`c`
+        // fragment cannot be merged with the absent-`c` fragment), so each remains free to keep
+        // its own physical-presence semantics.
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1024,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        dataset.checkout_latest().await.unwrap();
+
+        // Change the default → originally-absent rows must reflect it; explicit rows untouched.
+        dataset.set_column_default("c", "77").await.unwrap();
+        dataset.checkout_latest().await.unwrap();
+        let (a, c) = read_ac(&dataset).await;
+        assert_eq!(c.null_count(), 0, "compaction must not introduce nulls");
+        for i in 0..a.len() {
+            let expected = match a.value(i) {
+                1 | 2 => 77, // originally absent → must follow the new live default
+                3 => 100,    // explicitly written → preserved, not frozen-to-default
+                4 => 200,    // explicitly written → preserved, not frozen-to-default
+                other => panic!("unexpected a value {other}"),
+            };
+            assert_eq!(
+                c.value(i),
+                expected,
+                "post-compaction row a={} must read {expected}, got {}",
+                a.value(i),
+                c.value(i)
+            );
+        }
     }
 }

@@ -71,6 +71,7 @@ pub mod builder;
 pub mod cleanup;
 mod data_file;
 mod data_file_part;
+pub(crate) mod default_values;
 pub mod delta;
 pub mod files;
 pub mod fragment;
@@ -104,10 +105,10 @@ mod take;
 /// [Transaction Specification](https://lance.org/format/table/transaction/#transaction-types).
 pub mod transaction {
     pub use lance_table::transaction::{
-        DataOverlayGroup, DataReplacementGroup, Operation, ReadVersionState, RewriteGroup,
-        RewrittenIndex, Transaction, TransactionBuilder, UpdateMap, UpdateMapEntry, UpdateMode,
-        UpdatedFragmentOffsets, translate_config_updates, translate_schema_metadata_updates,
-        validate_operation,
+        COLUMN_DEFAULTS_MODEL_CONFIG_KEY, DataOverlayGroup, DataReplacementGroup, Operation,
+        ReadVersionState, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder, UpdateMap,
+        UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets, column_defaults_model_b_enabled,
+        translate_config_updates, translate_schema_metadata_updates, validate_operation,
     };
 }
 pub mod udtf;

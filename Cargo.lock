@@ -4626,11 +4626,13 @@ version = "13.0.0-beta.13"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
+ "arrow-cast",
  "arrow-data",
  "arrow-schema",
  "async-trait",
  "blake3",
  "bytes",
+ "chrono",
  "criterion",
  "datafusion-common",
  "datafusion-sql",
