@@ -165,6 +165,18 @@ impl FileFragment {
         Ok(Some(fragment))
     }
 }
+/// One fragment's horizontal-rewrite output, bound to the manifest version it
+/// was read at. The committer commits against that version so the conflict
+/// check catches any change made to the fragment between the read and the
+/// commit (mirrors vertical compaction's `RewriteResult::read_version`).
+#[derive(Debug, Clone)]
+pub struct RewriteColumnsResult {
+    /// The rewritten fragment metadata to publish.
+    pub fragment: Fragment,
+    /// The manifest version the fragment was read at.
+    pub read_version: u64,
+}
+
 /// Horizontal executor: rewrites one fragment's named columns into a new data
 /// file (see [`FileFragment::rewrite_columns`]). The columns and target version
 /// are the executor's configuration; the task is the fragment to rewrite.
@@ -189,20 +201,26 @@ impl RewriteColumnsExecutor {
 impl CompactionExecutor for RewriteColumnsExecutor {
     type Task = FileFragment;
     /// `None` when the fragment already had the layout (nothing to commit).
-    type TaskResult = Option<Fragment>;
+    type TaskResult = Option<RewriteColumnsResult>;
 
-    /// The task carries its own dataset handle (a [`FileFragment`] already bound
-    /// to the read version), so the `dataset` argument the pipeline threads in is
-    /// unused here — the read version comes from the fragment, not the snapshot.
+    /// The task is a [`FileFragment`] already bound to its read version, so the
+    /// `dataset` argument the pipeline threads in is unused; the read version is
+    /// taken from the fragment and carried into the result for the committer.
     async fn execute(
         &self,
         _dataset: Cow<'_, Dataset>,
         task: FileFragment,
         _options: &CompactionOptions,
-    ) -> Result<Option<Fragment>> {
+    ) -> Result<Option<RewriteColumnsResult>> {
+        let read_version = task.dataset().manifest.version;
         let columns: Vec<&str> = self.columns.iter().map(String::as_str).collect();
-        task.rewrite_columns(&columns, self.data_storage_version)
-            .await
+        Ok(task
+            .rewrite_columns(&columns, self.data_storage_version)
+            .await?
+            .map(|fragment| RewriteColumnsResult {
+                fragment,
+                read_version,
+            }))
     }
 }
 /// Commits horizontal-compaction results as one `Operation::Update` in
@@ -213,19 +231,29 @@ pub struct RewriteColumnsCommitter;
 
 #[async_trait::async_trait]
 impl CompactionCommitter for RewriteColumnsCommitter {
-    type TaskResult = Option<Fragment>;
+    type TaskResult = Option<RewriteColumnsResult>;
 
     async fn commit(
         &self,
         dataset: &mut Dataset,
-        results: Vec<Option<Fragment>>,
+        results: Vec<Option<RewriteColumnsResult>>,
         _remap_options: Arc<dyn IndexRemapperOptions>,
         _options: &CompactionOptions,
     ) -> Result<CompactionMetrics> {
-        let updated_fragments: Vec<Fragment> = results.into_iter().flatten().collect();
-        if updated_fragments.is_empty() {
+        let results: Vec<RewriteColumnsResult> = results.into_iter().flatten().collect();
+        if results.is_empty() {
             return Ok(CompactionMetrics::default());
         }
+        // Commit against the earliest version any rewritten fragment was read
+        // at, not the current one, so the conflict check catches a fragment
+        // changed between the read and this commit (as vertical compaction does).
+        let read_version = results
+            .iter()
+            .map(|result| result.read_version)
+            .min()
+            .expect("results is non-empty");
+        let updated_fragments: Vec<Fragment> =
+            results.into_iter().map(|result| result.fragment).collect();
         // Row addresses and values are unchanged, so no fragment is added or
         // removed; only per-fragment files change. `files_added` is one new
         // file per rewritten fragment; `files_removed` is the fully-tombstoned
@@ -253,7 +281,7 @@ impl CompactionCommitter for RewriteColumnsCommitter {
             metrics.files_removed += (original_files + 1).saturating_sub(fragment.files.len());
         }
         let transaction = Transaction::new(
-            dataset.manifest.version,
+            read_version,
             Operation::Update {
                 removed_fragment_ids: Vec::new(),
                 updated_fragments,
