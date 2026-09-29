@@ -792,8 +792,9 @@ pub struct CompactionMetrics {
     pub fragments_added: usize,
     /// The number of files that have been removed, including deletion files.
     pub files_removed: usize,
-    /// The number of files that have been added, which is always equal to the
-    /// number of fragments.
+    /// The number of data files that have been added. This equals the number of
+    /// new fragments for a plain vertical compaction, but a `column_groups`
+    /// compaction adds one file per group per fragment, so it can be larger.
     pub files_added: usize,
 }
 
@@ -899,6 +900,44 @@ impl CompactionCommitter for RewriteCommitter {
     ) -> Result<CompactionMetrics> {
         commit_compaction(dataset, results, remap_options, options).await
     }
+}
+
+/// Run a compaction pipeline: execute every task with bounded concurrency, then
+/// commit the collected results. This is the one orchestration both vertical
+/// (`RewriteExecutor`/`RewriteCommitter`) and horizontal
+/// (`RewriteColumnsExecutor`/`RewriteColumnsCommitter`) funnel through, so the
+/// [`CompactionExecutor`]/[`CompactionCommitter`] traits carry real polymorphism
+/// — a caller with its own executor/committer pair plugs in here — rather than
+/// documenting a seam nothing consumes. The two pipelines still differ in how
+/// they produce tasks and which operation they commit; only the execute-collect-
+/// commit skeleton is shared.
+pub(crate) async fn run_compaction_pipeline<E, C>(
+    dataset: &mut Dataset,
+    executor: E,
+    committer: C,
+    tasks: Vec<E::Task>,
+    remap_options: Arc<dyn IndexRemapperOptions>,
+    options: &CompactionOptions,
+    concurrency: usize,
+) -> Result<CompactionMetrics>
+where
+    E: CompactionExecutor,
+    C: CompactionCommitter<TaskResult = E::TaskResult>,
+{
+    if tasks.is_empty() {
+        return Ok(CompactionMetrics::default());
+    }
+    // Execute against an immutable snapshot; `commit` takes `&mut dataset` once
+    // every task has finished and the borrows are released.
+    let dataset_ref = &dataset.clone();
+    let results: Vec<E::TaskResult> = futures::stream::iter(tasks)
+        .map(|task| executor.execute(Cow::Borrowed(dataset_ref), task, options))
+        .buffer_unordered(concurrency.max(1))
+        .try_collect()
+        .await?;
+    committer
+        .commit(dataset, results, remap_options, options)
+        .await
 }
 
 /// Formulate a plan to compact the files in a dataset
@@ -1173,30 +1212,21 @@ pub async fn compact_files_with_planner(
         return Ok(CompactionMetrics::default());
     }
 
-    let dataset_ref = &dataset.clone();
-
-    let executor = RewriteExecutor;
-    let result_stream = futures::stream::iter(compaction_plan.tasks)
-        .map(|task| executor.execute(Cow::Borrowed(dataset_ref), task, &compaction_plan.options))
-        .buffer_unordered(
-            compaction_plan
-                .options
-                .num_threads
-                .unwrap_or_else(get_num_compute_intensive_cpus),
-        );
-
-    let completed_tasks: Vec<RewriteResult> = result_stream.try_collect().await?;
+    let concurrency = compaction_plan
+        .options
+        .num_threads
+        .unwrap_or_else(get_num_compute_intensive_cpus);
     let remap_options = remap_options.unwrap_or(Arc::new(DatasetIndexRemapperOptions::default()));
-    let metrics = RewriteCommitter
-        .commit(
-            dataset,
-            completed_tasks,
-            remap_options,
-            &compaction_plan.options,
-        )
-        .await?;
-
-    Ok(metrics)
+    run_compaction_pipeline(
+        dataset,
+        RewriteExecutor,
+        RewriteCommitter,
+        compaction_plan.tasks,
+        remap_options,
+        &compaction_plan.options,
+        concurrency,
+    )
+    .await
 }
 
 /// Information about a fragment used to decide its fate in compaction
@@ -2594,11 +2624,21 @@ async fn write_column_group_fragments(
     let mut per_group_seeds: Vec<Vec<Box<dyn lance_index::scalar::seed::IndexSeedWriter>>> =
         group_schemas.iter().map(|_| Vec::new()).collect();
     for seed in versions::create_seed_writers(write_version, Some(dataset), &params).await? {
-        if let Some(index) = group_schemas
+        match group_schemas
             .iter()
             .position(|schema| schema.field(seed.column_name()).is_some())
         {
-            per_group_seeds[index].push(seed);
+            Some(index) => per_group_seeds[index].push(seed),
+            // `column_group_schemas` partitions every top-level column, so an
+            // index's keyed column always lands in exactly one group. Guard the
+            // invariant rather than silently dropping the seed, which would
+            // rebuild the index from incomplete data.
+            None => {
+                return Err(Error::internal(format!(
+                    "column groups do not cover indexed column \"{}\"",
+                    seed.column_name()
+                )));
+            }
         }
     }
 
@@ -8243,19 +8283,6 @@ mod tests {
         assert!(checked > 0, "expected to check at least one stored vector");
     }
 
-    /// Build an `id` + `vec` dataset, create the given IVF vector index,
-    /// optionally delete rows, then run deferred compaction (which materializes
-    /// the deletions into the fragment-reuse index) and assert that KNN over
-    /// surviving vectors during the FRI window (a) never returns a deleted row
-    /// and (b) stays consistent with the pre-compaction answer.
-    ///
-    /// The deletion path is the interesting one: materialized deletions drop
-    /// rows from the quantization storage at load time, which shifts storage
-    /// positions. Flat storage (FLAT/PQ/SQ/RQ) is scanned linearly so this is
-    /// fine, but the HNSW graph addresses storage positionally and is not
-    /// frag-reuse aware, so a desync would surface here as recall collapse or a
-    /// resurrected/again-deleted row.
-    /// Top-k `id`s for a KNN query against the `vec` column.
     /// Horizontal compaction ([`Dataset::rewrite_columns`]) repacks a column's
     /// files without moving rows, so a vector index over that column keeps its
     /// uuid and coverage and is never rebuilt — the property #9291 only tested
@@ -8336,6 +8363,7 @@ mod tests {
         dataset.validate().await.unwrap();
     }
 
+    /// Top-k `id`s for a KNN query against the `vec` column.
     async fn vector_knn_ids(dataset: &Dataset, query: &[f32], k: usize) -> Vec<i32> {
         use arrow_array::cast::AsArray;
         use arrow_array::types::{Float32Type, Int32Type};
@@ -8357,6 +8385,18 @@ mod tests {
         ids
     }
 
+    /// Build an `id` + `vec` dataset, create the given IVF vector index,
+    /// optionally delete rows, then run deferred compaction (which materializes
+    /// the deletions into the fragment-reuse index) and assert that KNN over
+    /// surviving vectors during the FRI window (a) never returns a deleted row
+    /// and (b) stays consistent with the pre-compaction answer.
+    ///
+    /// The deletion path is the interesting one: materialized deletions drop
+    /// rows from the quantization storage at load time, which shifts storage
+    /// positions. Flat storage (FLAT/PQ/SQ/RQ) is scanned linearly so this is
+    /// fine, but the HNSW graph addresses storage positionally and is not
+    /// frag-reuse aware, so a desync would surface here as recall collapse or a
+    /// resurrected/again-deleted row.
     async fn check_vector_defer_compaction(
         params: VectorIndexParams,
         delete_predicate: Option<&str>,
@@ -11655,5 +11695,133 @@ mod tests {
         );
         assert_eq!(dataset.scan().try_into_batch().await.unwrap(), before);
         dataset.validate().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn compaction_column_groups_preserve_scalar_index() {
+        let (mut dataset, before) = column_group_dataset().await;
+        // ZoneMap is the scalar index that writes an index seed, so it actually
+        // drives the seed-routing loop in `write_column_group_fragments` (BTree
+        // writes no seed and would leave that path untested).
+        // ZoneMap only writes an index seed when `use_seeds` is enabled (for a
+        // fixed-width column it defaults off), and the seed is what drives the
+        // routing loop in `write_column_group_fragments`.
+        let index_params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap)
+            .with_params(&serde_json::json!({"use_seeds": true}));
+        dataset
+            .create_index(
+                &["a"],
+                IndexType::ZoneMap,
+                Some("a_idx".into()),
+                &index_params,
+                false,
+            )
+            .await
+            .unwrap();
+        // Split the indexed column into its own file group: its seed must be
+        // routed to the group holding "a" (a miss would trip the
+        // `Error::internal` guard and fail the compaction).
+        let options = CompactionOptions {
+            column_groups: vec![vec!["a".into()]],
+            ..Default::default()
+        };
+        compact_files(&mut dataset, options, None).await.unwrap();
+
+        // The grouped write ran the seed-routing loop (ZoneMap writes a seed,
+        // unlike BTree) and produced the requested split without corrupting the
+        // index metadata or the values.
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1, "the two fragments merged into one");
+        let mut groups: Vec<Vec<i32>> = fragments[0]
+            .metadata()
+            .files
+            .iter()
+            .map(|file| file.fields.to_vec())
+            .collect();
+        groups.sort();
+        assert_eq!(
+            groups,
+            vec![vec![0], vec![1, 2]],
+            "\"a\" split into its own file, {{b, c}} in another"
+        );
+        assert!(
+            dataset.load_index_by_name("a_idx").await.unwrap().is_some(),
+            "the ZoneMap index survives compaction"
+        );
+        let filtered = dataset
+            .scan()
+            .filter("a >= 15")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(filtered.num_rows(), 5, "a >= 15 matches five rows (15..20)");
+        assert_eq!(dataset.scan().try_into_batch().await.unwrap(), before);
+        dataset.validate().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn column_groups_preserve_horizontal_split_across_compaction() {
+        let (mut dataset, before) = column_group_dataset().await;
+        // Horizontal split: column c into its own file per fragment.
+        dataset.rewrite_columns(&["c"], None).await.unwrap();
+        for fragment in dataset.get_fragments() {
+            assert_eq!(
+                fragment.metadata().files.len(),
+                2,
+                "c is split into its own file"
+            );
+        }
+        // Vertical compaction with a matching group keeps c split instead of
+        // folding it back into one file — the feature's core promise.
+        let options = CompactionOptions {
+            column_groups: vec![vec!["c".into()]],
+            ..Default::default()
+        };
+        compact_files(&mut dataset, options, None).await.unwrap();
+
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1, "the two fragments merged");
+        let mut groups: Vec<Vec<i32>> = fragments[0]
+            .metadata()
+            .files
+            .iter()
+            .map(|file| file.fields.to_vec())
+            .collect();
+        groups.sort();
+        assert_eq!(
+            groups,
+            vec![vec![0, 1], vec![2]],
+            "layout stays split: {{a, b}} and {{c}}"
+        );
+        assert_eq!(dataset.scan().try_into_batch().await.unwrap(), before);
+        dataset.validate().await.unwrap();
+    }
+
+    #[test]
+    fn compaction_column_groups_parse_from_config() {
+        let config = std::collections::HashMap::from([(
+            "lance.compaction.column_groups".to_string(),
+            "b, c ; d".to_string(),
+        )]);
+        let options = CompactionOptions::from_dataset_config(&config).unwrap();
+        assert_eq!(
+            options.column_groups,
+            vec![
+                vec!["b".to_string(), "c".to_string()],
+                vec!["d".to_string()]
+            ],
+            "';' splits groups, ',' splits columns, whitespace trimmed"
+        );
+    }
+
+    #[test]
+    fn compaction_column_groups_validate_rejects_duplicate() {
+        let mut options = CompactionOptions {
+            column_groups: vec![vec!["b".into()], vec!["b".into()]],
+            ..Default::default()
+        };
+        let err = options.validate().unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
     }
 }

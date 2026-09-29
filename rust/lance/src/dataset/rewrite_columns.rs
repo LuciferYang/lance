@@ -25,9 +25,9 @@ use lance_table::format::{Fragment, overlay::TOMBSTONE_FIELD_ID};
 use super::fragment::FileFragment;
 use super::optimize::{
     CompactionCommitter, CompactionExecutor, CompactionMetrics, CompactionOptions,
+    run_compaction_pipeline,
 };
 use super::transaction::{Operation, Transaction, UpdateMode};
-use super::write::cleanup_data_fragments;
 use super::{Dataset, versions};
 use crate::dataset::optimize::remapping::IndexRemapperOptions;
 use crate::{Error, Result};
@@ -97,7 +97,7 @@ impl FileFragment {
     ) -> Result<Option<Fragment>> {
         let dataset = self.dataset();
         let write_schema = rewrite_schema(dataset, columns)?;
-        let write_version = write_version(dataset, data_storage_version)?;
+        let resolved_version = write_version(dataset, data_storage_version)?;
         let field_ids: HashSet<i32> = write_schema.field_ids().into_iter().collect();
 
         let already_split = self.metadata().files.iter().any(|file| {
@@ -109,7 +109,7 @@ impl FileFragment {
                 == field_ids
                 && file
                     .file_version()
-                    .is_ok_and(|version| version == write_version)
+                    .is_ok_and(|version| version == resolved_version)
         });
         if already_split {
             return Ok(None);
@@ -121,7 +121,7 @@ impl FileFragment {
                 Some((write_schema, dataset.schema().clone())),
                 None,
                 None,
-                write_version,
+                resolved_version,
             )
             .await?;
         let written: Result<Fragment> = async {
@@ -174,12 +174,26 @@ pub struct RewriteColumnsExecutor {
     data_storage_version: Option<LanceFileVersion>,
 }
 
+impl RewriteColumnsExecutor {
+    /// Build an executor that repacks `columns` into one new file per fragment,
+    /// optionally in a different V2 version.
+    pub fn new(columns: &[&str], data_storage_version: Option<LanceFileVersion>) -> Self {
+        Self {
+            columns: columns.iter().map(|c| c.to_string()).collect(),
+            data_storage_version,
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl CompactionExecutor for RewriteColumnsExecutor {
     type Task = FileFragment;
     /// `None` when the fragment already had the layout (nothing to commit).
     type TaskResult = Option<Fragment>;
 
+    /// The task carries its own dataset handle (a [`FileFragment`] already bound
+    /// to the read version), so the `dataset` argument the pipeline threads in is
+    /// unused here — the read version comes from the fragment, not the snapshot.
     async fn execute(
         &self,
         _dataset: Cow<'_, Dataset>,
@@ -221,10 +235,21 @@ impl CompactionCommitter for RewriteColumnsCommitter {
             ..CompactionMetrics::default()
         };
         for fragment in &updated_fragments {
+            // A fragment being updated must exist in the version we commit
+            // against; a missing one is an inconsistency (e.g. a distributed
+            // caller passing a stale fragment id), not a zero-file fragment.
             let original_files = dataset
                 .get_fragment(fragment.id as usize)
-                .map(|f| f.metadata().files.len())
-                .unwrap_or(0);
+                .ok_or_else(|| {
+                    Error::internal(format!(
+                        "rewrite_columns is updating fragment {} that is not in the \
+                         current manifest",
+                        fragment.id
+                    ))
+                })?
+                .metadata()
+                .files
+                .len();
             metrics.files_removed += (original_files + 1).saturating_sub(fragment.files.len());
         }
         let transaction = Transaction::new(
@@ -264,48 +289,22 @@ impl Dataset {
         columns: &[&str],
         data_storage_version: Option<LanceFileVersion>,
     ) -> Result<CompactionMetrics> {
-        let executor = RewriteColumnsExecutor {
-            columns: columns.iter().map(|c| c.to_string()).collect(),
-            data_storage_version,
-        };
+        let executor = RewriteColumnsExecutor::new(columns, data_storage_version);
         let options = CompactionOptions::default();
-        let fragments = self.get_fragments();
-        let mut results = Vec::with_capacity(fragments.len());
-        for fragment in fragments {
-            match executor
-                .execute(Cow::Borrowed(&*self), fragment, &options)
-                .await
-            {
-                Ok(result) => results.push(result),
-                Err(err) => {
-                    self.cleanup_rewritten_files(&results).await;
-                    return Err(err);
-                }
-            }
-        }
-        RewriteColumnsCommitter
-            .commit(
-                self,
-                results,
-                Arc::new(crate::dataset::index::DatasetIndexRemapperOptions::default()),
-                &options,
-            )
-            .await
-    }
-
-    /// Delete the files a failed rewrite wrote: the last file of every
-    /// rewritten fragment is the only one that did not exist before.
-    async fn cleanup_rewritten_files(&self, results: &[Option<Fragment>]) {
-        let new_files = results
-            .iter()
-            .flatten()
-            .filter_map(|fragment| fragment.files.last())
-            .map(|file| Fragment {
-                files: vec![file.clone()],
-                ..Fragment::new(0)
-            })
-            .collect::<Vec<_>>();
-        cleanup_data_fragments(&self.object_store, &self.base, None, &new_files).await;
+        let tasks = self.get_fragments();
+        let concurrency = self.object_store.io_parallelism();
+        // Like vertical compaction, a failed run leaves its new files
+        // uncommitted and unreferenced; dataset cleanup reclaims them.
+        run_compaction_pipeline(
+            self,
+            executor,
+            RewriteColumnsCommitter,
+            tasks,
+            Arc::new(crate::dataset::index::DatasetIndexRemapperOptions::default()),
+            &options,
+            concurrency,
+        )
+        .await
     }
 }
 #[cfg(test)]
@@ -496,6 +495,21 @@ mod tests {
             "rewrite collapsed each fragment to one data file: {:?}",
             dataset.column_layout_stats()
         );
+        assert_eq!(dataset.scan().try_into_batch().await.unwrap(), before);
+        dataset.validate().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rewrite_after_fragment_fully_deleted() {
+        let mut dataset = write("memory://", LanceFileVersion::V2_0).await;
+        // Deleting every row of a fragment removes it from the manifest, so the
+        // rewrite runs over the surviving fragment(s); it must still succeed and
+        // leave the live rows byte-for-byte unchanged.
+        dataset.delete("a < 4").await.unwrap();
+        let before = dataset.scan().try_into_batch().await.unwrap();
+
+        dataset.rewrite_columns(&["c"], None).await.unwrap();
+
         assert_eq!(dataset.scan().try_into_batch().await.unwrap(), before);
         dataset.validate().await.unwrap();
     }
