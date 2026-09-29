@@ -820,7 +820,7 @@ pub trait CompactionCommitter: Send + Sync {
     ) -> Result<CompactionMetrics>;
 }
 
-/// Vertical compaction: rewrite groups of fragments via [`rewrite_files`],
+/// Vertical compaction: rewrite groups of fragments via `rewrite_files`,
 /// committed as `Operation::Rewrite` by [`RewriteCommitter`].
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RewriteExecutor;
