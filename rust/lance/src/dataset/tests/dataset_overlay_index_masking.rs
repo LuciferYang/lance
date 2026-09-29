@@ -255,6 +255,38 @@ async fn test_overlay_stale_drop_and_new_match(#[values(false, true)] stable_row
     assert_eq!(ids_matching(&dataset, "age = 20").await, vec![2]);
 }
 
+/// Horizontal compaction ([`Dataset::rewrite_columns`]) commits with an empty
+/// `fields_modified`, so an existing data overlay must be carried forward and
+/// keep shadowing the base — even when the rewrite repacks an unrelated column.
+#[tokio::test]
+async fn rewrite_columns_preserves_data_overlay() {
+    let dataset = create_base_dataset().await;
+    // Fragment 0, offset 1 is id=1, age=10; the overlay changes its age to 999.
+    let mut dataset = commit_overlay(
+        dataset,
+        "age_overlay",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![i32_array([Some(999)])],
+    )
+    .await;
+    assert_eq!(ids_matching(&dataset, "age = 999").await, vec![1]);
+
+    // Repack an unrelated column; the overlay on `age` must survive.
+    dataset.rewrite_columns(&["id"], None).await.unwrap();
+
+    assert_eq!(
+        dataset.get_fragment(0).unwrap().metadata().overlays.len(),
+        1,
+        "the data overlay must survive the rewrite"
+    );
+    // The overlaid value still shadows the base: age=999 for id=1, old 10 gone.
+    assert_eq!(ids_matching(&dataset, "age = 999").await, vec![1]);
+    assert_eq!(ids_matching(&dataset, "age = 10").await, Vec::<i32>::new());
+    dataset.validate().await.unwrap();
+}
+
 /// Row-level BTree precision: when one row in a covered fragment is stale, only that row is
 /// blocked from the index result and re-evaluated on the stale-Take path. Non-stale rows in
 /// the same fragment (including one that matches the predicate) remain on the indexed path.
