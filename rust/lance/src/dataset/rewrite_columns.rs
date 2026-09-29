@@ -541,4 +541,63 @@ mod tests {
         assert_eq!(dataset.scan().try_into_batch().await.unwrap(), before);
         dataset.validate().await.unwrap();
     }
+
+    #[tokio::test]
+    async fn rewrite_columns_conflicts_with_intervening_delete() {
+        use crate::dataset::index::DatasetIndexRemapperOptions;
+        use crate::dataset::optimize::{
+            CompactionCommitter, CompactionExecutor, CompactionOptions,
+        };
+        use std::borrow::Cow;
+
+        let mut dataset = write("memory://", LanceFileVersion::V2_0).await;
+
+        // Rewrite column "c" of fragment 0, reading at the current version.
+        let executor = RewriteColumnsExecutor::new(&["c"], None);
+        let fragment = dataset.get_fragment(0).unwrap();
+        let stale = executor
+            .execute(
+                Cow::Borrowed(&dataset),
+                fragment,
+                &CompactionOptions::default(),
+            )
+            .await
+            .unwrap()
+            .expect("fragment 0 has columns to repack");
+
+        // A delete lands on that same fragment before the rewrite is committed.
+        dataset.delete("a = 1").await.unwrap();
+        let after_delete = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(after_delete.num_rows(), 7);
+
+        // The rewrite was read before the delete, so committing it must conflict
+        // rather than publish the stale layout and resurrect the deleted row.
+        let committed = RewriteColumnsCommitter
+            .commit(
+                &mut dataset,
+                vec![Some(stale)],
+                Arc::new(DatasetIndexRemapperOptions::default()),
+                &CompactionOptions::default(),
+            )
+            .await;
+        assert!(
+            committed.is_err(),
+            "a rewrite read before the delete must not commit over it"
+        );
+
+        // The delete stands: seven rows, none with a = 1.
+        assert_eq!(dataset.scan().try_into_batch().await.unwrap(), after_delete);
+        assert_eq!(
+            dataset
+                .scan()
+                .filter("a = 1")
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap()
+                .num_rows(),
+            0
+        );
+        dataset.validate().await.unwrap();
+    }
 }
