@@ -364,7 +364,7 @@ fn shared_prefilter_future(
         };
         let CloneableResult(result) = future.await;
         waiter.mark_complete();
-        result.map_err(|error| error.0)
+        result.map_err(|error| error.into_inner())
     }
     .boxed()
 }
