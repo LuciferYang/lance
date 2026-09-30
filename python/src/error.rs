@@ -103,9 +103,8 @@ pub trait PythonErrorExt<T> {
 
 impl<T> PythonErrorExt<T> for std::result::Result<T, LanceError> {
     fn infer_error(self) -> PyResult<T> {
-        let err = match &self {
-            Ok(_) => return Ok(self.unwrap()),
-            Err(err) => err,
+        let Err(err) = &self else {
+            return Ok(self.unwrap());
         };
         // Classify by the root error so a coalesced `Error::Shared(..)` from a
         // shared cache/IO future maps to the same Python exception as the error
@@ -142,9 +141,8 @@ impl<T> PythonErrorExt<T> for std::result::Result<T, LanceError> {
     }
 
     fn io_or_timeout_error(self) -> PyResult<T> {
-        let err = match &self {
-            Ok(_) => return Ok(self.unwrap()),
-            Err(err) => err,
+        let Err(err) = &self else {
+            return Ok(self.unwrap());
         };
         match err.find_root() {
             LanceError::Timeout { .. } => Err(PyTimeoutError::new_err(err.to_string())),
@@ -159,9 +157,8 @@ impl<T> PythonErrorExt<T> for std::result::Result<T, LanceError> {
     }
 
     fn io_or_commit_conflict_error(self) -> PyResult<T> {
-        let err = match &self {
-            Ok(_) => return Ok(self.unwrap()),
-            Err(err) => err,
+        let Err(err) = &self else {
+            return Ok(self.unwrap());
         };
         match err.find_root() {
             root @ (LanceError::RetryableCommitConflict { .. }
