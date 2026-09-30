@@ -427,8 +427,8 @@ pub enum Error {
     /// deep-copying its source (see [`CloneableError`]). Accessors that read a
     /// variant or typed source rather than the message — [`Error::external_source`],
     /// [`Error::fence_reason`], [`Error::is_backpressure`], [`Error::is_not_found`],
-    /// [`Error::is_commit_status_unknown`] — see through this wrapper, so a shared
-    /// error answers them exactly as the error it wraps.
+    /// [`Error::is_commit_status_unknown`], [`Error::backtrace`] — see through this
+    /// wrapper, so a shared error answers them exactly as the error it wraps.
     #[snafu(transparent)]
     Shared { source: Arc<Self> },
 }
@@ -815,7 +815,8 @@ impl Error {
         }
     }
 
-    /// Returns a reference to the external error source if this is an `External` variant.
+    /// Returns a reference to the external error source if this is an `External`
+    /// variant, seeing through any `Shared` wrapper.
     ///
     /// This allows downcasting to recover the original error type.
     pub fn external_source(&self) -> Option<&BoxedError> {
@@ -825,9 +826,12 @@ impl Error {
         }
     }
 
-    /// Consumes the error and returns the external source if this is an `External` variant.
+    /// Consumes the error and returns the external source if this is an `External`
+    /// variant, seeing through a sole-owner `Shared` wrapper.
     ///
-    /// Returns `Err(self)` if this is not an `External` variant, allowing for chained handling.
+    /// Otherwise returns `Err` with an equivalent error for chained handling: a
+    /// sole-owner `Shared` is unwrapped to its inner error, a still-shared one
+    /// stays wrapped, and any other error is returned as-is.
     pub fn into_external(self) -> std::result::Result<BoxedError, Self> {
         match self {
             Self::External { source } => Ok(source),
@@ -1100,8 +1104,15 @@ pub struct CloneableError(Arc<Error>);
 
 impl CloneableError {
     /// Wrap an [`Error`] so it can be shared and cloned.
+    ///
+    /// An already-shared error reuses its inner `Arc` rather than nesting
+    /// another [`Error::Shared`], so repeatedly wrapping and recovering the
+    /// same error keeps the wrapper flat instead of growing a `Shared` chain.
     pub fn new(error: Error) -> Self {
-        Self(Arc::new(error))
+        Self(match error {
+            Error::Shared { source } => source,
+            other => Arc::new(other),
+        })
     }
 
     /// Borrow the shared error.
@@ -1196,6 +1207,55 @@ mod test {
                 .expect("external source must survive a clone");
             assert_eq!(source.downcast_ref::<MyCustomError>().unwrap().code, 7);
         }
+    }
+
+    /// `new` must reuse an already-shared error's Arc instead of nesting another
+    /// `Shared` layer, so repeated share/recover cycles cannot grow the depth
+    /// (and with it the depth-proportional recursion in `into_external`,
+    /// `Display`, `backtrace`, and `Drop`).
+    #[test]
+    fn cloneable_error_new_flattens_shared() {
+        let shared = Error::Shared {
+            source: Arc::new(Error::io("disk gone")),
+        };
+        let wrapped = CloneableError::new(shared);
+        assert!(matches!(wrapped.inner(), Error::IO { .. }));
+        assert!(!matches!(wrapped.inner(), Error::Shared { .. }));
+    }
+
+    /// A sole owner recovers the concrete inner error, not a `Shared` wrapper —
+    /// the common consumer path (e.g. moka's `unwrap_or_clone(..).into_inner()`).
+    #[test]
+    fn into_inner_sole_owner_returns_concrete_variant() {
+        let recovered = CloneableError::new(Error::io("solo")).into_inner();
+        assert!(matches!(recovered, Error::IO { .. }));
+    }
+
+    /// A still-shared error cannot surrender ownership of its source, so
+    /// `into_external` returns it re-wrapped rather than the boxed source.
+    #[test]
+    fn into_external_keeps_multi_owner_shared_wrapped() {
+        let arc = Arc::new(Error::external(Box::new(MyCustomError {
+            code: 5,
+            message: "still shared".into(),
+        })));
+        let _second_owner = arc.clone(); // refcount 2 → try_unwrap must fail
+        match (Error::Shared { source: arc }).into_external() {
+            Err(Error::Shared { .. }) => {}
+            other => panic!("multi-owner Shared must stay wrapped, got {other:?}"),
+        }
+    }
+
+    /// `backtrace()` delegates through the `Shared` wrapper to the inner error.
+    #[test]
+    fn backtrace_sees_through_shared() {
+        let shared = Error::Shared {
+            source: Arc::new(Error::io("io")),
+        };
+        assert_eq!(
+            shared.backtrace().is_some(),
+            Error::io("io").backtrace().is_some()
+        );
     }
 
     /// Every accessor that reads a variant or typed source rather than the
