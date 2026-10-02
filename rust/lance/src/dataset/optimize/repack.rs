@@ -75,13 +75,14 @@ fn file_coverage(file: &DataFile, schema: &Schema) -> HashSet<i32> {
 /// A merge only takes files it empties: files whose columns can all move,
 /// which hold no spilled lineage and share no column with a file holding it,
 /// and whose other fields (a struct header) belong to columns that move too.
-/// The files left keep their columns, though a struct moved out of one
-/// leaves a tombstone where its header was. Without groups, when every file
-/// holding a column can be emptied, one of them stays unless `max_files` is
-/// 1: the largest by recorded size, with the files sharing no column with it
-/// merged, or if that leaves fewer than two, every other file. Nothing is
-/// merged unless at least two files would be emptied, so a merge lowers the
-/// file count.
+/// The files left keep the columns that do not move. Without groups, when
+/// every file holding a column can be emptied, one of them stays unless
+/// `max_files` is 1. Trying the files in order of recorded size, the one kept
+/// is the first whose merge (of the files sharing no column with it, else of
+/// every other file, as long as it keeps a column) leaves the largest file
+/// in place, or failing that the first with any merge. Nothing is merged
+/// unless at least two files would be emptied, so a merge lowers the file
+/// count.
 ///
 /// A column the fragment has no data for (added as all nulls) is left out of
 /// its group, and a group holding a blob column, or a column whose fields are
@@ -246,8 +247,7 @@ pub(super) fn plan_fragment_repack(
             let all = emptied(candidates);
             let holding = file_columns.iter().filter(|c| !c.is_empty()).count();
             // A file a move cannot empty stays anyway. Otherwise one file
-            // stays unless the limit is 1: the largest whose staying still
-            // leaves two files to merge.
+            // stays unless the limit is 1.
             let merged = if all.len() < holding || max_files == Some(1) {
                 all
             } else {
@@ -258,27 +258,29 @@ pub(super) fn plan_fragment_repack(
                         file_columns[*index].len(),
                     ))
                 });
-                // Prefer merging only files that share no column with the
-                // file kept, which leaves it untouched; else merge every
-                // other file, as long as the kept file keeps a column.
-                by_size
-                    .iter()
-                    .find_map(|kept| {
-                        let kept_columns = &file_columns[*kept];
-                        let untouched = emptied(
-                            all.iter()
-                                .copied()
-                                .filter(|index| file_columns[*index].is_disjoint(kept_columns))
-                                .collect(),
-                        );
-                        if untouched.len() > 1 {
-                            return Some(untouched);
-                        }
-                        let others =
-                            emptied(all.iter().copied().filter(|index| index != kept).collect());
-                        (others.len() > 1 && !kept_columns.is_subset(&columns_of(&others)))
-                            .then_some(others)
-                    })
+                // For each file kept, largest first: merge the files sharing
+                // no column with it, which leaves it untouched, else every
+                // other file, as long as the kept file keeps a column. A plan
+                // that leaves the largest file in place wins.
+                let plans = by_size.iter().flat_map(|kept| {
+                    let untouched = emptied(
+                        all.iter()
+                            .copied()
+                            .filter(|index| file_columns[*index].is_disjoint(&file_columns[*kept]))
+                            .collect(),
+                    );
+                    let others = emptied(all.iter().copied().filter(|i| i != kept).collect());
+                    let keeps_a_column = !file_columns[*kept].is_subset(&columns_of(&others));
+                    [Some(untouched), keeps_a_column.then_some(others)]
+                        .into_iter()
+                        .flatten()
+                        .filter(|merged| merged.len() > 1)
+                });
+                let largest = by_size[0];
+                plans
+                    .clone()
+                    .find(|merged| !merged.contains(&largest))
+                    .or_else(|| plans.clone().next())
                     .unwrap_or_default()
             };
             if merged.len() > 1 {

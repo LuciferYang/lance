@@ -326,10 +326,11 @@ pub struct CompactionOptions {
     /// The count is [`FragmentColumnLayoutStats::live_file_count`]. Only
     /// files the repack empties are merged, at least two at a time. A file
     /// stays when it holds a blob column, a column only partly in the
-    /// fragment's files, or spilled row lineage, or shares a column with such
-    /// a file; without `column_groups`, when every file could go, the largest
-    /// stays unless the limit is 1. So a fragment can stay above the limit;
-    /// so can one with more `column_groups` than the limit allows.
+    /// fragment's files, or spilled row lineage, or shares a column with a
+    /// file holding spilled row lineage; without `column_groups`, when every
+    /// file holding a column could go, one stays (usually the largest) unless
+    /// the limit is 1. So a fragment can stay above the limit; so can one with
+    /// more `column_groups` than the limit allows.
     /// The repack writes each new file whole, with no `max_bytes_per_file`
     /// split. Not planned under `ForceBinaryCopy`, since a repack reencodes.
     ///

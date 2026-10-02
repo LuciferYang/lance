@@ -1190,3 +1190,48 @@ fn repack_keeps_the_largest_file_next_to_a_header_only_file() {
         Some(vec![vec![1, 4]])
     );
 }
+
+/// A merge that leaves the largest file untouched wins over one that merges
+/// it away, even when a smaller file is the one kept.
+#[test]
+fn repack_prefers_leaving_the_largest_file_untouched() {
+    use arrow_schema::Fields;
+    let child = |name: &str| Field::new(name, DataType::Int32, true);
+    let sized = |path: &str, fields: Vec<i32>, size: u64| {
+        let mut file = v2_0_file(path, fields);
+        file.file_size_bytes = lance_io::utils::CachedFileSize::new(size);
+        file
+    };
+    // s=0 {x=1, y=2, z=3}, t=4 {p=5, q=6}, c=7.
+    let schema = lance_schema(Schema::new(vec![
+        Field::new(
+            "s",
+            DataType::Struct(Fields::from(vec![child("x"), child("y"), child("z")])),
+            true,
+        ),
+        Field::new(
+            "t",
+            DataType::Struct(Fields::from(vec![child("p"), child("q")])),
+            true,
+        ),
+        child("c"),
+    ]));
+    let mut fragment = Fragment::new(0);
+    fragment.files = vec![
+        sized("k.lance", vec![0, 1, 4, 5], 100),
+        sized("m1.lance", vec![0, 2, 7], 10),
+        sized("m2.lance", vec![0, 3], 10),
+        sized("m3.lance", vec![4, 6], 10),
+    ];
+    // Keeping m3 merges m1 and m2 (s and c) and leaves k holding t.
+    assert_eq!(
+        crate::dataset::optimize::repack::plan_fragment_repack(
+            &schema,
+            &fragment,
+            4,
+            None,
+            Some(3)
+        ),
+        Some(vec![vec![0, 7]])
+    );
+}
