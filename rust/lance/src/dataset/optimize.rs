@@ -860,14 +860,11 @@ impl CompactionCommitter for RewriteCommitter {
 }
 
 /// Run a compaction pipeline: execute every task with bounded concurrency, then
-/// commit the collected results. This is the one orchestration a compaction
-/// pipeline funnels through: vertical rides it here as `RewriteExecutor` plus
-/// `RewriteCommitter`, and a second executor/committer pair (horizontal
-/// compaction, added in a follow-up) plugs in the same way. So the
-/// [`CompactionExecutor`]/[`CompactionCommitter`] traits carry real polymorphism
-/// (a caller with its own pair plugs in here) rather than documenting a seam
-/// nothing consumes. Pipelines still differ in how they produce tasks and which
-/// operation they commit; only the execute-collect-commit skeleton is shared.
+/// commit the collected results. Vertical compaction runs through it as
+/// `RewriteExecutor` plus `RewriteCommitter`; horizontal compaction, added in a
+/// follow-up, is a second executor/committer pair through the same function.
+/// Pipelines still differ in how they produce tasks and which operation they
+/// commit; only the execute-collect-commit skeleton is shared.
 pub(crate) async fn run_compaction_pipeline<E, C>(
     dataset: &mut Dataset,
     executor: E,
