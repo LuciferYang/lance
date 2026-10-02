@@ -2594,6 +2594,7 @@ mod tests {
             2,
             vec![1, 2, 1],
             0.0,
+            None,
             0,
             OffsetPreloadSource::Writer(vec![1, 2, 2, 2, 3, 4]),
         )
@@ -2672,6 +2673,7 @@ mod tests {
             2,
             vec![1, 2, 1],
             0.0,
+            None,
         )
         .await
         .unwrap();
@@ -2738,6 +2740,7 @@ mod tests {
             2,
             vec![1, 2, 1],
             0.0,
+            None,
             DEFAULT_MAX_PRELOADED_OFFSETS_BYTES,
             OffsetPreloadSource::ForcedOnDemand,
         )
@@ -2759,6 +2762,7 @@ mod tests {
             2,
             vec![1, 2, 1],
             0.0,
+            None,
             DEFAULT_MAX_PRELOADED_OFFSETS_BYTES,
             OffsetPreloadSource::Sidecar,
         )
