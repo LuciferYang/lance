@@ -1297,7 +1297,7 @@ pub async fn compact_files(
 ) -> Result<CompactionMetrics> {
     info!(target: TRACE_DATASET_EVENTS, event=DATASET_COMPACTING_EVENT, uri = &dataset.uri);
     let planner = DefaultCompactionPlanner::new(options)?;
-    compact_files_with_planner(dataset, remap_options, &planner).await
+    Box::pin(compact_files_with_planner(dataset, remap_options, &planner)).await
 }
 
 pub async fn compact_files_with_planner(
@@ -1305,7 +1305,13 @@ pub async fn compact_files_with_planner(
     remap_options: Option<Arc<dyn IndexRemapperOptions>>, // These will be deprecated later
     planner: &dyn CompactionPlanner,
 ) -> Result<CompactionMetrics> {
-    compact_files_with_executor(dataset, remap_options, planner, &DefaultCompactionExecutor).await
+    Box::pin(compact_files_with_executor(
+        dataset,
+        remap_options,
+        planner,
+        &DefaultCompactionExecutor,
+    ))
+    .await
 }
 
 /// Plan with `planner`, run every task with `executor`, and commit the
@@ -3808,7 +3814,7 @@ pub async fn commit_compaction(
              a plan may put a fragment in one kind of task only"
         )));
     }
-    let mut metrics = commit_rewrites(dataset, rewrites, remap_options, options).await?;
+    let mut metrics = Box::pin(commit_rewrites(dataset, rewrites, remap_options, options)).await?;
     metrics += repack::commit_repacked_files(dataset, repacks, options).await?;
     Ok(metrics)
 }

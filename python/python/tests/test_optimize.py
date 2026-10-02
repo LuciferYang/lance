@@ -192,8 +192,9 @@ def test_distributed_repack(tmp_path: Path):
     dataset = _backfilled(tmp_path)
     expected = dataset.to_table()
 
+    # c and d sit in separate files, so the group moves them into one.
     plan = Compaction.plan(
-        dataset, options=dict(column_groups=[["d"]], scope="repack_columns")
+        dataset, options=dict(column_groups=[["c", "d"]], scope="repack_columns")
     )
     assert [task.kind for task in plan.tasks] == ["repack_columns"] * 2
     results = [
