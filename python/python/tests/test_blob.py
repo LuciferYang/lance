@@ -5,12 +5,14 @@ import gc
 import importlib
 import io
 import queue
+import random
 import subprocess
 import sys
 import tarfile
 import textwrap
 import threading
 import uuid
+import zipfile
 from pathlib import Path
 
 import lance
@@ -23,6 +25,8 @@ from lance.file import LanceFileSession
 from lance.fragment import write_fragments
 
 lance_dataset_module = importlib.import_module("lance.dataset")
+
+LEGACY_BLOB_STORAGE_VERSION = "2.1"
 
 
 def _blob_row_ids(dataset):
@@ -213,7 +217,11 @@ def test_blob_descriptions(tmp_path):
             ]
         ),
     )
-    ds = lance.write_dataset(table, tmp_path / "test_ds")
+    ds = lance.write_dataset(
+        table,
+        tmp_path / "test_ds",
+        data_storage_version=LEGACY_BLOB_STORAGE_VERSION,
+    )
     # These positions may be surprising but lance pads buffers to 64-byte boundaries
     expected_positions = pa.array([0, 64, 128], pa.uint64())
     expected_sizes = pa.array([3, 3, 3], pa.uint64())
@@ -236,7 +244,11 @@ def test_scan_blob_as_binary(tmp_path):
             ]
         ),
     )
-    ds = lance.write_dataset(table, tmp_path / "test_ds")
+    ds = lance.write_dataset(
+        table,
+        tmp_path / "test_ds",
+        data_storage_version=LEGACY_BLOB_STORAGE_VERSION,
+    )
 
     tbl = ds.scanner(columns=["blobs"], blob_handling="all_binary").to_table()
     assert tbl.column("blobs").to_pylist() == values
@@ -254,7 +266,11 @@ def test_sql_blob_as_binary(tmp_path):
             ]
         ),
     )
-    ds = lance.write_dataset(table, tmp_path / "test_ds")
+    ds = lance.write_dataset(
+        table,
+        tmp_path / "test_ds",
+        data_storage_version=LEGACY_BLOB_STORAGE_VERSION,
+    )
 
     batches = (
         ds.sql("SELECT blobs FROM dataset")
@@ -312,7 +328,11 @@ def test_fragment_scan_blob_as_binary(tmp_path):
             ]
         ),
     )
-    ds = lance.write_dataset(table, tmp_path / "test_ds")
+    ds = lance.write_dataset(
+        table,
+        tmp_path / "test_ds",
+        data_storage_version=LEGACY_BLOB_STORAGE_VERSION,
+    )
 
     fragment = ds.get_fragments()[0]
 
@@ -338,7 +358,11 @@ def dataset_with_blobs(tmp_path):
             ]
         ),
     )
-    ds = lance.write_dataset(table, tmp_path / "test_ds")
+    ds = lance.write_dataset(
+        table,
+        tmp_path / "test_ds",
+        data_storage_version=LEGACY_BLOB_STORAGE_VERSION,
+    )
 
     values = pa.array([b"qux", b"quux", b"corge"], pa.large_binary())
     idx = pa.array([3, 4, 5], pa.uint64())
@@ -426,7 +450,11 @@ def test_blob_files_close_no_shutdown_panic(tmp_path):
                 ]
             ),
         )
-        ds = lance.write_dataset(table, {str(tmp_path / "ds")!r})
+        ds = lance.write_dataset(
+            table,
+            {str(tmp_path / "ds")!r},
+            data_storage_version={LEGACY_BLOB_STORAGE_VERSION!r},
+        )
         row_ids = ds.to_table(columns=[], with_row_id=True).column("_rowid").to_pylist()
         blobs = ds.take_blobs("blob", ids=row_ids)
         for blob in blobs:
@@ -476,6 +504,7 @@ def test_blob_files_by_address_with_stable_row_ids(tmp_path):
     ds = lance.write_dataset(
         table,
         tmp_path / "test_ds",
+        data_storage_version=LEGACY_BLOB_STORAGE_VERSION,
         enable_stable_row_ids=True,
     )
 
@@ -814,6 +843,40 @@ def test_blob_file_seek(tmp_path, dataset_with_blobs):
     with blobs[1] as f:
         assert f.seek(1) == 1
         assert f.read(1) == b"a"
+        assert f.seek(-1, io.SEEK_CUR) == 1
+        assert f.seek(-1, io.SEEK_END) == 2
+
+
+@pytest.mark.parametrize(
+    "whence",
+    [
+        pytest.param(io.SEEK_SET, id="set"),
+        pytest.param(io.SEEK_CUR, id="cur"),
+        pytest.param(io.SEEK_END, id="end"),
+    ],
+)
+def test_blob_file_negative_seek_raises_value_error(dataset_with_blobs, whence):
+    blob = dataset_with_blobs.take_blobs("blobs", indices=[1])[0]
+    offset = -(blob.size() + 1) if whence == io.SEEK_END else -1
+    with pytest.raises(ValueError, match="negative seek value -1"):
+        blob.seek(offset, whence)
+    assert blob.tell() == 0
+
+
+def test_blob_file_negative_seek_does_not_move_cursor(dataset_with_blobs):
+    blob = dataset_with_blobs.take_blobs("blobs", indices=[1])[0]
+    blob.seek(2)
+    with pytest.raises(ValueError, match="negative seek value -1"):
+        blob.seek(-1)
+    assert blob.tell() == 2
+
+
+def test_blob_file_read_past_eof_leaves_cursor(dataset_with_blobs):
+    with dataset_with_blobs.take_blobs("blobs", indices=[1])[0] as blob:
+        past_eof = blob.size() + 1
+        assert blob.seek(past_eof) == past_eof
+        assert blob.read() == b""
+        assert blob.tell() == past_eof
 
 
 @pytest.mark.parametrize(
@@ -886,7 +949,11 @@ def test_null_blobs(tmp_path):
             ]
         ),
     )
-    ds = lance.write_dataset(table, tmp_path / "test_ds")
+    ds = lance.write_dataset(
+        table,
+        tmp_path / "test_ds",
+        data_storage_version=LEGACY_BLOB_STORAGE_VERSION,
+    )
 
     blobs = ds.take_blobs("blob", ids=range(100))
     assert blobs == [None] * 100
@@ -930,6 +997,213 @@ def test_blob_file_read_middle(tmp_path, dataset_with_blobs):
         assert f.read(1) == b"b"
         assert f.read(1) == b"a"
         assert f.read(1) == b"r"
+
+
+def test_blob_file_buffer_size_configures_inner():
+    inner = _CountingBlobInner(b"x")
+    blob = BlobFile(inner, buffer_size=64 * 1024)
+
+    assert isinstance(blob, io.BufferedIOBase)
+    assert inner.buffer_size == 64 * 1024
+
+
+def test_blob_file_buffer_size_zero_configures_inner():
+    inner = _CountingBlobInner(b"x")
+    BlobFile(inner, buffer_size=0)
+    assert inner.buffer_size == 0
+
+
+def test_blob_file_read_range_does_not_issue_sequential_read():
+    payload = bytes(range(256))
+    inner = _CountingBlobInner(payload)
+    blob = BlobFile(inner, buffer_size=64)
+
+    assert blob.read_range(1, 3) == payload[1:4]
+    assert blob.tell() == 0
+    assert inner.read_sizes == []
+    assert blob.read(2) == payload[:2]
+
+
+def test_blob_file_read_range_does_not_move_cursor():
+    payload = bytes(range(256)) * 4
+    inner = _CountingBlobInner(payload)
+    blob = BlobFile(inner, buffer_size=64)
+
+    assert blob.read(8) == payload[:8]
+    assert blob.tell() == 8
+    assert blob.read_range(20, 5) == payload[20:25]
+    assert blob.tell() == 8
+    assert blob.read(4) == payload[8:12]
+
+
+@pytest.mark.parametrize("buffer_size", [32, 0])
+def test_blob_file_text_wrapper_readline(buffer_size):
+    payload = b"hello\nworld\n"
+    blob = BlobFile(_CountingBlobInner(payload), buffer_size=buffer_size)
+    wrapper = io.TextIOWrapper(blob, encoding="utf-8")
+
+    assert wrapper.readline() == "hello\n"
+    assert wrapper.readline() == "world\n"
+
+
+def test_take_blobs_sequential_small_reads_reuse_prefetch(tmp_path):
+    payload = bytes(range(256)) * 160
+    ds = lance.write_dataset(
+        _complete_blob_table([0], [payload]),
+        tmp_path / "seq_prefetch",
+        data_storage_version="2.2",
+    )
+    blob = ds.take_blobs("blob", indices=[0], buffer_size=32 * 1024)[0]
+
+    assert _read_in_8k_chunks(blob) == payload
+    assert blob.inner._range_submission_count() == 2
+
+
+def test_take_blobs_buffer_size_zero_fetches_each_sequential_read(tmp_path):
+    payload = b"x" * (24 * 1024)
+    ds = lance.write_dataset(
+        _complete_blob_table([0], [payload]),
+        tmp_path / "seq_unbuffered",
+        data_storage_version="2.2",
+    )
+    blob = ds.take_blobs("blob", indices=[0], buffer_size=0)[0]
+
+    assert _read_in_8k_chunks(blob) == payload
+    assert blob.inner._range_submission_count() == 3
+
+
+def test_take_blobs_seek_inside_prefetch_does_not_refetch(tmp_path):
+    payload = bytes((i * 31) % 256 for i in range(40 * 1024))
+    ds = lance.write_dataset(
+        _complete_blob_table([0], [payload]),
+        tmp_path / "seek_inside",
+        data_storage_version="2.2",
+    )
+    blob = ds.take_blobs("blob", indices=[0], buffer_size=32 * 1024)[0]
+
+    assert blob.read(100) == payload[:100]
+    after_fill = blob.inner._range_submission_count()
+    blob.seek(1000)
+    assert blob.read(100) == payload[1000:1100]
+    assert blob.inner._range_submission_count() == after_fill
+
+
+def test_take_blobs_seek_outside_prefetch_issues_new_range_submission(tmp_path):
+    payload = random.Random(0).randbytes(40 * 1024)
+    ds = lance.write_dataset(
+        _complete_blob_table([0], [payload]),
+        tmp_path / "seek_outside",
+        data_storage_version="2.2",
+    )
+    blob = ds.take_blobs("blob", indices=[0], buffer_size=32 * 1024)[0]
+
+    assert blob.read(100) == payload[:100]
+    after_fill = blob.inner._range_submission_count()
+    blob.seek(33 * 1024)
+    assert blob.read(100) == payload[33 * 1024 : 33 * 1024 + 100]
+    assert blob.inner._range_submission_count() == after_fill + 1
+
+
+def test_take_blobs_read_fills_across_buffer_boundary(tmp_path):
+    payload = bytes(range(40))
+    ds = lance.write_dataset(
+        _complete_blob_table([0], [payload]),
+        tmp_path / "read_boundary",
+        data_storage_version="2.2",
+    )
+    blob = ds.take_blobs("blob", indices=[0], buffer_size=16)[0]
+    assert blob.read(4) == payload[:4]
+    assert blob.read(20) == payload[4:24]
+    assert blob.tell() == 24
+
+    blob = ds.take_blobs("blob", indices=[0], buffer_size=16)[0]
+    assert blob.read(4) == payload[:4]
+    buf = bytearray(20)
+    assert blob.readinto(buf) == 20
+    assert bytes(buf) == payload[4:24]
+
+    blob = ds.take_blobs("blob", indices=[0], buffer_size=16)[0]
+    assert blob.read(4) == payload[:4]
+    assert blob.read1(20) == payload[4:24]
+    assert blob.tell() == 24
+
+
+def test_take_blobs_text_wrapper_readline(tmp_path):
+    payload = b"hello\nworld\n"
+    ds = lance.write_dataset(
+        _complete_blob_table([0], [payload]),
+        tmp_path / "text_wrapper",
+        data_storage_version="2.2",
+    )
+    blob = ds.take_blobs("blob", indices=[0])[0]
+    wrapper = io.TextIOWrapper(blob, encoding="utf-8")
+
+    assert wrapper.readline() == "hello\n"
+    assert wrapper.readline() == "world\n"
+
+
+def test_blob_file_readinto_readonly_does_not_advance_cursor():
+    inner = _CountingBlobInner(b"abcdef")
+    blob = BlobFile(inner, buffer_size=0)
+
+    with pytest.raises(TypeError, match="read-write"):
+        blob.readinto(b"xx")
+    assert blob.tell() == 0
+    assert inner.read_sizes == []
+
+
+def test_blob_file_empty_read_after_close_raises():
+    blob = BlobFile(_CountingBlobInner(b"abcdef"), buffer_size=0)
+    blob.close()
+
+    with pytest.raises(ValueError, match="read of closed file"):
+        blob.read(0)
+    with pytest.raises(ValueError, match="readinto of closed file"):
+        blob.readinto(bytearray())
+
+
+@pytest.mark.parametrize(
+    ("buffer_size", "match"),
+    [
+        pytest.param(-1, "non-negative", id="negative"),
+        pytest.param(True, "must be an int", id="bool"),
+        pytest.param(1.5, "must be an int", id="float"),
+    ],
+)
+def test_blob_file_rejects_invalid_buffer_size(buffer_size, match):
+    with pytest.raises((TypeError, ValueError), match=match):
+        BlobFile(_CountingBlobInner(b"x"), buffer_size=buffer_size)
+
+
+def test_take_blobs_buffer_size_zero_reads_payload(dataset_with_blobs):
+    blob = dataset_with_blobs.take_blobs("blobs", indices=[1], buffer_size=0)[0]
+    assert isinstance(blob, BlobFile)
+    assert blob.read() == b"bar"
+
+
+def test_take_blobs_rejects_invalid_buffer_size_for_empty_selection(dataset_with_blobs):
+    with pytest.raises(ValueError, match="non-negative"):
+        dataset_with_blobs.take_blobs("blobs", indices=[], buffer_size=-1)
+
+
+def test_blob_file_zipfile_reads_payload(tmp_path):
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("hello.txt", "hello blob")
+    payload = archive.getvalue()
+
+    table = pa.table(
+        {"blob": lance.blob_array([payload])},
+        schema=pa.schema([lance.blob_field("blob")]),
+    )
+    ds = lance.write_dataset(
+        table,
+        tmp_path / "zip_blob",
+        data_storage_version="2.2",
+    )
+    blob = ds.take_blobs("blob", indices=[0])[0]
+    with zipfile.ZipFile(blob) as zf:
+        assert zf.read("hello.txt") == b"hello blob"
 
 
 def test_take_deleted_blob(tmp_path, dataset_with_blobs):
@@ -2363,7 +2637,11 @@ def dataset_for_pandas_blob_tests(tmp_path):
             ]
         ),
     )
-    return lance.write_dataset(table, tmp_path / "blob_pandas_ds")
+    return lance.write_dataset(
+        table,
+        tmp_path / "blob_pandas_ds",
+        data_storage_version=LEGACY_BLOB_STORAGE_VERSION,
+    )
 
 
 @pytest.fixture
@@ -2610,7 +2888,11 @@ def dataset_with_nested_blobs(tmp_path):
         [pa.array([1, 2, 3], pa.int64()), info_array],
         schema=pa.schema([pa.field("id", pa.int64()), pa.field("info", info_type)]),
     )
-    return lance.write_dataset(table, tmp_path / "nested_blob_ds")
+    return lance.write_dataset(
+        table,
+        tmp_path / "nested_blob_ds",
+        data_storage_version=LEGACY_BLOB_STORAGE_VERSION,
+    )
 
 
 def test_to_pandas_returns_blob_file_handles_for_nested_fields(
@@ -2829,3 +3111,62 @@ def test_packed_blob_writer_bulk_fixed_size_binary(tmp_path, as_chunked):
 
     assert descriptors.to_pylist() == expected_descriptors
     assert _blob_sidecar_path(tmp_path, file_id, blob_id).read_bytes() == b"wordtest"
+
+
+class _CountingBlobInner:
+    def __init__(self, payload: bytes):
+        self._payload = payload
+        self._pos = 0
+        self._closed = False
+        self.buffer_size: int | None = None
+        self.read_sizes: list[int] = []
+
+    def set_buffer_size(self, buffer_size: int) -> None:
+        self.buffer_size = buffer_size
+
+    def close(self) -> None:
+        self._closed = True
+
+    def is_closed(self) -> bool:
+        return self._closed
+
+    def seek(self, position: int) -> None:
+        self._pos = position
+
+    def tell(self) -> int:
+        return self._pos
+
+    def size(self) -> int:
+        return len(self._payload)
+
+    def readall(self) -> bytes:
+        data = self._payload[self._pos :]
+        if data:
+            self.read_sizes.append(len(data))
+        self._pos = len(self._payload)
+        return data
+
+    def read_range(self, offset: int, length: int) -> bytes:
+        return self._payload[offset : offset + length]
+
+    def read_ranges(self, ranges: list[tuple[int, int]]) -> list[bytes]:
+        return [self.read_range(offset, length) for offset, length in ranges]
+
+    def read_into(self, b: bytearray) -> int:
+        if self._pos >= len(self._payload):
+            return 0
+        bytes_read = min(len(b), len(self._payload) - self._pos)
+        self.read_sizes.append(bytes_read)
+        b[:bytes_read] = self._payload[self._pos : self._pos + bytes_read]
+        self._pos += bytes_read
+        return bytes_read
+
+
+def _read_in_8k_chunks(blob: BlobFile) -> bytes:
+    chunks = []
+    while True:
+        chunk = blob.read(8192)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return b"".join(chunks)
