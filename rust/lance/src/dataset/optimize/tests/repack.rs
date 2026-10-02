@@ -782,8 +782,9 @@ async fn commit_rejects_a_fragment_in_both_kinds_of_task() {
     assert_eq!(dataset.manifest.version, version);
 }
 
-/// A column that cannot move outside the kept file stays where it is; the
-/// columns that can move are still merged.
+/// A blob column outside the lineage file stays where it is; the columns
+/// that can move are still merged. The lineage is what makes `lineage.lance`
+/// the file kept.
 #[test]
 fn repack_merges_around_a_blob_outside_the_kept_file() {
     use lance_table::format::{ROW_ID_FIELD_ID, RowIdMeta};
@@ -819,4 +820,72 @@ fn repack_merges_around_a_blob_outside_the_kept_file() {
             "max_files={max_files}"
         );
     }
+}
+
+/// A file holding a column that cannot move is never partly emptied: moving
+/// its other columns out would add a file instead of removing one.
+#[test]
+fn repack_never_adds_a_file() {
+    use lance_table::format::{ROW_ID_FIELD_ID, RowIdMeta};
+    let blob = |name: &str| {
+        let mut field = Field::new(name, DataType::LargeBinary, true);
+        field.set_metadata(std::collections::HashMap::from([(
+            lance_arrow::BLOB_META_KEY.to_string(),
+            "true".to_string(),
+        )]));
+        field
+    };
+    let plan = |schema: &lance_core::datatypes::Schema, fragment: &Fragment, max| {
+        crate::dataset::optimize::repack::plan_fragment_repack(
+            schema,
+            fragment,
+            fragment.files.len(),
+            None,
+            Some(max),
+        )
+    };
+
+    // Lineage in one file, a blob next to a movable column in the other.
+    let schema = lance_schema(Schema::new(vec![
+        Field::new("a", DataType::Int32, true),
+        blob("img"),
+        Field::new("d", DataType::Int32, true),
+    ]));
+    let mut fragment = Fragment::new(0);
+    fragment.files = vec![
+        v2_0_file("lineage.lance", vec![0, ROW_ID_FIELD_ID]),
+        v2_0_file("mixed.lance", vec![1, 2]),
+    ];
+    fragment.row_id_meta = Some(RowIdMeta::Column);
+    assert_eq!(plan(&schema, &fragment, 1), None);
+
+    // Two files, each a blob next to a movable column.
+    let schema = lance_schema(Schema::new(vec![
+        Field::new("id", DataType::Int32, true),
+        blob("img1"),
+        blob("img2"),
+        Field::new("cap", DataType::Utf8, true),
+    ]));
+    let mut fragment = Fragment::new(0);
+    fragment.files = vec![
+        v2_0_file("base.lance", vec![0, 1]),
+        v2_0_file("extra.lance", vec![2, 3]),
+    ];
+    assert_eq!(plan(&schema, &fragment, 1), None);
+
+    // A blob next to a movable column, and two movable files: only those two
+    // merge.
+    let schema = lance_schema(Schema::new(vec![
+        blob("img"),
+        Field::new("d", DataType::Int32, true),
+        Field::new("e", DataType::Int32, true),
+        Field::new("f", DataType::Int32, true),
+    ]));
+    let mut fragment = Fragment::new(0);
+    fragment.files = vec![
+        v2_0_file("mixed.lance", vec![0, 1]),
+        v2_0_file("e.lance", vec![2]),
+        v2_0_file("f.lance", vec![3]),
+    ];
+    assert_eq!(plan(&schema, &fragment, 2), Some(vec![vec![2, 3]]));
 }

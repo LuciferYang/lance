@@ -324,12 +324,13 @@ pub struct CompactionOptions {
     /// repack rewrites only the columns that move and keeps rows, fragment ids
     /// and indices as they are (see [`CompactionTaskKind::RepackColumns`]).
     /// The count is [`FragmentColumnLayoutStats::live_file_count`]. The
-    /// columns of one file stay where they are (unless the limit is 1 and
-    /// every column can move), and blob columns never move, so a fragment can
-    /// stay above the limit; so can one with more `column_groups` than the
-    /// limit allows. The repack
-    /// writes each new file whole, with no `max_bytes_per_file` split. Not
-    /// planned under `ForceBinaryCopy`, since a repack reencodes.
+    /// columns of one file stay where they are (unless the limit is 1, every
+    /// column can move and no file holds spilled row lineage), and a file
+    /// holding a blob column, a column only partly in the fragment's files,
+    /// or spilled row lineage is never emptied, so a fragment can stay above
+    /// the limit; so can one with more `column_groups` than the limit allows.
+    /// The repack writes each new file whole, with no `max_bytes_per_file`
+    /// split. Not planned under `ForceBinaryCopy`, since a repack reencodes.
     ///
     /// Defaults to `None` (no file-count trigger). Must be at least 1.
     ///
