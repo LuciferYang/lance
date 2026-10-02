@@ -685,7 +685,8 @@ async fn test_vector_batch_falls_back_on_overlay(#[values(false, true)] stable_r
     scanner
         .nearest("vec", queries.as_ref(), 3)
         .unwrap()
-        .nprobes(1)
+        .minimum_nprobes(1)
+        .maximum_nprobes(1)
         .project(&["id"])
         .unwrap();
     let plan = scanner.explain_plan(false).await.unwrap();
@@ -700,7 +701,8 @@ async fn test_vector_batch_falls_back_on_overlay(#[values(false, true)] stable_r
     scanner
         .nearest("vec", queries.as_ref(), 3)
         .unwrap()
-        .nprobes(1)
+        .minimum_nprobes(1)
+        .maximum_nprobes(1)
         .project(&["id"])
         .unwrap();
     let plan = scanner.explain_plan(false).await.unwrap();
