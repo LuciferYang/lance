@@ -782,9 +782,8 @@ async fn commit_rejects_a_fragment_in_both_kinds_of_task() {
     assert_eq!(dataset.manifest.version, version);
 }
 
-/// A blob column outside the lineage file stays where it is; the columns
-/// that can move are still merged. The lineage is what makes `lineage.lance`
-/// the file kept.
+/// The lineage file and a blob file both stay as they are; the columns that
+/// can move are still merged.
 #[test]
 fn repack_merges_around_a_blob_outside_the_kept_file() {
     use lance_table::format::{ROW_ID_FIELD_ID, RowIdMeta};
@@ -888,4 +887,124 @@ fn repack_never_adds_a_file() {
         v2_0_file("f.lance", vec![3]),
     ];
     assert_eq!(plan(&schema, &fragment, 2), Some(vec![vec![2, 3]]));
+}
+
+/// A file holding a struct's header next to another column is emptied only
+/// when the struct moves too, so a merge is planned around the file whose
+/// staying leaves the others emptied.
+#[test]
+fn repack_moves_a_struct_with_its_header() {
+    use arrow_schema::Fields;
+    let plan = |schema: &lance_core::datatypes::Schema, fragment: &Fragment| {
+        crate::dataset::optimize::repack::plan_fragment_repack(
+            schema,
+            fragment,
+            fragment.files.len(),
+            None,
+            Some(2),
+        )
+    };
+    let child = |name: &str| Field::new(name, DataType::Int32, true);
+
+    // a=0, s=1 {x=2 (dropped), y=3}, b=4, c=5.
+    let arrow = Schema::new(vec![
+        child("a"),
+        Field::new(
+            "s",
+            DataType::Struct(Fields::from(vec![child("x"), child("y")])),
+            true,
+        ),
+        child("b"),
+        child("c"),
+    ]);
+    let schema = lance_schema(arrow).project_by_ids(&[0, 1, 3, 4, 5], false);
+    let mut fragment = Fragment::new(0);
+    fragment.files = vec![
+        v2_0_file("a.lance", vec![0, 1, 2]),
+        v2_0_file("s.lance", vec![1, 3, 5]),
+        v2_0_file("b.lance", vec![4]),
+    ];
+    // Keeping s.lance would leave a.lance alive on the header; keeping
+    // a.lance lets s.lance and b.lance both go.
+    assert_eq!(plan(&schema, &fragment), Some(vec![vec![1, 4, 5]]));
+
+    // a=0, s=1 {x=2, y=3, z=4} (x, z dropped), b=5, c=6: both a.lance and
+    // b.lance hold the header.
+    let arrow = Schema::new(vec![
+        child("a"),
+        Field::new(
+            "s",
+            DataType::Struct(Fields::from(vec![child("x"), child("y"), child("z")])),
+            true,
+        ),
+        child("b"),
+        child("c"),
+    ]);
+    let schema = lance_schema(arrow).project_by_ids(&[0, 1, 3, 5, 6], false);
+    let mut fragment = Fragment::new(0);
+    fragment.files = vec![
+        v2_0_file("a.lance", vec![0, 1, 2]),
+        v2_0_file("b.lance", vec![5, 1, 4]),
+        v2_0_file("s.lance", vec![1, 3, 6]),
+    ];
+    assert_eq!(plan(&schema, &fragment), Some(vec![vec![1, 5, 6]]));
+}
+
+/// A struct-header file merged next to the struct reaches one file, and the
+/// next run plans nothing.
+#[tokio::test]
+async fn repack_with_a_dropped_struct_child_converges() {
+    use arrow_array::{ArrayRef, StructArray};
+    use arrow_schema::Fields;
+    let fields = Fields::from(vec![
+        Field::new("x", DataType::Int32, true),
+        Field::new("y", DataType::Int32, true),
+    ]);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("s", DataType::Struct(fields.clone()), true),
+    ]));
+    let values =
+        |offset: i32| Arc::new(Int32Array::from_iter_values(offset..offset + 4)) as ArrayRef;
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            values(0),
+            Arc::new(StructArray::new(fields, vec![values(10), values(20)], None)),
+        ],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_0),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .add_columns(
+            NewColumnTransform::SqlExpressions(vec![("b".into(), "a + 1".into())]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    dataset.drop_columns(&["s.x"]).await.unwrap();
+    let before = dataset.scan().try_into_batch().await.unwrap();
+
+    compact_files(&mut dataset, repack_options(Some(1), vec![]), None)
+        .await
+        .unwrap();
+    assert_eq!(live_file_counts(&dataset), vec![1]);
+    assert_eq!(dataset.scan().try_into_batch().await.unwrap(), before);
+    dataset.validate().await.unwrap();
+
+    let version = dataset.manifest.version;
+    compact_files(&mut dataset, repack_options(Some(1), vec![]), None)
+        .await
+        .unwrap();
+    assert_eq!(dataset.manifest.version, version);
 }

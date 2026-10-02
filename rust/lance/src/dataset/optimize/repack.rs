@@ -62,13 +62,15 @@ fn file_coverage(file: &DataFile, schema: &Schema) -> HashSet<i32> {
 /// file of their own. A group is moved unless one live file holds exactly its
 /// columns; moving it out leaves the other columns where they were. The
 /// columns no group names are merged into one new file only when the
-/// fragment is over `max_files`. Without groups and over `max_files`, the
-/// files whose columns can all move, other than the one kept (the largest
-/// when every file can be emptied), are merged
-/// into one new file; a file holding a column that cannot move, or spilled
-/// lineage, is left whole and is the file kept, so a repack never adds a
-/// file. With `max_files` 1, every column movable and no file holding spilled
-/// lineage, all columns go to one file.
+/// fragment is over `max_files`.
+///
+/// Without groups and over `max_files`, only files the move empties are
+/// merged: files whose columns can all move, which hold no spilled lineage,
+/// and whose other fields (a struct header) belong to columns that move too.
+/// Any other file stays as it is. When every live file can be emptied, one
+/// stays as well, the largest by recorded size that still leaves two to
+/// merge, unless `max_files` is 1. Nothing is planned unless at least two
+/// files would be emptied, so the file count drops.
 ///
 /// A column the fragment has no data for (added as all nulls) is left out of
 /// its group, and a group holding a blob column, or a column whose fields are
@@ -120,6 +122,21 @@ pub(super) fn plan_fragment_repack(
             (field.id, ids)
         })
         .collect();
+    // Every schema field id under each top-level column.
+    let column_fields: std::collections::HashMap<i32, HashSet<i32>> = schema
+        .fields
+        .iter()
+        .map(|field| {
+            let ids = Schema {
+                fields: vec![field.clone()],
+                metadata: Default::default(),
+            }
+            .field_ids()
+            .into_iter()
+            .collect();
+            (field.id, ids)
+        })
+        .collect();
     let present: BTreeSet<i32> = column_leaves
         .iter()
         .filter(|(_, leaves)| !leaves.is_disjoint(&covered))
@@ -146,6 +163,42 @@ pub(super) fn plan_fragment_repack(
         })
         .collect();
     let holds_lineage = |file: &DataFile| file.fields.iter().any(|id| spilled.contains(id));
+    // The live files whose columns can all move and which hold no lineage.
+    let candidates: Vec<usize> = (0..live.len())
+        .filter(|index| {
+            let columns = &file_columns[*index];
+            !columns.is_empty()
+                && !holds_lineage(live[*index].0)
+                && columns.iter().all(|column| movable.contains(column))
+        })
+        .collect();
+    // Of `files`, the ones a move of all their columns together leaves with no
+    // schema field, so the commit drops them. A file can also hold a field of
+    // a column it holds no data for (a struct header), which only moving that
+    // column from another file takes out.
+    let emptied = |mut files: Vec<usize>| loop {
+        let moved: HashSet<i32> = files
+            .iter()
+            .flat_map(|index| &file_columns[*index])
+            .flat_map(|column| &column_fields[column])
+            .copied()
+            .collect();
+        let next: Vec<usize> = files
+            .iter()
+            .copied()
+            .filter(|index| {
+                live[*index]
+                    .0
+                    .fields
+                    .iter()
+                    .all(|id| !schema_ids.contains(id) || moved.contains(id))
+            })
+            .collect();
+        if next.len() == files.len() {
+            break files;
+        }
+        files = next;
+    };
 
     let wanted: Vec<BTreeSet<i32>> = match groups {
         Some(groups) => {
@@ -164,52 +217,34 @@ pub(super) fn plan_fragment_repack(
             }
             wanted
         }
-        None if max_files == Some(1)
-            && present.iter().all(|c| movable.contains(c))
-            && !live.iter().any(|(file, _)| holds_lineage(file)) =>
-        {
-            vec![present.clone()]
-        }
         None => {
-            // The files a merge can empty: every column moves, no lineage.
-            let mergeable: Vec<(usize, &BTreeSet<i32>)> = live
-                .iter()
-                .zip(&file_columns)
-                .enumerate()
-                .filter(|(_, ((file, _), columns))| {
-                    !columns.is_empty()
-                        && !holds_lineage(file)
-                        && columns.iter().all(|column| movable.contains(column))
-                })
-                .map(|(index, (_, columns))| (index, columns))
-                .collect();
-            // A file that cannot be emptied stays anyway, so every mergeable
-            // file merges; otherwise the largest one stays.
-            let kept = if mergeable.len() < live.len() {
-                None
+            let all = emptied(candidates);
+            // A file a move cannot empty stays anyway. Otherwise one file
+            // stays unless the limit is 1: the largest whose staying still
+            // leaves two files to merge.
+            let merged = if all.len() < live.len() || max_files == Some(1) {
+                all
             } else {
-                mergeable
+                let mut by_size = all.clone();
+                by_size.sort_by_key(|index| {
+                    std::cmp::Reverse((
+                        live[*index].0.file_size_bytes.get().map(|size| size.get()),
+                        file_columns[*index].len(),
+                    ))
+                });
+                by_size
                     .iter()
-                    .max_by_key(|(index, columns)| {
-                        let file = live[*index].0;
-                        (
-                            file.file_size_bytes.get().map(|size| size.get()),
-                            columns.len(),
-                        )
-                    })
-                    .map(|(index, _)| *index)
+                    .map(|kept| emptied(all.iter().copied().filter(|i| i != kept).collect()))
+                    .find(|merged| merged.len() > 1)
+                    .unwrap_or_default()
             };
-            let rest: BTreeSet<i32> = mergeable
-                .iter()
-                .filter(|(index, _)| Some(*index) != kept)
-                .flat_map(|(_, columns)| columns.iter().copied())
-                .collect();
-            let rest_files = mergeable
-                .iter()
-                .filter(|(index, _)| Some(*index) != kept)
-                .count();
-            if rest_files > 1 {
-                vec![rest]
+            if merged.len() > 1 {
+                vec![
+                    merged
+                        .iter()
+                        .flat_map(|index| file_columns[*index].iter().copied())
+                        .collect(),
+                ]
             } else {
                 Vec::new()
             }
