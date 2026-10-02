@@ -2263,9 +2263,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     async move { spawn_cpu(move || transformer.transform(&slice?)).await }
                 })
                 .buffered(num_workers)
-                .map(|x| {
-                    x.map_err(|e| Error::internal(format!("shuffle transform task failed: {e}")))?
-                })
                 .peekable(),
         );
 
