@@ -787,117 +787,37 @@ pub trait CompactionPlanner: Send + Sync {
     async fn plan(&self, dataset: &Dataset) -> Result<CompactionPlan>;
 }
 
-/// The executor half of a pluggable compaction pipeline: run one task the
-/// planner produced, yielding a result the paired [`CompactionCommitter`]
-/// commits. Vertical (`RewriteExecutor`) and, later, horizontal compaction are
-/// separate implementations selected by mode, not variants of one plan, so
-/// each keeps its own task/result types and serialized shapes.
+/// Runs one task of a [`CompactionPlan`]. Pass an implementation to
+/// [`compact_files_with_executor`] to run the tasks somewhere else (say, on a
+/// cluster) or to wrap the default one; [`CompactionTask::execute`] runs the
+/// default one for a task executed by hand.
+///
+/// The results go to [`commit_compaction`].
 #[async_trait::async_trait]
 pub trait CompactionExecutor: Send + Sync {
-    /// The task unit the paired planner emits.
-    type Task: Send;
-    /// Per-task output, collected and handed to the committer.
-    type TaskResult: Send;
-
-    /// Execute one task against `dataset` (already at the plan's read version).
+    /// Execute `task` against `dataset`, which is at the plan's read version.
     async fn execute(
         &self,
-        dataset: Cow<'_, Dataset>,
-        task: Self::Task,
+        dataset: &Dataset,
+        task: TaskData,
         options: &CompactionOptions,
-    ) -> Result<Self::TaskResult>;
+    ) -> Result<RewriteResult>;
 }
 
-/// The commit half of a pluggable compaction pipeline: fold the executor's
-/// results into one transaction. Each pipeline commits its own operation
-/// (vertical → `Operation::Rewrite`; horizontal → `Operation::Update`).
-#[async_trait::async_trait]
-pub trait CompactionCommitter: Send + Sync {
-    /// Must match the paired executor's [`CompactionExecutor::TaskResult`].
-    type TaskResult: Send;
-
-    /// Commit the collected results, returning the run's metrics.
-    async fn commit(
-        &self,
-        dataset: &mut Dataset,
-        results: Vec<Self::TaskResult>,
-        remap_options: Arc<dyn IndexRemapperOptions>,
-        options: &CompactionOptions,
-    ) -> Result<CompactionMetrics>;
-}
-
-/// Vertical compaction: rewrite groups of fragments via `rewrite_files`,
-/// committed as `Operation::Rewrite` by [`RewriteCommitter`].
+/// Runs a task the way this crate does: rewrites its fragments into new ones.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct RewriteExecutor;
+pub struct DefaultCompactionExecutor;
 
 #[async_trait::async_trait]
-impl CompactionExecutor for RewriteExecutor {
-    type Task = TaskData;
-    type TaskResult = RewriteResult;
-
+impl CompactionExecutor for DefaultCompactionExecutor {
     async fn execute(
         &self,
-        dataset: Cow<'_, Dataset>,
+        dataset: &Dataset,
         task: TaskData,
         options: &CompactionOptions,
     ) -> Result<RewriteResult> {
-        rewrite_files(dataset, task, options).await
+        rewrite_files(Cow::Borrowed(dataset), task, options).await
     }
-}
-
-/// Commits vertical compaction results as a single `Operation::Rewrite`.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct RewriteCommitter;
-
-#[async_trait::async_trait]
-impl CompactionCommitter for RewriteCommitter {
-    type TaskResult = RewriteResult;
-
-    async fn commit(
-        &self,
-        dataset: &mut Dataset,
-        results: Vec<RewriteResult>,
-        remap_options: Arc<dyn IndexRemapperOptions>,
-        options: &CompactionOptions,
-    ) -> Result<CompactionMetrics> {
-        commit_compaction(dataset, results, remap_options, options).await
-    }
-}
-
-/// Run a compaction pipeline: execute every task with bounded concurrency, then
-/// commit the collected results. Vertical compaction runs through it as
-/// `RewriteExecutor` plus `RewriteCommitter`; horizontal compaction, added in a
-/// follow-up, is a second executor/committer pair through the same function.
-/// Pipelines still differ in how they produce tasks and which operation they
-/// commit; only the execute-collect-commit skeleton is shared.
-pub(crate) async fn run_compaction_pipeline<E, C>(
-    dataset: &mut Dataset,
-    executor: E,
-    committer: C,
-    tasks: Vec<E::Task>,
-    remap_options: Arc<dyn IndexRemapperOptions>,
-    options: &CompactionOptions,
-    concurrency: usize,
-) -> Result<CompactionMetrics>
-where
-    E: CompactionExecutor,
-    C: CompactionCommitter<TaskResult = E::TaskResult>,
-{
-    if tasks.is_empty() {
-        return Ok(CompactionMetrics::default());
-    }
-    // Execute against an immutable snapshot; `commit` takes `&mut dataset` once
-    // every task has finished and the borrows are released.
-    let dataset_ref = &dataset.clone();
-    let results: Vec<E::TaskResult> = futures::stream::iter(tasks)
-        .map(|task| executor.execute(Cow::Borrowed(dataset_ref), task, options))
-        .buffer_unordered(concurrency.max(1))
-        .try_collect()
-        .await?;
-    committer
-        .commit(dataset, results, remap_options, options)
-        .await
 }
 
 /// Formulate a plan to compact the files in a dataset
@@ -1159,6 +1079,17 @@ pub async fn compact_files_with_planner(
     remap_options: Option<Arc<dyn IndexRemapperOptions>>, // These will be deprecated later
     planner: &dyn CompactionPlanner,
 ) -> Result<CompactionMetrics> {
+    compact_files_with_executor(dataset, remap_options, planner, &DefaultCompactionExecutor).await
+}
+
+/// Plan with `planner`, run every task with `executor`, and commit the
+/// results with [`commit_compaction`].
+pub async fn compact_files_with_executor(
+    dataset: &mut Dataset,
+    remap_options: Option<Arc<dyn IndexRemapperOptions>>, // These will be deprecated later
+    planner: &dyn CompactionPlanner,
+    executor: &dyn CompactionExecutor,
+) -> Result<CompactionMetrics> {
     let compaction_plan: CompactionPlan = planner.plan(dataset).await?;
 
     // A tagged FRI history is maintained by appending transitions to the
@@ -1192,16 +1123,16 @@ pub async fn compact_files_with_planner(
         .num_threads
         .unwrap_or_else(get_num_compute_intensive_cpus);
     let remap_options = remap_options.unwrap_or(Arc::new(DatasetIndexRemapperOptions::default()));
-    run_compaction_pipeline(
-        dataset,
-        RewriteExecutor,
-        RewriteCommitter,
-        compaction_plan.tasks,
-        remap_options,
-        &compaction_plan.options,
-        concurrency,
-    )
-    .await
+    let options = &compaction_plan.options;
+    // Execute against an immutable snapshot; the commit takes `&mut dataset`
+    // once every task has finished.
+    let snapshot = &dataset.clone();
+    let results: Vec<RewriteResult> = futures::stream::iter(compaction_plan.tasks.clone())
+        .map(|task| executor.execute(snapshot, task, options))
+        .buffer_unordered(concurrency.max(1))
+        .try_collect()
+        .await?;
+    commit_compaction(dataset, results, remap_options, options).await
 }
 
 /// Information about a fragment used to decide its fate in compaction
@@ -2252,8 +2183,8 @@ impl CompactionTask {
         } else {
             Cow::Owned(dataset.checkout_version(self.read_version).await?)
         };
-        RewriteExecutor
-            .execute(dataset, self.task.clone(), &self.options)
+        DefaultCompactionExecutor
+            .execute(dataset.as_ref(), self.task.clone(), &self.options)
             .await
     }
 }
@@ -4299,6 +4230,64 @@ mod tests {
                 serde_json::from_value::<LanceFileVersion>(serde_json::json!(value)).unwrap_err();
             assert!(error.to_string().contains(value));
         }
+    }
+
+    /// `compact_files_with_executor` runs every planned task through the
+    /// executor it is given and commits what that executor returns.
+    #[tokio::test]
+    async fn compact_files_runs_tasks_through_the_given_executor() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Counting(AtomicUsize);
+
+        #[async_trait]
+        impl CompactionExecutor for Counting {
+            async fn execute(
+                &self,
+                dataset: &Dataset,
+                task: TaskData,
+                options: &CompactionOptions,
+            ) -> Result<RewriteResult> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                DefaultCompactionExecutor
+                    .execute(dataset, task, options)
+                    .await
+            }
+        }
+
+        let data = sample_data();
+        let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 1_000,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let before = dataset.count_rows(None).await.unwrap();
+        let options = CompactionOptions {
+            target_rows_per_fragment: 5_000,
+            ..Default::default()
+        };
+        let planner = DefaultCompactionPlanner::new(options.clone()).unwrap();
+        let tasks = plan_compaction(&dataset, &options)
+            .await
+            .unwrap()
+            .num_tasks();
+        assert!(tasks > 0);
+
+        let executor = Counting(AtomicUsize::new(0));
+        let metrics = compact_files_with_executor(&mut dataset, None, &planner, &executor)
+            .await
+            .unwrap();
+
+        assert_eq!(executor.0.load(Ordering::SeqCst), tasks);
+        assert!(metrics.fragments_removed > 0);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), before);
+        dataset.validate().await.unwrap();
     }
 
     #[rstest]
