@@ -86,25 +86,35 @@ impl FileFragment {
     /// Rewrite `columns` of this fragment into one new data file.
     ///
     /// The returned metadata has the new file appended and the rewritten fields
-    /// tombstoned in the files they came from; a file left holding only
-    /// tombstones is dropped. Nothing is committed. Returns `None` when the
-    /// columns already sit alone in a file of the requested version, so a
-    /// retried or resumed rewrite skips finished work.
+    /// tombstoned in the files they came from; a file left holding no column
+    /// of the schema is dropped, unless it carries the fragment's spilled row
+    /// lineage. Nothing is committed: commit the result with
+    /// [`RewriteColumnsCommitter`]. Returns `None` when the columns already sit
+    /// alone in a file of the requested version, so a retried or resumed
+    /// rewrite skips finished work.
     pub async fn rewrite_columns(
         &self,
         columns: &[&str],
         data_storage_version: Option<LanceFileVersion>,
-    ) -> Result<Option<Fragment>> {
+    ) -> Result<Option<RewriteColumnsResult>> {
         let dataset = self.dataset();
         let write_schema = rewrite_schema(dataset, columns)?;
         let resolved_version = write_version(dataset, data_storage_version)?;
         let field_ids: HashSet<i32> = write_schema.field_ids().into_iter().collect();
+        // Ids of columns `drop_columns` removed stay in their files, and a
+        // spilled row lineage sequence sits in a data file under a reserved id,
+        // so a file's ids are only compared and kept by what the schema reads.
+        let schema_ids: HashSet<i32> = dataset
+            .schema()
+            .fields_pre_order()
+            .map(|field| field.id)
+            .collect();
 
         let already_split = self.metadata().files.iter().any(|file| {
             file.fields
                 .iter()
                 .copied()
-                .filter(|id| *id != TOMBSTONE_FIELD_ID)
+                .filter(|id| schema_ids.contains(id))
                 .collect::<HashSet<_>>()
                 == field_ids
                 && file
@@ -158,11 +168,22 @@ impl FileFragment {
                 .collect::<Vec<_>>()
                 .into();
         }
-        // A file holding only tombstones is unreachable to readers.
-        fragment
-            .files
-            .retain(|file| file.fields.iter().any(|id| *id != TOMBSTONE_FIELD_ID));
-        Ok(Some(fragment))
+        // Drop a file left with nothing the schema reads, the rule
+        // `drop_columns` applies, but keep one carrying the fragment's spilled
+        // row lineage: it is the only copy.
+        let spilled = fragment.spilled_row_lineage_field_ids();
+        fragment.files.retain(|file| {
+            file.fields
+                .iter()
+                .any(|id| schema_ids.contains(id) || spilled.contains(id))
+        });
+        // The new file is the last one and is always kept.
+        let files_removed = self.metadata().files.len() + 1 - fragment.files.len();
+        Ok(Some(RewriteColumnsResult {
+            fragment,
+            read_version: dataset.manifest.version,
+            files_removed,
+        }))
     }
 }
 /// One fragment's horizontal-rewrite output, bound to the manifest version it
@@ -175,6 +196,8 @@ pub struct RewriteColumnsResult {
     pub fragment: Fragment,
     /// The manifest version the fragment was read at.
     pub read_version: u64,
+    /// How many of the fragment's data files the rewrite dropped.
+    pub files_removed: usize,
 }
 
 /// Horizontal executor: rewrites one fragment's named columns into a new data
@@ -204,23 +227,17 @@ impl CompactionExecutor for RewriteColumnsExecutor {
     type TaskResult = Option<RewriteColumnsResult>;
 
     /// The task is a [`FileFragment`] already bound to its read version, so the
-    /// `dataset` argument the pipeline threads in is unused; the read version is
-    /// taken from the fragment and carried into the result for the committer.
+    /// `dataset` argument the pipeline threads in is unused; the result carries
+    /// the fragment's read version for the committer.
     async fn execute(
         &self,
         _dataset: Cow<'_, Dataset>,
         task: FileFragment,
         _options: &CompactionOptions,
     ) -> Result<Option<RewriteColumnsResult>> {
-        let read_version = task.dataset().manifest.version;
         let columns: Vec<&str> = self.columns.iter().map(String::as_str).collect();
-        Ok(task
-            .rewrite_columns(&columns, self.data_storage_version)
-            .await?
-            .map(|fragment| RewriteColumnsResult {
-                fragment,
-                read_version,
-            }))
+        task.rewrite_columns(&columns, self.data_storage_version)
+            .await
     }
 }
 /// Commits horizontal-compaction results as one `Operation::Update` in
@@ -252,34 +269,17 @@ impl CompactionCommitter for RewriteColumnsCommitter {
             .map(|result| result.read_version)
             .min()
             .expect("results is non-empty");
-        let updated_fragments: Vec<Fragment> =
-            results.into_iter().map(|result| result.fragment).collect();
         // Row addresses and values are unchanged, so no fragment is added or
-        // removed; only per-fragment files change. `files_added` is one new
-        // file per rewritten fragment; `files_removed` is the fully-tombstoned
-        // files that were dropped.
-        let mut metrics = CompactionMetrics {
-            files_added: updated_fragments.len(),
+        // removed; only per-fragment files change: one new file per rewritten
+        // fragment, and the files each rewrite dropped. A fragment changed or
+        // removed since its read is left to the commit's conflict check.
+        let metrics = CompactionMetrics {
+            files_added: results.len(),
+            files_removed: results.iter().map(|result| result.files_removed).sum(),
             ..CompactionMetrics::default()
         };
-        for fragment in &updated_fragments {
-            // A fragment being updated must exist in the version we commit
-            // against; a missing one is an inconsistency (e.g. a distributed
-            // caller passing a stale fragment id), not a zero-file fragment.
-            let original_files = dataset
-                .get_fragment(fragment.id as usize)
-                .ok_or_else(|| {
-                    Error::internal(format!(
-                        "rewrite_columns is updating fragment {} that is not in the \
-                         current manifest",
-                        fragment.id
-                    ))
-                })?
-                .metadata()
-                .files
-                .len();
-            metrics.files_removed += (original_files + 1).saturating_sub(fragment.files.len());
-        }
+        let updated_fragments: Vec<Fragment> =
+            results.into_iter().map(|result| result.fragment).collect();
         let transaction = Transaction::new(
             read_version,
             Operation::Update {
@@ -311,7 +311,12 @@ impl Dataset {
     /// ([`RewriteColumnsExecutor`] + [`RewriteColumnsCommitter`]) and commits
     /// once. To spread the work over many machines, call
     /// [`FileFragment::rewrite_columns`] per fragment and commit the returned
-    /// metadata with [`RewriteColumnsCommitter`].
+    /// results with [`RewriteColumnsCommitter`].
+    ///
+    /// The new files carry only the rewritten columns. On a table with stable
+    /// row ids whose row lineage was spilled into a data file, that file is
+    /// kept for the lineage even after every column has moved out of it, until
+    /// a vertical compaction rewrites the fragment.
     pub async fn rewrite_columns(
         &mut self,
         columns: &[&str],
@@ -542,8 +547,17 @@ mod tests {
         dataset.validate().await.unwrap();
     }
 
+    /// A delete that lands on the fragment between the rewrite's read and its
+    /// commit, whether it removes one row or the whole fragment, must surface
+    /// as a retryable conflict.
+    #[rstest::rstest]
+    #[case::one_row("a = 1", 7)]
+    #[case::whole_fragment("a < 4", 4)]
     #[tokio::test]
-    async fn rewrite_columns_conflicts_with_intervening_delete() {
+    async fn rewrite_columns_conflicts_with_intervening_delete(
+        #[case] predicate: &str,
+        #[case] rows_left: usize,
+    ) {
         use crate::dataset::index::DatasetIndexRemapperOptions;
         use crate::dataset::optimize::{
             CompactionCommitter, CompactionExecutor, CompactionOptions,
@@ -566,31 +580,32 @@ mod tests {
             .expect("fragment 0 has columns to repack");
 
         // A delete lands on that same fragment before the rewrite is committed.
-        dataset.delete("a = 1").await.unwrap();
+        dataset.delete(predicate).await.unwrap();
         let after_delete = dataset.scan().try_into_batch().await.unwrap();
-        assert_eq!(after_delete.num_rows(), 7);
+        assert_eq!(after_delete.num_rows(), rows_left);
 
         // The rewrite was read before the delete, so committing it must conflict
         // rather than publish the stale layout and resurrect the deleted row.
-        let committed = RewriteColumnsCommitter
+        let err = RewriteColumnsCommitter
             .commit(
                 &mut dataset,
                 vec![Some(stale)],
                 Arc::new(DatasetIndexRemapperOptions::default()),
                 &CompactionOptions::default(),
             )
-            .await;
+            .await
+            .unwrap_err();
         assert!(
-            committed.is_err(),
-            "a rewrite read before the delete must not commit over it"
+            matches!(err, Error::RetryableCommitConflict { .. }),
+            "a rewrite read before the delete must not commit over it: {err}"
         );
 
-        // The delete stands: seven rows, none with a = 1.
+        // The delete stands.
         assert_eq!(dataset.scan().try_into_batch().await.unwrap(), after_delete);
         assert_eq!(
             dataset
                 .scan()
-                .filter("a = 1")
+                .filter(predicate)
                 .unwrap()
                 .try_into_batch()
                 .await
@@ -598,6 +613,202 @@ mod tests {
                 .num_rows(),
             0
         );
+        dataset.validate().await.unwrap();
+    }
+
+    /// `drop_columns` leaves a dropped column's id in the file that held it.
+    /// Rewriting the rest of that file's columns leaves it with nothing the
+    /// schema reads, so the rewrite must drop it, as `drop_columns` would.
+    #[tokio::test]
+    async fn rewrite_drops_file_left_with_only_dropped_columns() {
+        use crate::dataset::NewColumnTransform;
+        let mut dataset = write("memory://", LanceFileVersion::V2_0).await;
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("d".into(), "a + 1".into())]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        dataset.drop_columns(&["c"]).await.unwrap();
+        let before = dataset.scan().try_into_batch().await.unwrap();
+
+        dataset
+            .rewrite_columns(&["a", "b", "d"], None)
+            .await
+            .unwrap();
+
+        for fragment in dataset.get_fragments() {
+            assert_eq!(
+                fragment.metadata().files.len(),
+                1,
+                "only the new file is left: {:?}",
+                fragment.metadata().files
+            );
+        }
+        assert_eq!(dataset.scan().try_into_batch().await.unwrap(), before);
+        dataset.validate().await.unwrap();
+    }
+
+    /// A file whose only other column was dropped already holds exactly the
+    /// requested columns, so there is nothing to rewrite.
+    #[tokio::test]
+    async fn rewrite_skips_file_whose_other_columns_were_dropped() {
+        let mut dataset = write("memory://", LanceFileVersion::V2_0).await;
+        dataset.drop_columns(&["c"]).await.unwrap();
+        let version = dataset.manifest.version;
+
+        dataset.rewrite_columns(&["a", "b"], None).await.unwrap();
+
+        assert_eq!(dataset.manifest.version, version, "nothing was committed");
+        dataset.validate().await.unwrap();
+    }
+
+    /// A `drop_columns` that commits between a rewrite's read and its commit
+    /// would leave a file holding only the dropped column if the rewrite went
+    /// through, whether that is the rewritten column's new file or a file the
+    /// drop removed, so the commit must conflict. When the rewritten column
+    /// survived the drop, rerunning the rewrite on the new version succeeds.
+    #[rstest::rstest]
+    #[case::rewritten_column("c")]
+    #[case::other_column("d")]
+    #[tokio::test]
+    async fn rewrite_columns_conflicts_with_concurrent_drop(#[case] dropped: &str) {
+        use crate::dataset::NewColumnTransform;
+        use crate::dataset::index::DatasetIndexRemapperOptions;
+        use crate::dataset::optimize::{
+            CompactionCommitter, CompactionExecutor, CompactionOptions,
+        };
+        use std::borrow::Cow;
+
+        let mut dataset = write("memory://", LanceFileVersion::V2_0).await;
+        // `d` gets a file of its own in every fragment.
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("d".into(), "a + 1".into())]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let executor = RewriteColumnsExecutor::new(&["c"], None);
+        let mut stale = Vec::new();
+        for fragment in dataset.get_fragments() {
+            stale.push(
+                executor
+                    .execute(
+                        Cow::Borrowed(&dataset),
+                        fragment,
+                        &CompactionOptions::default(),
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        dataset.drop_columns(&[dropped]).await.unwrap();
+        let version = dataset.manifest.version;
+        let expected = dataset.scan().try_into_batch().await.unwrap();
+
+        let err = RewriteColumnsCommitter
+            .commit(
+                &mut dataset,
+                stale,
+                Arc::new(DatasetIndexRemapperOptions::default()),
+                &CompactionOptions::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::RetryableCommitConflict { .. }),
+            "{err}"
+        );
+        dataset.checkout_latest().await.unwrap();
+        assert_eq!(dataset.manifest.version, version, "nothing was committed");
+        dataset.validate().await.unwrap();
+
+        if dropped != "c" {
+            dataset.rewrite_columns(&["c"], None).await.unwrap();
+            assert_eq!(dataset.scan().try_into_batch().await.unwrap(), expected);
+            dataset.validate().await.unwrap();
+        }
+    }
+
+    /// The concurrent-drop check must not trip on a file holding only
+    /// tombstones, which an in-place merge_insert leaves in its post-image for
+    /// the commit to drop: a rename racing such a commit has to go through.
+    #[tokio::test]
+    async fn rewrite_columns_commit_ignores_tombstoned_file_on_rename() {
+        use crate::dataset::index::DatasetIndexRemapperOptions;
+        use crate::dataset::optimize::{
+            CompactionCommitter, CompactionExecutor, CompactionOptions,
+        };
+        use crate::dataset::{ColumnAlteration, NewColumnTransform};
+        use std::borrow::Cow;
+
+        let mut dataset = write("memory://", LanceFileVersion::V2_0).await;
+        // `d` gets a file of its own in every fragment.
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("d".into(), "a + 1".into())]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // `d` already sits alone, so repack it together with `c`.
+        let executor = RewriteColumnsExecutor::new(&["c", "d"], None);
+        let mut results = Vec::new();
+        for fragment in dataset.get_fragments() {
+            // The file `d` lived in, fully tombstoned, as merge_insert leaves it.
+            let mut tombstoned = fragment.metadata().files[1].clone();
+            tombstoned.fields = vec![TOMBSTONE_FIELD_ID].into();
+            let mut result = executor
+                .execute(
+                    Cow::Borrowed(&dataset),
+                    fragment,
+                    &CompactionOptions::default(),
+                )
+                .await
+                .unwrap()
+                .expect("c and d have files to repack");
+            result.fragment.files.insert(1, tombstoned);
+            results.push(Some(result));
+        }
+
+        dataset
+            .alter_columns(&[ColumnAlteration::new("b".into()).rename("b2".into())])
+            .await
+            .unwrap();
+        let expected = dataset.scan().try_into_batch().await.unwrap();
+
+        RewriteColumnsCommitter
+            .commit(
+                &mut dataset,
+                results,
+                Arc::new(DatasetIndexRemapperOptions::default()),
+                &CompactionOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        for fragment in dataset.get_fragments() {
+            let layout: Vec<Vec<i32>> = fragment
+                .metadata()
+                .files
+                .iter()
+                .map(|file| file.fields.to_vec())
+                .collect();
+            assert_eq!(
+                layout,
+                vec![vec![0, 1, TOMBSTONE_FIELD_ID], vec![2, 3]],
+                "the rewrite landed and the commit dropped the tombstoned file"
+            );
+        }
+        assert_eq!(dataset.scan().try_into_batch().await.unwrap(), expected);
         dataset.validate().await.unwrap();
     }
 }

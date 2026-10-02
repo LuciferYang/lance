@@ -340,8 +340,10 @@ pub struct CompactionOptions {
     /// This is the layout [`Dataset::rewrite_columns`] produces, so a compaction
     /// configured with the same groups preserves that split instead of folding
     /// wide columns back in with narrow ones. Binary copy is disabled when
-    /// groups are set, and `max_bytes_per_file` is ignored so every group's
-    /// files split at the same rows.
+    /// groups are set (`ForceBinaryCopy` is rejected), and `max_bytes_per_file`
+    /// is ignored so every group's files split at the same rows. Set from
+    /// dataset config with `lance.compaction.column_groups` (see
+    /// [`Self::from_dataset_config`]).
     #[serde(default)]
     pub column_groups: Vec<Vec<String>>,
     /// Transaction properties to store with this commit.
@@ -409,6 +411,10 @@ impl CompactionOptions {
     /// - `lance.compaction.max_source_bytes`
     /// - `lance.compaction.max_overlays_per_fragment`
     /// - `lance.compaction.data_storage_version`
+    /// - `lance.compaction.column_groups`: groups separated by `;`, columns in
+    ///   a group by `,`, surrounding whitespace trimmed (`"b, c; d"` is
+    ///   `[["b", "c"], ["d"]]`). A column whose name contains `,` or `;`, or
+    ///   starts or ends with whitespace, cannot be named this way.
     pub fn from_dataset_config(config: &HashMap<String, String>) -> Result<Self> {
         let mut opts = Self::default();
         opts.apply_dataset_config(config)?;
@@ -592,6 +598,15 @@ impl CompactionOptions {
                     "CompactionOptions::column_groups lists column \"{column}\" more than once"
                 )));
             }
+        }
+        if !self.column_groups.is_empty()
+            && matches!(self.compaction_mode(), CompactionMode::ForceBinaryCopy)
+        {
+            return Err(Error::invalid_input(
+                "CompactionOptions::column_groups cannot be combined with \
+                 compaction_mode=ForceBinaryCopy: binary copy keeps each fragment's \
+                 file layout, so it cannot split columns into groups",
+            ));
         }
 
         for (name, value) in [
@@ -909,14 +924,11 @@ impl CompactionCommitter for RewriteCommitter {
 }
 
 /// Run a compaction pipeline: execute every task with bounded concurrency, then
-/// commit the collected results. This is the one orchestration both vertical
+/// commit the collected results. Both vertical
 /// (`RewriteExecutor`/`RewriteCommitter`) and horizontal
-/// (`RewriteColumnsExecutor`/`RewriteColumnsCommitter`) funnel through, so the
-/// [`CompactionExecutor`]/[`CompactionCommitter`] traits carry real polymorphism
-/// — a caller with its own executor/committer pair plugs in here — rather than
-/// documenting a seam nothing consumes. The two pipelines still differ in how
-/// they produce tasks and which operation they commit; only the execute-collect-
-/// commit skeleton is shared.
+/// (`RewriteColumnsExecutor`/`RewriteColumnsCommitter`) compaction run through
+/// it. The two pipelines still differ in how they produce tasks and which
+/// operation they commit; only the execute-collect-commit skeleton is shared.
 pub(crate) async fn run_compaction_pipeline<E, C>(
     dataset: &mut Dataset,
     executor: E,
@@ -2604,10 +2616,19 @@ fn column_group_schemas(
     groups: &[Vec<String>],
 ) -> Result<Vec<lance_core::datatypes::Schema>> {
     let names = || schema.fields.iter().map(|field| field.name.as_str());
+    let mut seen = HashSet::new();
     for column in groups.iter().flatten() {
         if !names().any(|name| name == column) {
             return Err(Error::invalid_input(format!(
                 "column_groups names \"{column}\", which is not a top-level column of the dataset"
+            )));
+        }
+        // Checked here as well as in `validate()`: a custom planner or a
+        // hand-built `CompactionTask` reaches `rewrite_files` without it, and a
+        // column in two groups would be written to two files.
+        if !seen.insert(column.as_str()) {
+            return Err(Error::invalid_input(format!(
+                "column_groups lists column \"{column}\" more than once"
             )));
         }
     }
@@ -2704,18 +2725,18 @@ async fn write_column_group_fragments(
         }
     }
 
+    // Returns which writer stopped reading first, if one did: a writer that
+    // fails closes its receiver, and its error is the one to report.
     let forward = async move {
         while let Some(batch) = reader.next().await {
             let batch = batch?;
-            for (sender, projection) in senders.iter_mut().zip(&projections) {
-                // A writer that stopped early (its own error) closes its
-                // receiver; stop forwarding and let try_join surface that error.
+            for (index, (sender, projection)) in senders.iter_mut().zip(&projections).enumerate() {
                 if sender.send(Ok(batch.project(projection)?)).await.is_err() {
-                    return Ok(());
+                    return Ok(Some(index));
                 }
             }
         }
-        Ok::<(), Error>(())
+        Ok::<Option<usize>, Error>(None)
     };
     let writers = group_streams
         .into_iter()
@@ -2742,21 +2763,57 @@ async fn write_column_group_fragments(
         })
         .collect::<Vec<_>>();
 
-    let (_, per_group) = futures::try_join!(forward, futures::future::try_join_all(writers))?;
-
-    let mut per_group = per_group.into_iter();
-    let mut fragments = per_group.next().unwrap_or_default();
-    for group in per_group {
-        if group.len() != fragments.len()
-            || fragments
-                .iter()
-                .zip(&group)
-                .any(|(a, b)| a.physical_rows != b.physical_rows)
-        {
-            return Err(Error::internal(
-                "column group writers did not split the compacted rows at the same fragments",
-            ));
+    // Run every writer to completion rather than dropping the others on the
+    // first error: a writer cleans up its own files only when it fails, so a
+    // group that finished must be cleaned up here if the write as a whole fails.
+    let (forwarded, per_group) = futures::join!(forward, futures::future::join_all(writers));
+    let mut written = Vec::with_capacity(per_group.len());
+    let mut errors = Vec::new();
+    for (index, result) in per_group.into_iter().enumerate() {
+        match result {
+            Ok(fragments) => written.push(fragments),
+            Err(err) => errors.push((index, err)),
         }
+    }
+    let failure = match forwarded {
+        // The read failed; the writers' errors follow from it.
+        Err(err) => Some(err),
+        Ok(Some(stopped)) => Some(
+            match errors.into_iter().find(|(index, _)| *index == stopped) {
+                Some((_, err)) => err,
+                // Not expected: a writer only finishes once its input ends,
+                // which needs the forwarder to have dropped every sender.
+                None => Error::internal(format!(
+                    "column group writer {stopped} stopped reading before the compacted rows ended"
+                )),
+            },
+        ),
+        Ok(None) => errors.into_iter().next().map(|(_, err)| err),
+    };
+    let misaligned = written.iter().skip(1).any(|group| {
+        group.len() != written[0].len()
+            || written[0]
+                .iter()
+                .zip(group)
+                .any(|(a, b)| a.physical_rows != b.physical_rows)
+    });
+    let failure = failure.or_else(|| {
+        misaligned.then(|| {
+            Error::internal(
+                "column group writers did not split the compacted rows at the same fragments",
+            )
+        })
+    });
+    if let Some(err) = failure {
+        for fragments in &written {
+            cleanup_data_fragments(&dataset.object_store, &dataset.base, None, fragments).await;
+        }
+        return Err(err);
+    }
+
+    let mut written = written.into_iter();
+    let mut fragments = written.next().unwrap_or_default();
+    for group in written {
         for (fragment, other) in fragments.iter_mut().zip(group) {
             fragment.files.extend(other.files);
         }
@@ -12518,5 +12575,32 @@ mod tests {
         };
         let err = options.validate().unwrap_err();
         assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+    }
+
+    /// `rewrite_files` builds its group schemas without `validate()` (a custom
+    /// planner or a hand-built `CompactionTask`), so the duplicate check has to
+    /// hold there too.
+    #[test]
+    fn column_group_schemas_reject_duplicate() {
+        let schema = lance_core::datatypes::Schema::try_from(&Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, true),
+        ]))
+        .unwrap();
+        let err = column_group_schemas(&schema, &[vec!["b".into()], vec!["b".into()]]).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+        assert!(err.to_string().contains("more than once"), "{err}");
+    }
+
+    #[test]
+    fn compaction_column_groups_validate_rejects_force_binary_copy() {
+        let mut options = CompactionOptions {
+            column_groups: vec![vec!["b".into()]],
+            compaction_mode: Some(CompactionMode::ForceBinaryCopy),
+            ..Default::default()
+        };
+        let err = options.validate().unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+        assert!(err.to_string().contains("ForceBinaryCopy"), "{err}");
     }
 }
