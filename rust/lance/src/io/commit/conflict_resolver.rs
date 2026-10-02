@@ -18,7 +18,7 @@ use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::mem_wal::{CompactedSsTable, MEM_WAL_INDEX_NAME};
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::IndexMetadata;
-use lance_table::format::overlay::{OverlayCoverage, TOMBSTONE_FIELD_ID};
+use lance_table::format::overlay::OverlayCoverage;
 use lance_table::format::pb::fragment_reuse_index_details::{InlineContent, Transition};
 use lance_table::system_index::frag_reuse::lineage::TaggedLineage;
 use lance_table::system_index::frag_reuse::metadata::is_tagged;
@@ -681,34 +681,6 @@ impl<'a> TransactionRebase<'a> {
                             );
                         }
                     }
-                    // An in-place column rewrite publishes each fragment's file
-                    // list as it built it at the read version, so a file the
-                    // projection removed (it held only dropped fields) would come
-                    // back, and so would a new file holding only a dropped field.
-                    // `fields_modified` can't catch this: a rewrite that moves
-                    // values without changing them (horizontal compaction) leaves
-                    // it empty. Apply the projection's own keep rule to our files.
-                    // A file holding only tombstones is skipped: an in-place
-                    // merge_insert leaves one behind and the commit drops it.
-                    if matches!(self_update_mode, Some(UpdateMode::RewriteColumns)) {
-                        let remaining: HashSet<i32> =
-                            schema.fields_pre_order().map(|field| field.id).collect();
-                        let drops_a_file = self_updated_fragments.iter().any(|fragment| {
-                            let spilled = fragment.spilled_row_lineage_field_ids();
-                            fragment.files.iter().any(|file| {
-                                file.fields.iter().any(|id| *id != TOMBSTONE_FIELD_ID)
-                                    && !file
-                                        .fields
-                                        .iter()
-                                        .any(|id| remaining.contains(id) || spilled.contains(id))
-                            })
-                        });
-                        if drops_a_file {
-                            return Err(
-                                self.retryable_conflict_err(other_transaction, other_version)
-                            );
-                        }
-                    }
                     Ok(())
                 }
                 Operation::DataOverlay { groups } => {
@@ -1088,7 +1060,7 @@ impl<'a> TransactionRebase<'a> {
                                     fragment.files.iter().any(|file| {
                                         file.fields.iter().any(|field| {
                                             *field
-                                                == TOMBSTONE_FIELD_ID
+                                                == lance_table::format::overlay::TOMBSTONE_FIELD_ID
                                         })
                                     })
                                 })
@@ -6275,7 +6247,7 @@ mod tests {
             (
                 "Moved DataReplacement vs DataReplacement of an overlapping field",
                 Operation::DataReplacement {
-                    replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01)],
                     data_change: false,
                 },
                 Operation::DataReplacement {

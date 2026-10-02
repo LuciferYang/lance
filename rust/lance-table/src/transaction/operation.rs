@@ -118,14 +118,14 @@ pub enum Operation {
     /// they live and the new file is appended, and a file left holding no
     /// field of the schema is dropped. A fragment can take several groups, one
     /// per new file, applied in order. Used for null column population, and by
-    /// horizontal compaction to repack columns into fewer files.
+    /// compaction to repack columns into fewer files.
     ///
     /// The fields of a legacy (V1) data file cannot be tombstoned one by one,
     /// so a field held by a V1 file can only be replaced by an exact match.
     DataReplacement {
         replacements: Vec<DataReplacementGroup>,
         /// Whether the new files change any value. `false` means the values
-        /// were only moved to new files (horizontal compaction): indices keep
+        /// were only moved to new files (a compaction repack): indices keep
         /// their coverage of the replaced fields, overlays keep shadowing, and
         /// no row is stamped as updated.
         data_change: bool,

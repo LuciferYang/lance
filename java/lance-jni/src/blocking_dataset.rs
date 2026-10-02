@@ -10,9 +10,9 @@ use crate::namespace::{
 use crate::session::{handle_from_session, session_from_handle};
 use crate::traits::{FromJObjectWithEnv, FromJString, export_vec, import_vec, import_vec_to_rust};
 use crate::utils::{
-    build_compaction_options, extract_base_store_params, extract_storage_options,
-    extract_write_params, get_scalar_index_params, get_vector_index_params, to_java_map,
-    to_rust_map,
+    apply_repack_options, build_compaction_options, extract_base_store_params,
+    extract_storage_options, extract_write_params, get_scalar_index_params,
+    get_vector_index_params, to_java_map, to_rust_map,
 };
 use crate::{block_on, traits::IntoJava};
 use arrow::array::RecordBatchReader;
@@ -3616,7 +3616,22 @@ fn convert_java_compaction_options_to_rust(
         )?
         .l()?;
 
-    build_compaction_options(
+    let max_data_files_per_fragment = env
+        .call_method(
+            &java_options,
+            "getMaxDataFilesPerFragment",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
+    let column_groups = env
+        .call_method(&java_options, "getColumnGroups", "()Ljava/util/List;", &[])?
+        .l()?;
+    let scope = env
+        .call_method(&java_options, "getScope", "()Ljava/util/Optional;", &[])?
+        .l()?;
+
+    let mut options = build_compaction_options(
         env,
         &target_rows_per_fragment,
         &max_rows_per_group,
@@ -3634,7 +3649,15 @@ fn convert_java_compaction_options_to_rust(
         &excluded_fragment_ids,
         &data_storage_version,
         config,
-    )
+    )?;
+    apply_repack_options(
+        env,
+        &mut options,
+        &max_data_files_per_fragment,
+        &column_groups,
+        &scope,
+    )?;
+    Ok(options)
 }
 
 #[unsafe(no_mangle)]

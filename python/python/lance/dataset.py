@@ -7613,6 +7613,9 @@ class DatasetOptimizer:
         max_source_bytes: Optional[int] = None,
         excluded_fragment_ids: Optional[list[int]] = None,
         data_storage_version: Optional[str] = None,
+        max_data_files_per_fragment: Optional[int] = None,
+        column_groups: Optional[list[list[str]]] = None,
+        scope: Optional[Literal["all", "rewrite_fragments", "repack_columns"]] = None,
     ) -> CompactionMetrics:
         """Compacts small files in the dataset, reducing total number of files.
 
@@ -7620,6 +7623,8 @@ class DatasetOptimizer:
          * Removes deleted rows from fragments
          * Removes dropped columns from fragments
          * Merges small fragments into larger ones
+         * Repacks a fragment's columns into fewer data files, when
+           ``max_data_files_per_fragment`` or ``column_groups`` asks for it
 
         This method preserves the insertion order of the dataset. This may mean
         it leaves small fragments in the dataset if they are not adjacent to
@@ -7647,6 +7652,9 @@ class DatasetOptimizer:
         ``lance.compaction.max_source_fragments``,
         ``lance.compaction.max_source_rows``,
         ``lance.compaction.max_source_bytes``,
+        ``lance.compaction.max_data_files_per_fragment``,
+        ``lance.compaction.column_groups``,
+        ``lance.compaction.scope``,
         ``lance.compaction.data_storage_version``.
 
         Parameters
@@ -7728,6 +7736,24 @@ class DatasetOptimizer:
             Uses the compaction config target when set, otherwise the dataset's
             default write version. Does not change that default or the versions
             of unselected files. V1/V2 cross-family targets are rejected.
+        max_data_files_per_fragment: int, optional
+            Maximum number of data files a fragment may hold columns in before
+            its columns are repacked into fewer files. Each ``add_columns``
+            backfill adds one file per fragment. A repack rewrites only the
+            columns that move and keeps rows, fragment ids and indices as they
+            are. If not specified, uses the manifest config value, or no limit.
+        column_groups: list[list[str]], optional
+            Top-level columns to keep in their own data files. Each inner list
+            becomes one data file per fragment; the columns no group names share
+            one file. Fragments the compaction rewrites are written this way,
+            and the others have their columns repacked to match. Names that are
+            not top-level columns are ignored. If not specified, uses the
+            manifest config value (``"b, c; d"`` is ``[["b", "c"], ["d"]]``).
+        scope: str, optional
+            Which tasks to plan: ``"rewrite_fragments"`` only rewrites
+            fragments, ``"repack_columns"`` only repacks columns, and
+            ``"all"`` (the default) does both. A run that does both commits
+            two versions.
 
         Returns
         -------
@@ -7756,6 +7782,9 @@ class DatasetOptimizer:
                 max_source_bytes=max_source_bytes,
                 excluded_fragment_ids=excluded_fragment_ids,
                 data_storage_version=data_storage_version,
+                max_data_files_per_fragment=max_data_files_per_fragment,
+                column_groups=column_groups,
+                scope=scope,
             ).items()
             if v is not None
         }

@@ -255,11 +255,10 @@ async fn test_overlay_stale_drop_and_new_match(#[values(false, true)] stable_row
     assert_eq!(ids_matching(&dataset, "age = 20").await, vec![2]);
 }
 
-/// Horizontal compaction ([`Dataset::rewrite_columns`]) commits with an empty
-/// `fields_modified`, so an existing data overlay must be carried forward and
-/// keep shadowing the base — even when the rewrite repacks an unrelated column.
+/// A column repack moves base values without changing them, so an overlay on
+/// the fragment keeps shadowing the base it was written over.
 #[tokio::test]
-async fn rewrite_columns_preserves_data_overlay() {
+async fn repack_columns_preserves_data_overlay() {
     let dataset = create_base_dataset().await;
     // Fragment 0, offset 1 is id=1, age=10; the overlay changes its age to 999.
     let mut dataset = commit_overlay(
@@ -273,8 +272,16 @@ async fn rewrite_columns_preserves_data_overlay() {
     .await;
     assert_eq!(ids_matching(&dataset, "age = 999").await, vec![1]);
 
-    // Repack an unrelated column; the overlay on `age` must survive.
-    dataset.rewrite_columns(&["id"], None).await.unwrap();
+    // Split `id` into a file of its own; the overlay on `age` must survive.
+    let options = crate::dataset::optimize::CompactionOptions {
+        column_groups: vec![vec!["id".into()]],
+        scope: crate::dataset::optimize::CompactionScope::RepackColumns,
+        ..Default::default()
+    };
+    crate::dataset::optimize::compact_files(&mut dataset, options, None)
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragment(0).unwrap().metadata().files.len(), 2);
 
     assert_eq!(
         dataset.get_fragment(0).unwrap().metadata().overlays.len(),

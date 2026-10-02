@@ -18,8 +18,10 @@ import org.lance.compaction.CompactionMetrics;
 import org.lance.compaction.CompactionMode;
 import org.lance.compaction.CompactionOptions;
 import org.lance.compaction.CompactionPlan;
+import org.lance.compaction.CompactionScope;
 import org.lance.compaction.CompactionTask;
 import org.lance.compaction.RewriteResult;
+import org.lance.schema.SqlExpressions;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.junit.jupiter.api.Test;
@@ -33,9 +35,11 @@ import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Collections;
+import java.util.List;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -264,6 +268,53 @@ public class CompactionTest {
         RewriteResult result = task.execute(dataset);
         assertEquals(2, result.getMetrics().getFragmentsRemoved());
         assertEquals(1, result.getMetrics().getFragmentsAdded());
+      }
+    }
+  }
+
+  @Test
+  public void testRepackColumns(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("test_repack_columns").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 10).close();
+      try (Dataset dataset = testDataset.write(2, 10)) {
+        dataset.addColumns(
+            new SqlExpressions.Builder().withExpression("double_id", "id * 2").build(),
+            Optional.empty());
+        assertEquals(2, dataset.getFragments().get(0).metadata().getFiles().size());
+
+        CompactionOptions options =
+            CompactionOptions.builder()
+                .withMaxDataFilesPerFragment(1)
+                .withScope(CompactionScope.REPACK_COLUMNS)
+                .build();
+        CompactionPlan plan = Compaction.planCompaction(dataset, options);
+        assertEquals(Optional.of(1L), plan.getCompactionOptions().getMaxDataFilesPerFragment());
+        assertEquals(
+            Optional.of(CompactionScope.REPACK_COLUMNS.getValue()),
+            plan.getCompactionOptions().getScope());
+        assertEquals(2, plan.getCompactionTasks().size());
+
+        List<RewriteResult> results = new ArrayList<>();
+        for (CompactionTask task : plan.getCompactionTasks()) {
+          task = serializeAndDeserialize(task);
+          assertEquals(
+              Collections.singletonList(Arrays.asList(0, 1, 2)),
+              task.getTaskData().getRepackFiles());
+          RewriteResult result = serializeAndDeserialize(task.execute(dataset));
+          assertEquals(1, result.getRepackedFiles().size());
+          results.add(result);
+        }
+        Compaction.commitCompaction(dataset, results, plan.getCompactionOptions());
+
+        dataset.checkoutLatest();
+        assertEquals(2, dataset.getFragments().size());
+        for (Fragment fragment : dataset.getFragments()) {
+          assertEquals(1, fragment.metadata().getFiles().size());
+        }
       }
     }
   }

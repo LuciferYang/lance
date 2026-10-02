@@ -23,9 +23,9 @@ import java.util.Objects;
 /**
  * Replace the data files backing some fields of existing fragments with new files, without moving
  * rows. Each group names a fragment and one new data file for it. At commit, a file holding exactly
- * the new file's fields is swapped for it; otherwise the new file's fields are tombstoned where they
- * live and the new file is appended. A fragment can take several groups, one per new file. Used for
- * null column population, and by compaction to repack columns into fewer files.
+ * the new file's fields is swapped for it; otherwise the new file's fields are tombstoned where
+ * they live and the new file is appended. A fragment can take several groups, one per new file.
+ * Used for null column population, and by compaction to repack columns into fewer files.
  *
  * <p>{@code dataChange == false} declares that the new files hold the same values as the files they
  * replace: indices keep their coverage, overlays keep shadowing, and no row is reported as updated.

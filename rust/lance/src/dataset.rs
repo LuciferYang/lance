@@ -83,7 +83,6 @@ pub mod optimize;
 pub(crate) mod overlay;
 pub mod progress;
 pub mod refs;
-pub mod rewrite_columns;
 pub mod rowids;
 pub mod scanner;
 mod schema_evolution;

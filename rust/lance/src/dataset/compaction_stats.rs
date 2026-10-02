@@ -3,11 +3,11 @@
 
 //! Per-fragment column-layout statistics.
 //!
-//! A compaction planner keys on how many data files each fragment carries: a
-//! fragment split across many small per-column files (typically from repeated
-//! `add_columns` backfills) is the signal horizontal compaction targets.
-//! Exposing these stats via [`Dataset::column_layout_stats`] keeps the planning
-//! decision observable instead of buried in a black-box heuristic.
+//! The default compaction planner repacks a fragment's columns when it holds
+//! them in more than `max_data_files_per_fragment` files, counted here.
+//! Repeated `add_columns` backfills are the usual cause. Exposing the counts
+//! via [`Dataset::column_layout_stats`] lets a caller see why a fragment was,
+//! or was not, picked, and lets a custom planner make its own call.
 
 use std::collections::HashSet;
 
@@ -18,9 +18,9 @@ use super::Dataset;
 pub struct FragmentColumnLayoutStats {
     /// The fragment these stats describe.
     pub fragment_id: u64,
-    /// Number of data files holding at least one column of the dataset schema.
-    /// A large value on a wide dataset is what horizontal compaction collapses
-    /// back into fewer files. A file left holding only tombstones or dropped
+    /// Number of data files holding at least one column of the dataset schema,
+    /// the count `max_data_files_per_fragment` is compared with. A file left
+    /// holding only tombstones or dropped
     /// columns, or kept only for the fragment's spilled row lineage, holds no
     /// column a read touches and is not counted.
     pub live_file_count: usize,
@@ -31,8 +31,8 @@ pub struct FragmentColumnLayoutStats {
 impl Dataset {
     /// Per-fragment column-layout stats, in manifest fragment order.
     ///
-    /// This is the planning input for horizontal compaction: it reads only
-    /// fragment metadata (no data files), so it is cheap to call.
+    /// The default planner's input for column repacks. It reads only fragment
+    /// metadata (no data files), so it is cheap to call.
     pub fn column_layout_stats(&self) -> Vec<FragmentColumnLayoutStats> {
         let schema_ids: HashSet<i32> = self
             .schema()
@@ -116,9 +116,8 @@ mod tests {
 
     /// Only files holding a schema column count. The extra files are added to
     /// the manifest by hand: the commit paths that leave such files behind (an
-    /// in-place column update after a drop, a full horizontal rewrite on a
-    /// table whose lineage was spilled into a data file) are not what this
-    /// test is about.
+    /// in-place column update after a drop, a repack on a table whose lineage
+    /// was spilled into a data file) are not what this test is about.
     #[tokio::test]
     async fn column_layout_stats_skips_files_without_schema_columns() {
         use lance_file::version::ConcreteFileVersion;
