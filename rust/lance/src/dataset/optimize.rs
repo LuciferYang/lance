@@ -328,8 +328,8 @@ pub struct CompactionOptions {
     /// stays when it holds a blob column, a column only partly in the
     /// fragment's files, or spilled row lineage, or shares a column with a
     /// file holding spilled row lineage; without `column_groups`, when every
-    /// file holding a column could go, one stays (usually the largest) unless
-    /// the limit is 1. So a fragment can stay above the limit; so can one with
+    /// file holding a column could go, at least one stays (the largest when
+    /// some merge leaves it) unless the limit is 1. So a fragment can stay above the limit; so can one with
     /// more `column_groups` than the limit allows.
     /// The repack writes each new file whole, with no `max_bytes_per_file`
     /// split. Not planned under `ForceBinaryCopy`, since a repack reencodes.

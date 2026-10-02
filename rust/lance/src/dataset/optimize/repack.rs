@@ -76,11 +76,11 @@ fn file_coverage(file: &DataFile, schema: &Schema) -> HashSet<i32> {
 /// which hold no spilled lineage and share no column with a file holding it,
 /// and whose other fields (a struct header) belong to columns that move too.
 /// The files left keep the columns that do not move. Without groups, when
-/// every file holding a column can be emptied, one of them stays unless
-/// `max_files` is 1. Trying the files in order of recorded size, the one kept
-/// is the first whose merge (of the files sharing no column with it, else of
-/// every other file, as long as it keeps a column) leaves the largest file
-/// in place, or failing that the first with any merge. Nothing is merged
+/// every file holding a column can be emptied, at least one of them stays
+/// unless `max_files` is 1. Trying the files largest first by recorded size,
+/// the one kept is the first whose merge (of the files sharing no column with
+/// it, else of every other file, as long as it keeps a column) leaves the
+/// largest file in place, or failing that the first with any merge. Nothing is merged
 /// unless at least two files would be emptied, so a merge lowers the file
 /// count.
 ///
@@ -248,7 +248,7 @@ pub(super) fn plan_fragment_repack(
             let holding = file_columns.iter().filter(|c| !c.is_empty()).count();
             // A file a move cannot empty stays anyway. Otherwise one file
             // stays unless the limit is 1.
-            let merged = if all.len() < holding || max_files == Some(1) {
+            let merged = if all.len() < 2 || all.len() < holding || max_files == Some(1) {
                 all
             } else {
                 let mut by_size = all.clone();
@@ -259,7 +259,7 @@ pub(super) fn plan_fragment_repack(
                     ))
                 });
                 // For each file kept, largest first: merge the files sharing
-                // no column with it, which leaves it untouched, else every
+                // no column with it, which leaves its data in place, else every
                 // other file, as long as the kept file keeps a column. A plan
                 // that leaves the largest file in place wins.
                 let plans = by_size.iter().flat_map(|kept| {

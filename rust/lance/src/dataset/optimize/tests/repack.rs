@@ -1191,10 +1191,10 @@ fn repack_keeps_the_largest_file_next_to_a_header_only_file() {
     );
 }
 
-/// A merge that leaves the largest file untouched wins over one that merges
+/// A merge that leaves the largest file in place wins over one that merges
 /// it away, even when a smaller file is the one kept.
 #[test]
-fn repack_prefers_leaving_the_largest_file_untouched() {
+fn repack_prefers_leaving_the_largest_file_in_place() {
     use arrow_schema::Fields;
     let child = |name: &str| Field::new(name, DataType::Int32, true);
     let sized = |path: &str, fields: Vec<i32>, size: u64| {
@@ -1233,5 +1233,41 @@ fn repack_prefers_leaving_the_largest_file_untouched() {
             Some(3)
         ),
         Some(vec![vec![0, 7]])
+    );
+}
+
+/// A fragment whose files all hold only a struct header has no column to
+/// move, and nothing is planned.
+#[test]
+fn repack_plans_nothing_for_header_only_files() {
+    use arrow_schema::Fields;
+    let child = |name: &str| Field::new(name, DataType::Int32, true);
+    // s=0 {a=1, b=2, c=3, d=4}; only d is left.
+    let schema = lance_schema(Schema::new(vec![Field::new(
+        "s",
+        DataType::Struct(Fields::from(vec![
+            child("a"),
+            child("b"),
+            child("c"),
+            child("d"),
+        ])),
+        true,
+    )]))
+    .project_by_ids(&[0, 4], false);
+    let mut fragment = Fragment::new(0);
+    fragment.files = vec![
+        v2_0_file("a.lance", vec![0, 1]),
+        v2_0_file("b.lance", vec![0, 2]),
+        v2_0_file("c.lance", vec![0, 3]),
+    ];
+    assert_eq!(
+        crate::dataset::optimize::repack::plan_fragment_repack(
+            &schema,
+            &fragment,
+            3,
+            None,
+            Some(2)
+        ),
+        None
     );
 }
