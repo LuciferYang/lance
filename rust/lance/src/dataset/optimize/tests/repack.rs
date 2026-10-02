@@ -592,7 +592,8 @@ fn repack_keeps_the_spilled_lineage_file() {
         ),
         Some(vec![vec![1, 2]])
     );
-    // Moving every column would leave the lineage file behind, so no repack.
+    // With a limit of 1 as well: moving every column would leave the lineage
+    // file behind, so its column stays.
     assert_eq!(
         crate::dataset::optimize::repack::plan_fragment_repack(
             &schema,
@@ -601,7 +602,7 @@ fn repack_keeps_the_spilled_lineage_file() {
             None,
             Some(1)
         ),
-        None
+        Some(vec![vec![1, 2]])
     );
 }
 
@@ -779,4 +780,43 @@ async fn commit_rejects_a_fragment_in_both_kinds_of_task() {
     assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
     dataset.checkout_latest().await.unwrap();
     assert_eq!(dataset.manifest.version, version);
+}
+
+/// A column that cannot move outside the kept file stays where it is; the
+/// columns that can move are still merged.
+#[test]
+fn repack_merges_around_a_blob_outside_the_kept_file() {
+    use lance_table::format::{ROW_ID_FIELD_ID, RowIdMeta};
+    let mut blob = Field::new("img", DataType::LargeBinary, true);
+    blob.set_metadata(std::collections::HashMap::from([(
+        lance_arrow::BLOB_META_KEY.to_string(),
+        "true".to_string(),
+    )]));
+    let schema = lance_schema(Schema::new(vec![
+        Field::new("a", DataType::Int32, true),
+        blob,
+        Field::new("d", DataType::Int32, true),
+        Field::new("e", DataType::Int32, true),
+    ]));
+    let mut fragment = Fragment::new(0);
+    fragment.files = vec![
+        v2_0_file("lineage.lance", vec![0, ROW_ID_FIELD_ID]),
+        v2_0_file("img.lance", vec![1]),
+        v2_0_file("d.lance", vec![2]),
+        v2_0_file("e.lance", vec![3]),
+    ];
+    fragment.row_id_meta = Some(RowIdMeta::Column);
+    for max_files in [1, 2] {
+        assert_eq!(
+            crate::dataset::optimize::repack::plan_fragment_repack(
+                &schema,
+                &fragment,
+                4,
+                None,
+                Some(max_files)
+            ),
+            Some(vec![vec![2, 3]]),
+            "max_files={max_files}"
+        );
+    }
 }

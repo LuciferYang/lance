@@ -324,9 +324,10 @@ pub struct CompactionOptions {
     /// repack rewrites only the columns that move and keeps rows, fragment ids
     /// and indices as they are (see [`CompactionTaskKind::RepackColumns`]).
     /// The count is [`FragmentColumnLayoutStats::live_file_count`]. The
-    /// columns of one file stay where they are unless the limit is 1, and
-    /// blob columns never move, so a fragment can stay above the limit; so
-    /// can one with more `column_groups` than the limit allows. The repack
+    /// columns of one file stay where they are (unless the limit is 1 and
+    /// every column can move), and blob columns never move, so a fragment can
+    /// stay above the limit; so can one with more `column_groups` than the
+    /// limit allows. The repack
     /// writes each new file whole, with no `max_bytes_per_file` split. Not
     /// planned under `ForceBinaryCopy`, since a repack reencodes.
     ///
@@ -358,8 +359,8 @@ pub struct CompactionOptions {
     /// Each inner list becomes one data file per fragment holding exactly
     /// those columns. Empty (the default) means no groups.
     ///
-    /// A fragment a compaction rewrites gets one file per group plus one file
-    /// for every column no group names. A fragment it leaves alone has a
+    /// A fragment a compaction rewrites gets one file per group plus one
+    /// shared file for the columns no group names. A fragment it leaves alone has a
     /// group repacked into a file of its own when no single file holds
     /// exactly that group's columns (see [`CompactionTaskKind::RepackColumns`]),
     /// unless `scope` is [`CompactionScope::RewriteFragments`]; the columns no
@@ -1525,15 +1526,17 @@ fn task_source_bytes(
     schema_field_ids: &HashSet<i32>,
 ) -> Result<u64> {
     // The field ids a task reads: every schema field, or a repack's columns.
-    let read_ids: HashSet<i32> = match &task.kind {
-        CompactionTaskKind::RewriteFragments => schema_field_ids.clone(),
+    let read_ids: Cow<'_, HashSet<i32>> = match &task.kind {
+        CompactionTaskKind::RewriteFragments => Cow::Borrowed(schema_field_ids),
         CompactionTaskKind::RepackColumns { files } => {
             let columns: Vec<i32> = files.iter().flatten().copied().collect();
-            schema
-                .project_by_ids(&columns, true)
-                .field_ids()
-                .into_iter()
-                .collect()
+            Cow::Owned(
+                schema
+                    .project_by_ids(&columns, true)
+                    .field_ids()
+                    .into_iter()
+                    .collect(),
+            )
         }
     };
     let reads_overlays = task.kind == CompactionTaskKind::RewriteFragments;

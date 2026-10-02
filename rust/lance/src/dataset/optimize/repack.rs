@@ -28,9 +28,9 @@ use crate::dataset::transaction::{DataReplacementGroup, Operation, TransactionBu
 use crate::dataset::{Dataset, cleanup_data_fragments, versions};
 use crate::{Error, Result};
 
-/// The ids of the leaf fields at and beneath `field`. A file holds a column's
-/// data only through its leaves: a V2.0 file can keep a struct's header after
-/// the struct's last child in it was dropped.
+/// The ids of the leaf fields at and beneath `field`. The planner places a
+/// column by where its leaves are: a V2.0 file can keep a struct's header
+/// after the struct's last child in it was dropped.
 fn leaf_ids(field: &LanceField, ids: &mut HashSet<i32>) {
     if field.children.is_empty() {
         ids.insert(field.id);
@@ -65,8 +65,9 @@ fn file_coverage(file: &DataFile, schema: &Schema) -> HashSet<i32> {
 /// fragment is over `max_files`. Without groups and over `max_files`, the
 /// columns of one live file stay where they are (the file holding the
 /// fragment's spilled row lineage, else one holding a column that cannot
-/// move, else the largest) and every other column goes to one new file; with
-/// `max_files` 1 and every column movable, all of them go to one file.
+/// move, else the largest) and every other column that can move goes to one
+/// new file; with `max_files` 1, every column movable and no spilled lineage,
+/// all of them go to one file.
 ///
 /// A column the fragment has no data for (added as all nulls) is left out of
 /// its group, and a group holding a blob column, or a column whose fields are
@@ -76,7 +77,9 @@ fn file_coverage(file: &DataFile, schema: &Schema) -> HashSet<i32> {
 /// stay for the lineage alone until a rewrite of the fragment reclaims it.
 ///
 /// `live_files` is the fragment's
-/// [`FragmentColumnLayoutStats::live_file_count`].
+/// [`FragmentColumnLayoutStats::live_file_count`]. A V2.0 file left holding
+/// only a struct header counts there but holds no column here, so it stays
+/// until a rewrite of the fragment.
 ///
 /// [`FragmentColumnLayoutStats::live_file_count`]: crate::dataset::compaction_stats::FragmentColumnLayoutStats::live_file_count
 pub(super) fn plan_fragment_repack(
@@ -160,7 +163,10 @@ pub(super) fn plan_fragment_repack(
             }
             wanted
         }
-        None if max_files == Some(1) && present.iter().all(|c| movable.contains(c)) => {
+        None if max_files == Some(1)
+            && present.iter().all(|c| movable.contains(c))
+            && !live.iter().any(|(file, _)| holds_lineage(file)) =>
+        {
             vec![present.clone()]
         }
         None => {
@@ -177,7 +183,11 @@ pub(super) fn plan_fragment_repack(
                 })
                 .map(|(_, columns)| columns.clone())
                 .unwrap_or_default();
-            let rest = present.difference(&kept).copied().collect();
+            let rest = present
+                .difference(&kept)
+                .copied()
+                .filter(|column| movable.contains(column))
+                .collect();
             vec![kept, rest]
         }
     };
