@@ -7654,7 +7654,6 @@ class DatasetOptimizer:
         ``lance.compaction.max_source_bytes``,
         ``lance.compaction.max_data_files_per_fragment``,
         ``lance.compaction.column_groups``,
-        ``lance.compaction.scope``,
         ``lance.compaction.data_storage_version``.
 
         Parameters

@@ -543,19 +543,12 @@ fn max_data_files_per_fragment_must_be_positive() {
 
 #[test]
 fn repack_options_parse_from_config() {
-    let config = HashMap::from([
-        (
-            "lance.compaction.max_data_files_per_fragment".to_string(),
-            "4".to_string(),
-        ),
-        (
-            "lance.compaction.scope".to_string(),
-            "repack_columns".to_string(),
-        ),
-    ]);
+    let config = HashMap::from([(
+        "lance.compaction.max_data_files_per_fragment".to_string(),
+        "4".to_string(),
+    )]);
     let options = CompactionOptions::from_dataset_config(&config).unwrap();
     assert_eq!(options.max_data_files_per_fragment, Some(4));
-    assert_eq!(options.scope, CompactionScope::RepackColumns);
 }
 
 /// The file holding a fragment's spilled row lineage keeps its columns: the

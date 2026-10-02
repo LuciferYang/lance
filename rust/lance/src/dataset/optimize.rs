@@ -433,7 +433,6 @@ impl CompactionOptions {
     /// - `lance.compaction.max_source_bytes`
     /// - `lance.compaction.max_overlays_per_fragment`
     /// - `lance.compaction.max_data_files_per_fragment`
-    /// - `lance.compaction.scope`: `all`, `rewrite_fragments` or `repack_columns`
     /// - `lance.compaction.data_storage_version`
     /// - `lance.compaction.column_groups`: groups separated by `;`, columns in
     ///   a group by `,`, surrounding whitespace trimmed (`"b, c; d"` is
@@ -585,9 +584,6 @@ impl CompactionOptions {
                             ))
                         })?),
                     };
-                }
-                "scope" => {
-                    self.scope = CompactionScope::try_from(value.as_str())?;
                 }
                 "max_data_files_per_fragment" => {
                     self.max_data_files_per_fragment = Some(value.parse().map_err(|_| {
@@ -966,6 +962,20 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             dataset.manifest.data_storage_format.lance_file_format(),
             write_version,
         )?;
+        // Warned about once here; the tasks skip the stale names silently.
+        for column in self.options.column_groups.iter().flatten() {
+            if !dataset
+                .schema()
+                .fields
+                .iter()
+                .any(|field| &field.name == column)
+            {
+                warn!(
+                    "Ignoring column_groups entry \"{column}\": it is not a top-level column \
+                     of the dataset"
+                );
+            }
+        }
         if !self.options.column_groups.is_empty() {
             // Surface a bad column-group config here rather than mid-write.
             column_group_schemas(dataset.schema(), &self.options.column_groups)?;
@@ -2751,9 +2761,10 @@ async fn reserve_fragment_ids(
 /// are configured: the columns no group claims first (when any), then one
 /// schema per group. Columns keep the dataset's order within each file.
 ///
-/// A name that is not a top-level column is skipped with a warning: the groups
-/// usually come from table config, which `drop_columns` and a rename leave as
-/// they are, and a stale name must not stop every later compaction.
+/// A name that is not a top-level column is skipped: the groups usually come
+/// from table config, which `drop_columns` and a rename leave as they are, and
+/// a stale name must not stop every later compaction. The planner warns about
+/// it.
 fn column_group_schemas(
     schema: &lance_core::datatypes::Schema,
     groups: &[Vec<String>],
@@ -2768,12 +2779,6 @@ fn column_group_schemas(
             return Err(Error::invalid_input(format!(
                 "column_groups lists column \"{column}\" more than once"
             )));
-        }
-        if !names().any(|name| name == column) {
-            warn!(
-                "Ignoring column_groups entry \"{column}\": it is not a top-level column \
-                 of the dataset"
-            );
         }
     }
     let claimed = |name: &str| groups.iter().flatten().any(|column| column == name);
