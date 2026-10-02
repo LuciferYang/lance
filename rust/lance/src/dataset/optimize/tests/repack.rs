@@ -170,8 +170,8 @@ async fn repack_follows_column_groups() {
             })
             .collect::<Vec<_>>();
         files.sort();
-        // The columns no group claims share one file.
-        assert_eq!(files, vec![vec![0, 1, 3], vec![2, 4]], "{files:?}");
+        // Only the group moves; the other columns stay where they were.
+        assert_eq!(files, vec![vec![0, 1], vec![2, 4], vec![3]], "{files:?}");
     }
     assert_eq!(dataset.scan().try_into_batch().await.unwrap(), before);
     dataset.validate().await.unwrap();
@@ -603,4 +603,180 @@ fn repack_keeps_the_spilled_lineage_file() {
         ),
         None
     );
+}
+
+/// Over the file limit with groups set, the columns no group names are merged
+/// into one file as well.
+#[tokio::test]
+async fn repack_merges_unclaimed_columns_over_the_limit() {
+    let mut dataset = write_backfilled().await;
+    let before = dataset.scan().try_into_batch().await.unwrap();
+
+    compact_files(&mut dataset, repack_options(Some(2), vec![vec!["e"]]), None)
+        .await
+        .unwrap();
+
+    for files in layout(&dataset) {
+        let mut files = files
+            .into_iter()
+            .map(|fields| {
+                fields
+                    .into_iter()
+                    .filter(|id| *id != TOMBSTONE_FIELD_ID)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        files.sort();
+        assert_eq!(files, vec![vec![0, 1, 2, 3], vec![4]], "{files:?}");
+    }
+    assert_eq!(dataset.scan().try_into_batch().await.unwrap(), before);
+    dataset.validate().await.unwrap();
+}
+
+fn lance_schema(arrow: Schema) -> lance_core::datatypes::Schema {
+    lance_core::datatypes::Schema::try_from(&arrow).unwrap()
+}
+
+fn v2_0_file(path: &str, fields: Vec<i32>) -> lance_table::format::DataFile {
+    let indices = (0..fields.len() as i32).collect();
+    lance_table::format::DataFile::new(
+        path,
+        fields,
+        indices,
+        lance_file::version::ConcreteFileVersion::V2_0,
+        None,
+        None,
+    )
+}
+
+/// A V2.0 file keeps a struct's header after the struct's last child in it
+/// is dropped. That header holds no data, so the file does not hold the
+/// struct: the struct sits alone in the file with its live child, and no
+/// repack is planned (one would be planned again on every run).
+#[test]
+fn repack_ignores_struct_header_without_children() {
+    use arrow_schema::Fields;
+    let arrow = Schema::new(vec![
+        Field::new("a", DataType::Int32, true),
+        Field::new(
+            "s",
+            DataType::Struct(Fields::from(vec![
+                Field::new("x", DataType::Int32, true),
+                Field::new("y", DataType::Int32, true),
+            ])),
+            true,
+        ),
+    ]);
+    // a=0, s=1, s.x=2 (dropped), s.y=3.
+    let schema = lance_schema(arrow).project_by_ids(&[0, 1, 3], false);
+    let mut fragment = Fragment::new(0);
+    fragment.files = vec![
+        v2_0_file("a.lance", vec![0, 1, 2]),
+        v2_0_file("s.lance", vec![1, 3]),
+    ];
+
+    assert_eq!(
+        crate::dataset::optimize::repack::plan_fragment_repack(
+            &schema,
+            &fragment,
+            2,
+            Some(&[vec![1]]),
+            None
+        ),
+        None
+    );
+    assert_eq!(
+        crate::dataset::optimize::repack::plan_fragment_repack(
+            &schema,
+            &fragment,
+            2,
+            None,
+            Some(1)
+        ),
+        Some(vec![vec![0, 1]])
+    );
+}
+
+/// A blob column never moves, so with a limit of 1 the other columns are
+/// merged next to it instead of nothing being planned.
+#[test]
+fn repack_merges_around_a_blob_column() {
+    let mut blob = Field::new("img", DataType::LargeBinary, true);
+    blob.set_metadata(std::collections::HashMap::from([(
+        lance_arrow::BLOB_META_KEY.to_string(),
+        "true".to_string(),
+    )]));
+    let schema = lance_schema(Schema::new(vec![
+        Field::new("id", DataType::Int32, true),
+        blob,
+        Field::new("d", DataType::Int32, true),
+        Field::new("e", DataType::Int32, true),
+    ]));
+    let mut fragment = Fragment::new(0);
+    fragment.files = vec![
+        v2_0_file("base.lance", vec![0, 1]),
+        v2_0_file("d.lance", vec![2]),
+        v2_0_file("e.lance", vec![3]),
+    ];
+    assert_eq!(
+        crate::dataset::optimize::repack::plan_fragment_repack(
+            &schema,
+            &fragment,
+            3,
+            None,
+            Some(1)
+        ),
+        Some(vec![vec![2, 3]])
+    );
+}
+
+#[tokio::test]
+async fn repack_is_not_planned_under_force_binary_copy() {
+    let dataset = write_backfilled().await;
+    let options = CompactionOptions {
+        compaction_mode: Some(CompactionMode::ForceBinaryCopy),
+        ..repack_options(Some(1), vec![])
+    };
+    let plan = plan_compaction(&dataset, &options).await.unwrap();
+    assert!(plan.tasks.is_empty(), "{plan:?}");
+}
+
+/// `max_source_bytes` counts only the files a repack reads.
+#[tokio::test]
+async fn repack_counts_only_the_files_it_reads_against_the_byte_budget() {
+    let dataset = write_backfilled().await;
+    let fragment = &dataset.manifest.fragments[0];
+    let size = |index: usize| fragment.files[index].file_size_bytes.get().unwrap().get();
+    // Each repack leaves the base file alone and merges d and e, so a budget
+    // for two of those fits both, though not one whole fragment.
+    let options = CompactionOptions {
+        max_source_bytes: Some(2 * (size(1) + size(2))),
+        ..repack_options(Some(2), vec![])
+    };
+    assert!(size(0) + size(1) + size(2) > 2 * (size(1) + size(2)));
+    let plan = plan_compaction(&dataset, &options).await.unwrap();
+    assert_eq!(plan.tasks.len(), 2, "{plan:?}");
+}
+
+/// A fragment both rewritten and repacked is refused before either commit.
+#[tokio::test]
+async fn commit_rejects_a_fragment_in_both_kinds_of_task() {
+    let mut dataset = write_backfilled().await;
+    let version = dataset.manifest.version;
+    let repacks = stale_repack_results(&dataset, &repack_options(Some(1), vec![])).await;
+    let rewrite = CompactionTask {
+        task: TaskData::rewrite_fragments(vec![dataset.manifest.fragments[0].clone()]),
+        read_version: version,
+        options: CompactionOptions::default(),
+    }
+    .execute(&dataset)
+    .await
+    .unwrap();
+
+    let mut results = repacks;
+    results.push(rewrite);
+    let err = commit_results(&mut dataset, results).await.unwrap_err();
+    assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+    dataset.checkout_latest().await.unwrap();
+    assert_eq!(dataset.manifest.version, version);
 }

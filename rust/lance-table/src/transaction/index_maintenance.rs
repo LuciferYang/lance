@@ -100,8 +100,7 @@ impl Transaction {
     /// present in `previous_fragments`, the fields whose backing data file
     /// changed (`merge_rewritten_fields`); a data replacement that changes
     /// data rewrites the fields its new files carry, read through `schema`.
-    /// Any other
-    /// operation rewrites nothing. `previous_fragments` is the caller's
+    /// Any other operation rewrites nothing. `previous_fragments` is the caller's
     /// "before" list: the current manifest's for a commit, the read
     /// version's for a rebase.
     pub fn rewritten_physical_columns(

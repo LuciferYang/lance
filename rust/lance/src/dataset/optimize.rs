@@ -323,7 +323,12 @@ pub struct CompactionOptions {
     /// for a rewrite, so this is the trigger that collapses those files. The
     /// repack rewrites only the columns that move and keeps rows, fragment ids
     /// and indices as they are (see [`CompactionTaskKind::RepackColumns`]).
-    /// The count is [`FragmentColumnLayoutStats::live_file_count`].
+    /// The count is [`FragmentColumnLayoutStats::live_file_count`]. The
+    /// columns of one file stay where they are unless the limit is 1, and
+    /// blob columns never move, so a fragment can stay above the limit; so
+    /// can one with more `column_groups` than the limit allows. The repack
+    /// writes each new file whole, with no `max_bytes_per_file` split. Not
+    /// planned under `ForceBinaryCopy`, since a repack reencodes.
     ///
     /// Defaults to `None` (no file-count trigger). Must be at least 1.
     ///
@@ -351,19 +356,21 @@ pub struct CompactionOptions {
     /// Top-level columns to keep in their own data files.
     ///
     /// Each inner list becomes one data file per fragment holding exactly
-    /// those columns; every column not listed goes to one shared file. Empty
-    /// (the default) puts every column in a single file per fragment.
+    /// those columns. Empty (the default) means no groups.
     ///
-    /// Fragments a compaction rewrites are written in this layout. A fragment
-    /// it leaves alone whose files do not match the layout has its columns
-    /// repacked to match (see [`CompactionTaskKind::RepackColumns`]), unless
-    /// `scope` is [`CompactionScope::RewriteFragments`]. A name that is not a
-    /// top-level column of the dataset (say, one dropped or renamed since the
-    /// groups were configured) is ignored with a warning. Binary copy is
-    /// disabled when groups are set (`ForceBinaryCopy` is rejected), and
-    /// `max_bytes_per_file` is ignored so every group's files split at the
-    /// same rows. Set from dataset config with `lance.compaction.column_groups`
-    /// (see [`Self::from_dataset_config`]).
+    /// A fragment a compaction rewrites gets one file per group plus one file
+    /// for every column no group names. A fragment it leaves alone has a
+    /// group repacked into a file of its own when no single file holds
+    /// exactly that group's columns (see [`CompactionTaskKind::RepackColumns`]),
+    /// unless `scope` is [`CompactionScope::RewriteFragments`]; the columns no
+    /// group names are merged only when the fragment is over
+    /// `max_data_files_per_fragment`. A group holding a blob column is left
+    /// as it is. A name that is not a top-level column of the dataset (say,
+    /// one dropped or renamed since the groups were configured) is ignored
+    /// with a warning. Binary copy is disabled when groups are set
+    /// (`ForceBinaryCopy` is rejected), and `max_bytes_per_file` is ignored so
+    /// every group's files split at the same rows. Set from dataset config
+    /// with `lance.compaction.column_groups` (see [`Self::from_dataset_config`]).
     #[serde(default)]
     pub column_groups: Vec<Vec<String>>,
     /// Transaction properties to store with this commit.
@@ -1207,13 +1214,25 @@ impl DefaultCompactionPlanner {
         let groups = if self.options.column_groups.is_empty() {
             None
         } else {
-            Some(column_group_ids(
+            Some(claimed_column_ids(
                 dataset.schema(),
                 &self.options.column_groups,
-            )?)
+            ))
         };
         let max_files = self.options.max_data_files_per_fragment;
         if groups.is_none() && max_files.is_none() {
+            return Ok(Vec::new());
+        }
+        // A repack reencodes the columns it moves. `validate()` already
+        // rejects `column_groups` with ForceBinaryCopy.
+        if matches!(
+            self.options.compaction_mode(),
+            CompactionMode::ForceBinaryCopy
+        ) {
+            log::info!(
+                "not planning column repacks: compaction_mode=ForceBinaryCopy does not \
+                 reencode, and a repack does"
+            );
             return Ok(Vec::new());
         }
         let stats = dataset.column_layout_stats();
@@ -1457,7 +1476,8 @@ fn limit_tasks_to_source_budget(
         total_fragments += task.fragments.len();
         total_rows = total_rows.saturating_add(live_rows);
         if options.max_source_bytes.is_some() {
-            total_bytes = total_bytes.saturating_add(task_source_bytes(&task, &schema_field_ids)?);
+            total_bytes =
+                total_bytes.saturating_add(task_source_bytes(&task, schema, &schema_field_ids)?);
         }
 
         let over_budget = options
@@ -1493,19 +1513,42 @@ fn limit_tasks_to_source_budget(
 ///
 /// Files whose fields are all absent from `schema_field_ids` only back
 /// dropped columns; compaction does not read them, so they are neither
-/// counted nor required to have a recorded size.
+/// counted nor required to have a recorded size. A column repack reads only
+/// the files holding the columns it moves, and no overlay, so only those
+/// files count.
 /// Only sizes recorded in the manifest are used: a missing size is an error
 /// rather than a metadata request against object storage, which would turn
 /// planning into one round trip per file. Deletion files are not counted.
-fn task_source_bytes(task: &TaskData, schema_field_ids: &HashSet<i32>) -> Result<u64> {
+fn task_source_bytes(
+    task: &TaskData,
+    schema: &lance_core::datatypes::Schema,
+    schema_field_ids: &HashSet<i32>,
+) -> Result<u64> {
+    // The field ids a task reads: every schema field, or a repack's columns.
+    let read_ids: HashSet<i32> = match &task.kind {
+        CompactionTaskKind::RewriteFragments => schema_field_ids.clone(),
+        CompactionTaskKind::RepackColumns { files } => {
+            let columns: Vec<i32> = files.iter().flatten().copied().collect();
+            schema
+                .project_by_ids(&columns, true)
+                .field_ids()
+                .into_iter()
+                .collect()
+        }
+    };
+    let reads_overlays = task.kind == CompactionTaskKind::RewriteFragments;
     let mut total_bytes = 0_u64;
     for fragment in &task.fragments {
-        let overlay_files = fragment.overlays.iter().map(|overlay| &overlay.data_file);
+        let overlay_files = fragment
+            .overlays
+            .iter()
+            .filter(|_| reads_overlays)
+            .map(|overlay| &overlay.data_file);
         for data_file in fragment.files.iter().chain(overlay_files) {
             if !data_file
                 .fields
                 .iter()
-                .any(|field_id| schema_field_ids.contains(field_id))
+                .any(|field_id| read_ids.contains(field_id))
             {
                 continue;
             }
@@ -2794,15 +2837,25 @@ fn column_group_schemas(
         .collect()
 }
 
-/// [`column_group_schemas`] as the field ids of each file's top-level columns.
-fn column_group_ids(
+/// The field ids of each group's top-level columns, without the columns no
+/// group names. A name that is not a top-level column is skipped, and so is a
+/// group left empty.
+fn claimed_column_ids(
     schema: &lance_core::datatypes::Schema,
     groups: &[Vec<String>],
-) -> Result<Vec<Vec<i32>>> {
-    Ok(column_group_schemas(schema, groups)?
+) -> Vec<Vec<i32>> {
+    groups
         .iter()
-        .map(|group| group.fields.iter().map(|field| field.id).collect())
-        .collect())
+        .map(|group| {
+            schema
+                .fields
+                .iter()
+                .filter(|field| group.contains(&field.name))
+                .map(|field| field.id)
+                .collect::<Vec<_>>()
+        })
+        .filter(|group| !group.is_empty())
+        .collect()
 }
 
 /// Compaction's grouped write: fan one read of the merged rows out to one
@@ -3721,7 +3774,7 @@ fn append_row_lineage_columns(
 /// Fragment rewrites commit as one `Operation::Rewrite`; column repacks then
 /// commit as one `Operation::DataReplacement` that moves values without
 /// changing them, so a run with both kinds of task makes two versions. A
-/// planner never puts one fragment in both kinds of task. If the second
+/// fragment in both kinds of task is rejected before either commit. If the second
 /// commit fails, the first stays committed and the error is returned; the
 /// repacks can be planned again.
 pub async fn commit_compaction(
@@ -3733,6 +3786,22 @@ pub async fn commit_compaction(
     let (repacks, rewrites): (Vec<_>, Vec<_>) = completed_tasks
         .into_iter()
         .partition(|task| task.repacked_files.is_some());
+    // Otherwise the rewrite commits and the repack then conflicts with it.
+    let rewritten: HashSet<u64> = rewrites
+        .iter()
+        .flat_map(|task| task.original_fragments.iter().map(|fragment| fragment.id))
+        .collect();
+    if let Some(fragment_id) = repacks
+        .iter()
+        .filter_map(|task| task.repacked_files.as_ref())
+        .map(|repacked| repacked.fragment_id)
+        .find(|id| rewritten.contains(id))
+    {
+        return Err(Error::invalid_input(format!(
+            "fragment {fragment_id} is both rewritten and repacked by this compaction; \
+             a plan may put a fragment in one kind of task only"
+        )));
+    }
     let mut metrics = commit_rewrites(dataset, rewrites, remap_options, options).await?;
     metrics += repack::commit_repacked_files(dataset, repacks, options).await?;
     Ok(metrics)

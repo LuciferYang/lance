@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Column repacking, the compaction task that rewrites one fragment's columns
-//! into fewer data files without moving rows.
+//! Column repacking, the compaction task that rewrites some of one fragment's
+//! columns into new data files without moving rows: fewer files, or the files
+//! `column_groups` asks for.
 //!
 //! Every `add_columns` backfill gives each fragment one more data file, and a
 //! large fragment with few deletions never qualifies for a rewrite, so its
@@ -27,11 +28,15 @@ use crate::dataset::transaction::{DataReplacementGroup, Operation, TransactionBu
 use crate::dataset::{Dataset, cleanup_data_fragments, versions};
 use crate::{Error, Result};
 
-/// The field ids of `field` and everything beneath it.
-fn subtree_ids(field: &LanceField, ids: &mut HashSet<i32>) {
-    ids.insert(field.id);
+/// The ids of the leaf fields at and beneath `field`. A file holds a column's
+/// data only through its leaves: a V2.0 file can keep a struct's header after
+/// the struct's last child in it was dropped.
+fn leaf_ids(field: &LanceField, ids: &mut HashSet<i32>) {
+    if field.children.is_empty() {
+        ids.insert(field.id);
+    }
     for child in &field.children {
-        subtree_ids(child, ids);
+        leaf_ids(child, ids);
     }
 }
 
@@ -53,24 +58,25 @@ fn file_coverage(file: &DataFile, schema: &Schema) -> HashSet<i32> {
 /// The new files a repack of `fragment` should write, each the top-level
 /// field ids it holds, or `None` when no repack is due.
 ///
-/// `groups` partitions the top-level columns into the files wanted, as
-/// `column_group_schemas` orders them. Without groups, the columns of one
-/// live file stay together (the file holding the fragment's spilled row
-/// lineage, else the one holding the most bytes) and every other column goes
-/// to one new file; when `max_files` is 1, every column goes to one file. A
-/// group is written unless one live file holds exactly its columns. A column
-/// the fragment has no data for (added as all nulls) is left out of its
-/// group, and a group holding a blob column, or a column whose fields are
-/// only partly in the fragment's files, is left as it is.
+/// `groups` are the column groups, each the top-level field ids to keep in a
+/// file of their own. A group is moved unless one live file holds exactly its
+/// columns; moving it out leaves the other columns where they were. The
+/// columns no group names are merged into one new file only when the
+/// fragment is over `max_files`. Without groups and over `max_files`, the
+/// columns of one live file stay where they are (the file holding the
+/// fragment's spilled row lineage, else one holding a column that cannot
+/// move, else the largest) and every other column goes to one new file; with
+/// `max_files` 1 and every column movable, all of them go to one file.
 ///
-/// The new files carry no row lineage, so a repack that would move every
-/// column out of the file holding the fragment's spilled lineage is not
-/// planned: that file would stay for the lineage alone, and a later rewrite
-/// of the fragment is what reclaims it.
+/// A column the fragment has no data for (added as all nulls) is left out of
+/// its group, and a group holding a blob column, or a column whose fields are
+/// only partly in the fragment's files, is left as it is. The new files carry
+/// no row lineage, so a repack that would move every column out of the file
+/// holding the fragment's spilled lineage is not planned: that file would
+/// stay for the lineage alone until a rewrite of the fragment reclaims it.
 ///
-/// A group out of place is a reason to repack; so is `live_files` (the
-/// fragment's [`FragmentColumnLayoutStats::live_file_count`]) above
-/// `max_files`.
+/// `live_files` is the fragment's
+/// [`FragmentColumnLayoutStats::live_file_count`].
 ///
 /// [`FragmentColumnLayoutStats::live_file_count`]: crate::dataset::compaction_stats::FragmentColumnLayoutStats::live_file_count
 pub(super) fn plan_fragment_repack(
@@ -101,63 +107,77 @@ pub(super) fn plan_fragment_repack(
         .map(|file| (file, file_coverage(file, schema)))
         .collect();
     let covered: HashSet<i32> = live.iter().flat_map(|(_, ids)| ids).copied().collect();
-    let column_ids: Vec<(i32, HashSet<i32>)> = schema
+    let column_leaves: Vec<(i32, HashSet<i32>)> = schema
         .fields
         .iter()
         .map(|field| {
             let mut ids = HashSet::new();
-            subtree_ids(field, &mut ids);
+            leaf_ids(field, &mut ids);
             (field.id, ids)
         })
         .collect();
-    let present: BTreeSet<i32> = column_ids
+    let present: BTreeSet<i32> = column_leaves
         .iter()
-        .filter(|(_, ids)| !ids.is_disjoint(&covered))
+        .filter(|(_, leaves)| !leaves.is_disjoint(&covered))
         .map(|(column, _)| *column)
         .collect();
     let movable: HashSet<i32> = schema
         .fields
         .iter()
-        .zip(&column_ids)
-        .filter(|(field, (_, ids))| !holds_blob(field) && ids.is_subset(&covered))
+        .zip(&column_leaves)
+        .filter(|(field, (column, leaves))| {
+            present.contains(column) && !holds_blob(field) && leaves.is_subset(&covered)
+        })
         .map(|(field, _)| field.id)
         .collect();
-    // The top-level columns each live file holds any field of.
+    // The top-level columns each live file holds data for.
     let file_columns: Vec<BTreeSet<i32>> = live
         .iter()
         .map(|(_, coverage)| {
-            column_ids
+            column_leaves
                 .iter()
-                .filter(|(_, ids)| !ids.is_disjoint(coverage))
+                .filter(|(_, leaves)| !leaves.is_disjoint(coverage))
                 .map(|(column, _)| *column)
                 .collect()
         })
         .collect();
+    let holds_lineage = |file: &DataFile| file.fields.iter().any(|id| spilled.contains(id));
 
     let wanted: Vec<BTreeSet<i32>> = match groups {
-        Some(groups) => groups
-            .iter()
-            .map(|group| group.iter().copied().collect())
-            .collect(),
-        None if max_files == Some(1) => vec![present.clone()],
+        Some(groups) => {
+            let mut wanted: Vec<BTreeSet<i32>> = groups
+                .iter()
+                .map(|group| group.iter().copied().collect())
+                .collect();
+            let claimed: BTreeSet<i32> = wanted.iter().flatten().copied().collect();
+            let rest: BTreeSet<i32> = present.difference(&claimed).copied().collect();
+            let rest_files = file_columns
+                .iter()
+                .filter(|columns| !columns.is_disjoint(&rest))
+                .count();
+            if over_file_limit && rest_files > 1 {
+                wanted.push(rest);
+            }
+            wanted
+        }
+        None if max_files == Some(1) && present.iter().all(|c| movable.contains(c)) => {
+            vec![present.clone()]
+        }
         None => {
             let kept = live
                 .iter()
                 .zip(&file_columns)
                 .max_by_key(|((file, _), columns)| {
                     (
-                        file.fields.iter().any(|id| spilled.contains(id)),
+                        holds_lineage(file),
+                        columns.iter().any(|column| !movable.contains(column)),
                         file.file_size_bytes.get().map(|size| size.get()),
                         columns.len(),
                     )
                 })
                 .map(|(_, columns)| columns.clone())
                 .unwrap_or_default();
-            let rest = present
-                .iter()
-                .copied()
-                .filter(|column| !kept.contains(column) && movable.contains(column))
-                .collect();
+            let rest = present.difference(&kept).copied().collect();
             vec![kept, rest]
         }
     };
@@ -179,7 +199,8 @@ pub(super) fn plan_fragment_repack(
         .collect();
     let moved: HashSet<i32> = out_of_place.iter().flatten().copied().collect();
     let strands_lineage = live.iter().zip(&file_columns).any(|((file, _), columns)| {
-        file.fields.iter().any(|id| spilled.contains(id))
+        holds_lineage(file)
+            && !columns.is_empty()
             && columns.iter().all(|column| moved.contains(column))
     });
     (!out_of_place.is_empty() && !strands_lineage).then_some(out_of_place)
@@ -236,7 +257,7 @@ pub(super) async fn execute_repack(
     }
 
     // Read the base values only: the overlays stay on the fragment and keep
-    // shadowing them, so the new files hold exactly what the old ones did.
+    // shadowing them, so every live row reads as it did.
     let mut base = fragment.clone();
     base.overlays.clear();
     let source = FileFragment::new(Arc::new(dataset.clone()), base);
@@ -326,7 +347,8 @@ async fn write_one_file(
 /// Commit the files of repack results as one `DataReplacement` that moves
 /// values without changing them. Each result applies to its fragment as it
 /// stands at commit, so a concurrent change to other columns of the fragment
-/// is kept; the conflict check retries one that touches the moved columns.
+/// is kept; one that touches the moved columns fails the commit with a
+/// retryable conflict.
 pub(super) async fn commit_repacked_files(
     dataset: &mut Dataset,
     results: Vec<RewriteResult>,

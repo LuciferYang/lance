@@ -1453,8 +1453,8 @@ impl Transaction {
                     }
                 }
 
-                // The replaced fields' coverage of the modified fragments was
-                // withdrawn by `prepare_indices`.
+                // When the data changed, the replaced fields' coverage of the
+                // modified fragments was withdrawn by `prepare_indices`.
             }
             Operation::DataOverlay { groups } => {
                 // Stamp each overlay with the version this commit is producing.
