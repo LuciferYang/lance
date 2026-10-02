@@ -1101,3 +1101,92 @@ fn repack_merges_only_files_it_empties() {
     ];
     assert_eq!(plan(&schema, &fragment, None, 2), Some(vec![vec![4, 5]]));
 }
+
+/// When every file holds the struct, the largest file is kept with its other
+/// column and the struct's other files merge; and when only some files share
+/// a column with the largest, the merge falls back to every other file.
+#[test]
+fn repack_keeps_the_largest_file_that_shares_a_struct() {
+    use arrow_schema::Fields;
+    let child = |name: &str| Field::new(name, DataType::Int32, true);
+    let sized = |path: &str, fields: Vec<i32>, size: u64| {
+        let mut file = v2_0_file(path, fields);
+        file.file_size_bytes = lance_io::utils::CachedFileSize::new(size);
+        file
+    };
+    let plan = |schema: &lance_core::datatypes::Schema, fragment: &Fragment| {
+        crate::dataset::optimize::repack::plan_fragment_repack(
+            schema,
+            fragment,
+            fragment.files.len(),
+            None,
+            Some(2),
+        )
+    };
+    // a=0, s=1 {x=2, y=3, z=4}, b=5.
+    let schema = lance_schema(Schema::new(vec![
+        child("a"),
+        Field::new(
+            "s",
+            DataType::Struct(Fields::from(vec![child("x"), child("y"), child("z")])),
+            true,
+        ),
+        child("b"),
+    ]));
+
+    let mut fragment = Fragment::new(0);
+    fragment.files = vec![
+        sized("k.lance", vec![0, 1, 2], 100),
+        sized("m1.lance", vec![1, 3], 10),
+        sized("m2.lance", vec![1, 4], 10),
+    ];
+    assert_eq!(plan(&schema, &fragment), Some(vec![vec![1]]));
+
+    fragment.files = vec![
+        sized("k.lance", vec![0, 1, 2], 100),
+        sized("m1.lance", vec![1, 3, 4], 10),
+        sized("m2.lance", vec![5], 10),
+    ];
+    assert_eq!(plan(&schema, &fragment), Some(vec![vec![1, 5]]));
+}
+
+/// A V2.0 file holding only a struct header holds no column, so it does not
+/// stop the largest file from being kept; it goes when the struct moves.
+#[test]
+fn repack_keeps_the_largest_file_next_to_a_header_only_file() {
+    use arrow_schema::Fields;
+    let child = |name: &str| Field::new(name, DataType::Int32, true);
+    let sized = |path: &str, fields: Vec<i32>, size: u64| {
+        let mut file = v2_0_file(path, fields);
+        file.file_size_bytes = lance_io::utils::CachedFileSize::new(size);
+        file
+    };
+    // a=0, s=1 {x=2 (dropped), y=3}, b=4.
+    let schema = lance_schema(Schema::new(vec![
+        child("a"),
+        Field::new(
+            "s",
+            DataType::Struct(Fields::from(vec![child("x"), child("y")])),
+            true,
+        ),
+        child("b"),
+    ]))
+    .project_by_ids(&[0, 1, 3, 4], false);
+    let mut fragment = Fragment::new(0);
+    fragment.files = vec![
+        sized("h.lance", vec![1, 2], 10),
+        sized("base.lance", vec![0], 100),
+        sized("sy.lance", vec![1, 3], 10),
+        sized("bf.lance", vec![4], 10),
+    ];
+    assert_eq!(
+        crate::dataset::optimize::repack::plan_fragment_repack(
+            &schema,
+            &fragment,
+            4,
+            None,
+            Some(2)
+        ),
+        Some(vec![vec![1, 4]])
+    );
+}

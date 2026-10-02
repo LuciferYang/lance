@@ -75,11 +75,13 @@ fn file_coverage(file: &DataFile, schema: &Schema) -> HashSet<i32> {
 /// A merge only takes files it empties: files whose columns can all move,
 /// which hold no spilled lineage and share no column with a file holding it,
 /// and whose other fields (a struct header) belong to columns that move too.
-/// The files left keep their other columns. Without groups, when every live
-/// file can be emptied, one is left untouched as well, the largest by
-/// recorded size that still leaves two to merge, unless `max_files` is 1.
-/// Nothing is merged unless at least two files would be emptied, so a merge
-/// lowers the file count.
+/// The files left keep their columns, though a struct moved out of one
+/// leaves a tombstone where its header was. Without groups, when every file
+/// holding a column can be emptied, one of them stays unless `max_files` is
+/// 1: the largest by recorded size, with the files sharing no column with it
+/// merged, or if that leaves fewer than two, every other file. Nothing is
+/// merged unless at least two files would be emptied, so a merge lowers the
+/// file count.
 ///
 /// A column the fragment has no data for (added as all nulls) is left out of
 /// its group, and a group holding a blob column, or a column whose fields are
@@ -242,10 +244,11 @@ pub(super) fn plan_fragment_repack(
         }
         None => {
             let all = emptied(candidates);
+            let holding = file_columns.iter().filter(|c| !c.is_empty()).count();
             // A file a move cannot empty stays anyway. Otherwise one file
             // stays unless the limit is 1: the largest whose staying still
             // leaves two files to merge.
-            let merged = if all.len() < live.len() || max_files == Some(1) {
+            let merged = if all.len() < holding || max_files == Some(1) {
                 all
             } else {
                 let mut by_size = all.clone();
@@ -255,21 +258,27 @@ pub(super) fn plan_fragment_repack(
                         file_columns[*index].len(),
                     ))
                 });
-                // The file kept shares no column with the merge, so it is
-                // left untouched.
+                // Prefer merging only files that share no column with the
+                // file kept, which leaves it untouched; else merge every
+                // other file, as long as the kept file keeps a column.
                 by_size
                     .iter()
-                    .map(|kept| {
-                        emptied(
+                    .find_map(|kept| {
+                        let kept_columns = &file_columns[*kept];
+                        let untouched = emptied(
                             all.iter()
                                 .copied()
-                                .filter(|index| {
-                                    file_columns[*index].is_disjoint(&file_columns[*kept])
-                                })
+                                .filter(|index| file_columns[*index].is_disjoint(kept_columns))
                                 .collect(),
-                        )
+                        );
+                        if untouched.len() > 1 {
+                            return Some(untouched);
+                        }
+                        let others =
+                            emptied(all.iter().copied().filter(|index| index != kept).collect());
+                        (others.len() > 1 && !kept_columns.is_subset(&columns_of(&others)))
+                            .then_some(others)
                     })
-                    .find(|merged| merged.len() > 1)
                     .unwrap_or_default()
             };
             if merged.len() > 1 {
