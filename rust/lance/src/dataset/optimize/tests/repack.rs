@@ -950,8 +950,8 @@ fn repack_moves_a_struct_with_its_header() {
     assert_eq!(plan(&schema, &fragment), Some(vec![vec![1, 5, 6]]));
 }
 
-/// A struct-header file merged next to the struct reaches one file, and the
-/// next run plans nothing.
+/// A fragment whose first file still holds a dropped struct child reaches one
+/// file, and the next run plans nothing.
 #[tokio::test]
 async fn repack_with_a_dropped_struct_child_converges() {
     use arrow_array::{ArrayRef, StructArray};
@@ -1007,4 +1007,97 @@ async fn repack_with_a_dropped_struct_child_converges() {
         .await
         .unwrap();
     assert_eq!(dataset.manifest.version, version);
+}
+
+/// Struct-header layouts for the merges the other planner tests don't reach:
+/// the unclaimed columns under `column_groups`, a struct split with the
+/// lineage file, and the file kept when every file could go.
+#[test]
+fn repack_merges_only_files_it_empties() {
+    use arrow_schema::Fields;
+    use lance_table::format::{ROW_ID_FIELD_ID, RowIdMeta};
+    let child = |name: &str| Field::new(name, DataType::Int32, true);
+    let plan = |schema: &lance_core::datatypes::Schema,
+                fragment: &Fragment,
+                groups: Option<&[Vec<i32>]>,
+                max| {
+        crate::dataset::optimize::repack::plan_fragment_repack(
+            schema,
+            fragment,
+            fragment.files.len(),
+            groups,
+            Some(max),
+        )
+    };
+
+    // a=0, s=1 {x=2 (dropped), y=3, z=4 (dropped)}, b=5, groups [[s]].
+    // a.lance and b.lance both keep s's header, so merging a and b would
+    // drop neither.
+    let arrow = Schema::new(vec![
+        child("a"),
+        Field::new(
+            "s",
+            DataType::Struct(Fields::from(vec![child("x"), child("y"), child("z")])),
+            true,
+        ),
+        child("b"),
+    ]);
+    let schema = lance_schema(arrow).project_by_ids(&[0, 1, 3, 5], false);
+    let mut fragment = Fragment::new(0);
+    fragment.files = vec![
+        v2_0_file("a.lance", vec![0, 1, 2]),
+        v2_0_file("b.lance", vec![5, 1, 4]),
+        v2_0_file("s.lance", vec![1, 3]),
+    ];
+    assert_eq!(plan(&schema, &fragment, Some(&[vec![1]]), 2), None);
+
+    // s=0 {y=1, z=2}, b=3, c=4. s is split between the lineage file and
+    // c1.lance; moving s would empty the lineage file's columns, so only b
+    // and c merge.
+    let arrow = Schema::new(vec![
+        Field::new(
+            "s",
+            DataType::Struct(Fields::from(vec![child("y"), child("z")])),
+            true,
+        ),
+        child("b"),
+        child("c"),
+    ]);
+    let schema = lance_schema(arrow);
+    let mut fragment = Fragment::new(0);
+    fragment.files = vec![
+        v2_0_file("lineage.lance", vec![0, 1, ROW_ID_FIELD_ID]),
+        v2_0_file("c1.lance", vec![0, 2]),
+        v2_0_file("b.lance", vec![3]),
+        v2_0_file("c.lance", vec![4]),
+    ];
+    fragment.row_id_meta = Some(RowIdMeta::Column);
+    assert_eq!(plan(&schema, &fragment, None, 2), Some(vec![vec![3, 4]]));
+
+    // a=0, s=1 {x=2, y=3}, b=4, c=5. k.lance is the largest and shares s with
+    // m1.lance; keeping k leaves s and m1 alone and merges b and c.
+    let arrow = Schema::new(vec![
+        child("a"),
+        Field::new(
+            "s",
+            DataType::Struct(Fields::from(vec![child("x"), child("y")])),
+            true,
+        ),
+        child("b"),
+        child("c"),
+    ]);
+    let schema = lance_schema(arrow);
+    let sized = |path: &str, fields: Vec<i32>, size: u64| {
+        let mut file = v2_0_file(path, fields);
+        file.file_size_bytes = lance_io::utils::CachedFileSize::new(size);
+        file
+    };
+    let mut fragment = Fragment::new(0);
+    fragment.files = vec![
+        sized("k.lance", vec![1, 2], 100),
+        sized("m1.lance", vec![0, 1, 3], 10),
+        sized("m2.lance", vec![4], 10),
+        sized("m3.lance", vec![5], 10),
+    ];
+    assert_eq!(plan(&schema, &fragment, None, 2), Some(vec![vec![4, 5]]));
 }

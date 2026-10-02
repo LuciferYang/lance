@@ -12,7 +12,7 @@
 //! an `Operation::DataReplacement` with `data_change: false`: the fragment id,
 //! row addresses, overlays and index coverage are left as they are.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use lance_core::datatypes::{Field as LanceField, Schema};
@@ -27,6 +27,14 @@ use crate::dataset::fragment::FileFragment;
 use crate::dataset::transaction::{DataReplacementGroup, Operation, TransactionBuilder};
 use crate::dataset::{Dataset, cleanup_data_fragments, versions};
 use crate::{Error, Result};
+
+/// The ids of `field` and every field beneath it.
+fn subtree_ids(field: &LanceField, ids: &mut HashSet<i32>) {
+    ids.insert(field.id);
+    for child in &field.children {
+        subtree_ids(child, ids);
+    }
+}
 
 /// The ids of the leaf fields at and beneath `field`. The planner places a
 /// column by where its leaves are: a V2.0 file can keep a struct's header
@@ -60,17 +68,18 @@ fn file_coverage(file: &DataFile, schema: &Schema) -> HashSet<i32> {
 ///
 /// `groups` are the column groups, each the top-level field ids to keep in a
 /// file of their own. A group is moved unless one live file holds exactly its
-/// columns; moving it out leaves the other columns where they were. The
-/// columns no group names are merged into one new file only when the
-/// fragment is over `max_files`.
+/// columns; moving it out leaves the other columns where they were. Over
+/// `max_files`, the files holding only columns no group names are merged as
+/// well, under the rule below.
 ///
-/// Without groups and over `max_files`, only files the move empties are
-/// merged: files whose columns can all move, which hold no spilled lineage,
+/// A merge only takes files it empties: files whose columns can all move,
+/// which hold no spilled lineage and share no column with a file holding it,
 /// and whose other fields (a struct header) belong to columns that move too.
-/// Any other file stays as it is. When every live file can be emptied, one
-/// stays as well, the largest by recorded size that still leaves two to
-/// merge, unless `max_files` is 1. Nothing is planned unless at least two
-/// files would be emptied, so the file count drops.
+/// The files left keep their other columns. Without groups, when every live
+/// file can be emptied, one is left untouched as well, the largest by
+/// recorded size that still leaves two to merge, unless `max_files` is 1.
+/// Nothing is merged unless at least two files would be emptied, so a merge
+/// lowers the file count.
 ///
 /// A column the fragment has no data for (added as all nulls) is left out of
 /// its group, and a group holding a blob column, or a column whose fields are
@@ -81,8 +90,9 @@ fn file_coverage(file: &DataFile, schema: &Schema) -> HashSet<i32> {
 ///
 /// `live_files` is the fragment's
 /// [`FragmentColumnLayoutStats::live_file_count`]. A V2.0 file left holding
-/// only a struct header counts there but holds no column here, so it stays
-/// until a rewrite of the fragment.
+/// only a struct header counts there but holds no column here: it goes when
+/// a repack moves the struct, and otherwise stays until a rewrite of the
+/// fragment.
 ///
 /// [`FragmentColumnLayoutStats::live_file_count`]: crate::dataset::compaction_stats::FragmentColumnLayoutStats::live_file_count
 pub(super) fn plan_fragment_repack(
@@ -123,17 +133,12 @@ pub(super) fn plan_fragment_repack(
         })
         .collect();
     // Every schema field id under each top-level column.
-    let column_fields: std::collections::HashMap<i32, HashSet<i32>> = schema
+    let column_fields: HashMap<i32, HashSet<i32>> = schema
         .fields
         .iter()
         .map(|field| {
-            let ids = Schema {
-                fields: vec![field.clone()],
-                metadata: Default::default(),
-            }
-            .field_ids()
-            .into_iter()
-            .collect();
+            let mut ids = HashSet::new();
+            subtree_ids(field, &mut ids);
             (field.id, ids)
         })
         .collect();
@@ -163,15 +168,29 @@ pub(super) fn plan_fragment_repack(
         })
         .collect();
     let holds_lineage = |file: &DataFile| file.fields.iter().any(|id| spilled.contains(id));
-    // The live files whose columns can all move and which hold no lineage.
+    let lineage_columns: BTreeSet<i32> = live
+        .iter()
+        .zip(&file_columns)
+        .filter(|((file, _), _)| holds_lineage(file))
+        .flat_map(|(_, columns)| columns.iter().copied())
+        .collect();
+    // The live files a merge may take: every column can move, and moving them
+    // takes nothing out of a file holding spilled lineage.
     let candidates: Vec<usize> = (0..live.len())
         .filter(|index| {
             let columns = &file_columns[*index];
             !columns.is_empty()
                 && !holds_lineage(live[*index].0)
+                && columns.is_disjoint(&lineage_columns)
                 && columns.iter().all(|column| movable.contains(column))
         })
         .collect();
+    let columns_of = |files: &[usize]| -> BTreeSet<i32> {
+        files
+            .iter()
+            .flat_map(|index| file_columns[*index].iter().copied())
+            .collect()
+    };
     // Of `files`, the ones a move of all their columns together leaves with no
     // schema field, so the commit drops them. A file can also hold a field of
     // a column it holds no data for (a struct header), which only moving that
@@ -207,13 +226,17 @@ pub(super) fn plan_fragment_repack(
                 .map(|group| group.iter().copied().collect())
                 .collect();
             let claimed: BTreeSet<i32> = wanted.iter().flatten().copied().collect();
-            let rest: BTreeSet<i32> = present.difference(&claimed).copied().collect();
-            let rest_files = file_columns
-                .iter()
-                .filter(|columns| !columns.is_disjoint(&rest))
-                .count();
-            if over_file_limit && rest_files > 1 {
-                wanted.push(rest);
+            if over_file_limit {
+                let merged = emptied(
+                    candidates
+                        .iter()
+                        .copied()
+                        .filter(|index| file_columns[*index].is_disjoint(&claimed))
+                        .collect(),
+                );
+                if merged.len() > 1 {
+                    wanted.push(columns_of(&merged));
+                }
             }
             wanted
         }
@@ -232,19 +255,25 @@ pub(super) fn plan_fragment_repack(
                         file_columns[*index].len(),
                     ))
                 });
+                // The file kept shares no column with the merge, so it is
+                // left untouched.
                 by_size
                     .iter()
-                    .map(|kept| emptied(all.iter().copied().filter(|i| i != kept).collect()))
+                    .map(|kept| {
+                        emptied(
+                            all.iter()
+                                .copied()
+                                .filter(|index| {
+                                    file_columns[*index].is_disjoint(&file_columns[*kept])
+                                })
+                                .collect(),
+                        )
+                    })
                     .find(|merged| merged.len() > 1)
                     .unwrap_or_default()
             };
             if merged.len() > 1 {
-                vec![
-                    merged
-                        .iter()
-                        .flat_map(|index| file_columns[*index].iter().copied())
-                        .collect(),
-                ]
+                vec![columns_of(&merged)]
             } else {
                 Vec::new()
             }
