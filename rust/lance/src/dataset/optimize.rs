@@ -2757,6 +2757,7 @@ async fn write_column_group_fragments(
                     None,
                     seed_writers,
                     Some(file_row_counts),
+                    None,
                 )
                 .await
             }
