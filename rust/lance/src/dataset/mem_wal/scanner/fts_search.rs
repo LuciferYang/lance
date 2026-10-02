@@ -58,7 +58,10 @@ use super::block_list::compute_source_block_lists;
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{FirstByPkExec, PkBlockFilterExec};
-use super::projection::{project_to_canonical, validate_projection_names};
+use super::generation_read::{GenerationRead, filter_above};
+use super::projection::{
+    project_to_canonical, resolve_data_fields, top_level_of, validate_projection_names,
+};
 use super::sstable_cache::{DatasetCache, SsTableWarmer, open_sstable};
 use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
@@ -124,6 +127,11 @@ fn requested_query_document_granularity(
                 }
                 Ok(())
             }
+            // BM25F blends the target columns per row, so combined_fields is
+            // row-granular by construction and carries no granularity field.
+            // Merging Row still catches a tree that mixes it with a
+            // list-element leaf.
+            IndexFtsQuery::CombinedFields(_) => merge(current, Some(DocumentGranularity::Row)),
         }
     }
 
@@ -162,6 +170,8 @@ fn set_query_document_granularity(
                 child.document_granularity = Some(document_granularity);
             }
         }
+        // Row-granular by construction, and it carries no field to set.
+        IndexFtsQuery::CombinedFields(_) => {}
     }
 }
 
@@ -214,10 +224,9 @@ fn validate_source_document_granularities(
 
 /// Reject the query shapes the active memtable arm cannot evaluate.
 ///
-/// Only two remain. A fuzzy Match cannot also require every term: the fuzzy
-/// path expands each term independently and unions the expansions. And
-/// multi-match spans columns, while the memtable holds one inverted index per
-/// column, so there is no single index to search.
+/// Only one remains: a fuzzy Match cannot also require every term, because the
+/// fuzzy path expands each term independently and unions the expansions. A
+/// multi-match is checked leaf by leaf under the same rule.
 fn validate_lsm_fts_query(query: &FullTextSearchQuery) -> Result<()> {
     fn visit(query: &IndexFtsQuery) -> Result<()> {
         match query {
@@ -240,11 +249,16 @@ fn validate_lsm_fts_query(query: &FullTextSearchQuery) -> Result<()> {
                 }
                 Ok(())
             }
-            IndexFtsQuery::MultiMatch(_) => Err(Error::not_supported(
-                "LSM full-text search does not support multi-match queries: the memtable \
-                 holds one inverted index per column, so a cross-column query has no single \
-                 index to search"
-                    .to_string(),
+            IndexFtsQuery::MultiMatch(m) => {
+                for leaf in &m.match_queries {
+                    visit(&IndexFtsQuery::Match(leaf.clone()))?;
+                }
+                Ok(())
+            }
+            // BM25F needs corpus-wide field statistics that the memtable's
+            // in-memory index does not maintain.
+            IndexFtsQuery::CombinedFields(_) => Err(Error::not_supported(
+                "LSM full-text search does not support combined_fields (BM25F)".to_string(),
             )),
         }
     }
@@ -343,12 +357,16 @@ fn transient_fts_index_store(
     // defaults here would have the active rows disagree with base and SSTable
     // rows about what matches — silently, by returning fewer rows. Defaults are
     // right only when no persisted index covers the column, where there is no
-    // contract to match.
+    // contract to match — except for positions. The base answers a phrase over
+    // an unindexed column from a flat scan, where positions are implicit, and a
+    // transient index built without them returns no phrase hit for rows the
+    // base finds. The index lives for one query over the visible prefix, so the
+    // extra storage is bounded by that prefix.
     for (column, field_id) in field_ids {
         let params = index_params
             .get(column)
             .cloned()
-            .unwrap_or_default()
+            .unwrap_or_else(|| InvertedIndexParams::default().with_position(true))
             .document_granularity(document_granularity);
         store.add_fts_with_params(
             format!("__transient_fts_{column}"),
@@ -379,21 +397,55 @@ enum FtsPlanShape {
     /// One predicate, evaluated whole by every source against these columns.
     /// Usually one; several when the tree's leaves name different fields.
     Bound(Vec<String>),
-    /// A top-level multi-match: independent per-column searches, unioned and
-    /// collapsed to the best field per row.
+    /// A top-level multi-match spanning columns: one independent search per
+    /// leaf, unioned and collapsed to the best hit per row.
     PerColumn(Vec<(String, IndexFtsQuery)>),
 }
 
 /// Decide how `query` reaches the columns it names.
 ///
-/// A top-level multi-match decomposes: its leaves are independent per-column
-/// matches, which is exactly what the base-table path scores separately before
-/// taking the best per row. Every other shape spanning columns is *one*
-/// predicate over several fields — `must: [a in title, b in body]` is a
-/// conjunction, not a union of per-column results — so it stays whole and each
-/// source evaluates it across all of them.
+/// A top-level multi-match spanning columns decomposes: its leaves are
+/// independent matches — usually one per column, but a column may carry
+/// several — which is exactly what the base-table path scores separately
+/// before taking the best per row. Naming one column, it is a single-index
+/// query like any other and stays bound: the memtable scores it as a
+/// best-child node and the dataset scanner keeps it on its compound scorer, so
+/// it needs no primary key to collapse by. Every other shape spanning columns
+/// is *one* predicate over several fields — `must: [a in title, b in body]` is
+/// a conjunction, not a union of per-column results — so it stays whole and
+/// each source evaluates it across all of them.
 fn fts_plan_shape(query: &IndexFtsQuery) -> Result<FtsPlanShape> {
     let columns = collect_query_columns(query);
+    if let IndexFtsQuery::MultiMatch(multi) = query {
+        // Row documents only, whatever the column count: the dataset scanner
+        // refuses element documents for any multi-match, and collapsing arms
+        // per primary key would drop elements anyway.
+        if requested_query_document_granularity(query)?
+            .is_some_and(|granularity| granularity.is_list_element())
+        {
+            return Err(Error::not_supported(
+                "multi-match full-text search supports row documents only, not list elements"
+                    .to_string(),
+            ));
+        }
+        if columns.len() <= 1 {
+            return Ok(FtsPlanShape::Bound(columns));
+        }
+        return multi
+            .match_queries
+            .iter()
+            .map(|leaf| {
+                let column = leaf.column.clone().ok_or_else(|| {
+                    Error::invalid_input(
+                        "multi-match leaf has no bound column; they are bound at construction"
+                            .to_string(),
+                    )
+                })?;
+                Ok((column, IndexFtsQuery::Match(leaf.clone())))
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(FtsPlanShape::PerColumn);
+    }
     if columns.len() <= 1 {
         return Ok(FtsPlanShape::Bound(columns));
     }
@@ -408,23 +460,7 @@ fn fts_plan_shape(query: &IndexFtsQuery) -> Result<FtsPlanShape> {
                 .to_string(),
         ));
     }
-    let IndexFtsQuery::MultiMatch(multi) = query else {
-        return Ok(FtsPlanShape::Bound(columns));
-    };
-    multi
-        .match_queries
-        .iter()
-        .map(|leaf| {
-            let column = leaf.column.clone().ok_or_else(|| {
-                Error::invalid_input(
-                    "multi-match leaf has no bound column; they are bound at construction"
-                        .to_string(),
-                )
-            })?;
-            Ok((column, IndexFtsQuery::Match(leaf.clone())))
-        })
-        .collect::<Result<Vec<_>>>()
-        .map(FtsPlanShape::PerColumn)
+    Ok(FtsPlanShape::Bound(columns))
 }
 
 /// The columns `query` names, in tree order and deduplicated.
@@ -444,6 +480,11 @@ fn collect_query_columns(query: &IndexFtsQuery) -> Vec<String> {
         match query {
             IndexFtsQuery::Match(query) => push(&query.column),
             IndexFtsQuery::Phrase(query) => push(&query.column),
+            IndexFtsQuery::CombinedFields(query) => {
+                for column in query.column_names() {
+                    push(&Some(column.to_string()));
+                }
+            }
             IndexFtsQuery::MultiMatch(query) => {
                 for leaf in &query.match_queries {
                     push(&leaf.column);
@@ -475,6 +516,9 @@ pub struct LsmFtsSearchPlanner {
     collector: LsmDataSourceCollector,
     pk_columns: Vec<String>,
     base_schema: SchemaRef,
+    /// The same schema with each field's id, which resolves a generation's
+    /// stored columns to the table's.
+    identity_schema: SchemaRef,
     /// Session threaded into SSTable opens (shared caches).
     session: Option<Arc<Session>>,
     /// Store params for opening SSTables, reusing the base dataset's store.
@@ -501,6 +545,7 @@ impl LsmFtsSearchPlanner {
         Self {
             collector,
             pk_columns,
+            identity_schema: base_schema.clone(),
             base_schema,
             session: None,
             store_params: None,
@@ -524,6 +569,16 @@ impl LsmFtsSearchPlanner {
     /// `1.0` are rejected by [`Self::plan_search`].
     pub fn with_overfetch_factor(mut self, factor: f64) -> Self {
         self.overfetch_factor = factor;
+        self
+    }
+
+    /// The table's schema carrying each field's id, which is what resolves a
+    /// generation's stored columns to the table's.
+    ///
+    /// Defaults to the base schema, so a caller that has no ids to give is
+    /// matched by name as it was.
+    pub fn with_identity_schema(mut self, schema: SchemaRef) -> Self {
+        self.identity_schema = schema;
         self
     }
 
@@ -615,16 +670,16 @@ impl LsmFtsSearchPlanner {
             ));
         }
 
-        // One single-column plan per field, unioned and collapsed. Each field is
-        // scored independently and a row takes its best field's score, which is
-        // what the base-table path does for a cross-column MultiMatch
-        // (`DisjunctionScore::Max`). Reusing the single-column planner per field
+        // One single-column plan per leaf, unioned and collapsed. Each leaf is
+        // scored independently and a row takes its best leaf's score, which is
+        // what the base-table path does for a MultiMatch
+        // (`DisjunctionScore::Max`). Reusing the single-column planner per leaf
         // keeps every per-source behavior — granularity resolution, prefilter,
         // the cross-generation block-list — identical to a single-column search,
-        // at the cost of one pass over the sources per field.
+        // at the cost of one pass over the sources per leaf.
         //
-        // Each arm is cut at `k * fields` rather than `k`: the final top-k is
-        // over *rows*, and a row can occupy up to one slot per field, so a
+        // Each arm is cut at `k * leaves` rather than `k`: the final top-k is
+        // over *rows*, and a row can occupy up to one slot per leaf, so a
         // tighter per-arm cut could leave fewer than `k` rows after the collapse
         // even when more matching rows exist.
         let candidate_limit = limit.map(|k| k.saturating_mul(per_column.len().max(1)));
@@ -782,7 +837,7 @@ impl LsmFtsSearchPlanner {
             &[SCORE_COLUMN]
         };
         validate_projection_names(projection, &self.base_schema, allowed_system_columns)?;
-        let target_schema = self.canonical_fts_schema(projection, document_granularity);
+        let target_schema = self.canonical_fts_schema(projection, document_granularity)?;
         let overfetch = super::validate_overfetch_factor(self.overfetch_factor)?;
 
         if sources.is_empty() {
@@ -832,16 +887,20 @@ impl LsmFtsSearchPlanner {
                 (source, is_active, blocked, fetch_limit)
             })
             .collect();
+        // Type-erased for the reason the vector planner's arm gives.
         let built =
             futures::future::try_join_all(arm_inputs.iter().map(|(source, _, _, fetch_limit)| {
-                Box::pin(self.build_source_plan(
-                    source,
-                    columns,
-                    &query,
-                    *fetch_limit,
-                    projection,
-                    &index_params,
-                ))
+                let arm: futures::future::BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> =
+                    Box::pin(self.build_source_plan(
+                        source,
+                        columns,
+                        &query,
+                        *fetch_limit,
+                        projection,
+                        &index_params,
+                        &target_schema,
+                    ));
+                arm
             }))
             .await?;
 
@@ -926,14 +985,30 @@ impl LsmFtsSearchPlanner {
                         self.warmer.as_ref(),
                     )
                     .await?;
-                    if index_params.is_empty() {
-                        index_params = indexed_fts_index_params(&dataset, column).await?;
+                    // The index is on this generation's own column, under the
+                    // name it had when the generation was sealed. A generation
+                    // sealed before the column existed has no index on it and
+                    // offers no granularity.
+                    let generation = GenerationRead::new(
+                        dataset.schema(),
+                        &self.identity_schema,
+                        &self.pk_columns,
+                        Vec::new(),
+                    );
+                    match generation.stored_name(column) {
+                        None => Vec::new(),
+                        Some(stored_column) => {
+                            if index_params.is_empty() {
+                                index_params =
+                                    indexed_fts_index_params(&dataset, stored_column).await?;
+                            }
+                            indexed_fts_document_granularities(&dataset, stored_column)
+                                .await?
+                                .into_iter()
+                                .map(|(_, document_granularity)| document_granularity)
+                                .collect::<Vec<_>>()
+                        }
                     }
-                    indexed_fts_document_granularities(&dataset, column)
-                        .await?
-                        .into_iter()
-                        .map(|(_, document_granularity)| document_granularity)
-                        .collect::<Vec<_>>()
                 }
                 LsmDataSource::ActiveMemTable { index_store, .. } => {
                     index_store.fts_document_granularities_by_column(column)
@@ -1003,6 +1078,9 @@ impl LsmFtsSearchPlanner {
         limit: Option<usize>,
         projection: Option<&[String]>,
         index_params: &HashMap<&str, InvertedIndexParams>,
+        // What every arm is normalized to, so an arm with nothing to offer can
+        // stand in for itself.
+        target_schema: &SchemaRef,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // One column: bind every leaf to it, which is what lets a tree built
         // from bare terms reach the right field. Several: the leaves already
@@ -1026,7 +1104,10 @@ impl LsmFtsSearchPlanner {
             LsmDataSource::BaseTable { dataset } => {
                 let mut scanner = dataset.scan();
                 let cols = self.fts_scanner_projection(projection);
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                // Resolve against the *source* schema so a nested path narrows the
+                // struct rather than flattening it; expressions cannot express a
+                // partial nested projection, only a schema can.
+                scanner.project_with_schema(&dataset.schema().project(&cols)?)?;
                 if let Some(ref filter) = self.filter {
                     // `prefilter(true)` is required: without it the scanner
                     // post-filters the unfiltered BM25 top-k, dropping matching
@@ -1047,16 +1128,95 @@ impl LsmFtsSearchPlanner {
                 )
                 .await?;
                 let mut scanner = dataset.scan();
-                let cols = self.fts_scanner_projection(projection);
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
-                if let Some(ref filter) = self.filter {
+                // Asked of this generation under its own names: a rename moved
+                // the table's name while the file still holds the old one.
+                let asked_for = self.fts_scanner_projection(projection);
+                let mut generation = GenerationRead::new(
+                    dataset.schema(),
+                    &self.identity_schema,
+                    &self.pk_columns,
+                    asked_for,
+                );
+                // Every queried column has to be resolved: a rename moved the
+                // table's name while the file still holds the old one.
+                let mut stored_columns = Vec::with_capacity(columns.len());
+                for column in columns {
+                    let Some(stored) = generation.stored_name(column) else {
+                        // Sealed before the column existed, so it has nothing to
+                        // match -- and nothing to give a predicate spanning it.
+                        return self.empty_plan(target_schema);
+                    };
+                    stored_columns.push((column.clone(), stored.to_string()));
+                }
+                // A predicate this generation cannot answer as written runs
+                // above the reconciliation, where the columns it names exist.
+                let (stored_filter, above) = generation.split_filter(self.filter.as_ref());
+                // Resolve against the *source* schema so a nested path narrows the
+                // struct rather than flattening it; expressions cannot express a
+                // partial nested projection, only a schema can.
+                scanner.project_with_schema(
+                    &dataset.schema().project(&generation.stored_projection())?,
+                )?;
+                if let Some(ref stored) = stored_filter {
                     // See the base arm: `prefilter(true)` makes this a true
                     // prefilter rather than a lossy post-filter on the BM25 top-k.
-                    scanner.filter_expr(filter.clone());
+                    scanner.filter_expr(stored.clone());
                     scanner.prefilter(true);
                 }
-                scanner.full_text_search(bind(query)?)?;
-                scanner.create_plan().await
+                // Bound here, limited below: this arm's limit rule is not the
+                // one `bind` applies, so only the column binding is taken from
+                // the shape of the set.
+                let bound_query = match stored_columns.as_slice() {
+                    // Every queried column is stored under the name the table
+                    // still uses, so the tree reaches the scanner as the other
+                    // arms get it -- a cross-column predicate keeps its own leaf
+                    // bindings, which rebinding would collapse onto one field.
+                    _ if stored_columns.iter().all(|(asked, stored)| asked == stored) => {
+                        match columns {
+                            [column] => query.clone().with_column(column.clone())?,
+                            _ => query.clone(),
+                        }
+                    }
+                    // One column, moved: bind the whole tree to the name this
+                    // generation stores it under.
+                    [(_, stored)] => query.clone().with_column(stored.clone())?,
+                    // Several columns, at least one of them renamed. Each leaf
+                    // would need its own name and `with_column` rebinds the
+                    // whole tree, collapsing a cross-column predicate onto one
+                    // field -- which answers a different question. Refuse rather
+                    // than rank on the wrong column silently.
+                    moved => {
+                        let renamed: Vec<String> = moved
+                            .iter()
+                            .filter(|(asked, stored)| asked != stored)
+                            .map(|(asked, stored)| format!("{asked} (stored as {stored})"))
+                            .collect();
+                        return Err(Error::invalid_input(format!(
+                            "a full-text search over several columns cannot read a sealed \
+                             generation in which one of them was renamed: {}. Compact the table \
+                             so the generation merges into base, or search the columns separately",
+                            renamed.join(", ")
+                        )));
+                    }
+                };
+                // A predicate that could not be pushed down runs above the
+                // reconciliation, which is after the search has taken its top-k
+                // by score. Cutting first would drop rows that pass the
+                // predicate behind rows that do not, so a generation with a
+                // deferred predicate does not cut.
+                let bound_query = match limit.filter(|_| above.is_none()) {
+                    Some(limit) => bound_query.limit(Some(limit as i64)),
+                    None => bound_query.limit(None),
+                };
+                scanner.full_text_search(bound_query)?;
+                // Boxed for the reason the scan planner's arm gives: a
+                // generation resolves its own schema before scanning, and
+                // the inlined future is too deep for the `Send` proof.
+                let reconciled = generation.reconcile(Box::pin(scanner.create_plan()).await?)?;
+                match &above {
+                    Some(expr) => filter_above(reconciled, expr),
+                    None => Ok(reconciled),
+                }
             }
             LsmDataSource::ActiveMemTable {
                 batch_store,
@@ -1094,7 +1254,7 @@ impl LsmFtsSearchPlanner {
                         Some(store) => store,
                         None => {
                             return self.empty_plan(
-                                &self.canonical_fts_schema(projection, document_granularity),
+                                &self.canonical_fts_schema(projection, document_granularity)?,
                             );
                         }
                     }
@@ -1145,11 +1305,19 @@ impl LsmFtsSearchPlanner {
     }
 
     /// Canonical FTS output: user-projected cols + PK + `_score`.
+    ///
+    /// Data columns resolve through [`resolve_data_fields`], the same
+    /// nested-path resolver [`canonical_output_schema`] uses, so `meta.a`
+    /// contributes `meta: Struct<a>` and sibling leaves collapse into one
+    /// field at the parent's first-mentioned position. The FTS-specific
+    /// columns (`_score`, `_doc_index`) are appended around it.
+    ///
+    /// [`canonical_output_schema`]: super::projection::canonical_output_schema
     fn canonical_fts_schema(
         &self,
         user_projection: Option<&[String]>,
         document_granularity: DocumentGranularity,
-    ) -> SchemaRef {
+    ) -> Result<SchemaRef> {
         let mut ordered: Vec<String> = if let Some(p) = user_projection {
             p.to_vec()
         } else {
@@ -1170,24 +1338,35 @@ impl LsmFtsSearchPlanner {
         if !ordered.iter().any(|c| c == SCORE_COLUMN) {
             ordered.push(SCORE_COLUMN.to_string());
         }
-        let fields: Vec<Arc<Field>> = ordered
+
+        let data_names: Vec<String> = ordered
             .iter()
-            .filter_map(|name| {
-                if name == SCORE_COLUMN {
-                    Some(Arc::new(Field::new(SCORE_COLUMN, DataType::Float32, true)))
-                } else if name == DOC_INDEX_COL {
-                    Some(Arc::new(DOC_INDEX_FIELD.clone()))
-                } else if is_system_column(name) {
-                    Some(Arc::new(Field::new(name.clone(), DataType::UInt64, true)))
-                } else {
-                    self.base_schema
-                        .field_with_name(name)
-                        .ok()
-                        .map(|f| Arc::new(f.clone()))
-                }
+            .filter(|n| {
+                n.as_str() != SCORE_COLUMN && n.as_str() != DOC_INDEX_COL && !is_system_column(n)
             })
+            .cloned()
             .collect();
-        Arc::new(Schema::new(fields))
+        let mut by_name: HashMap<String, Arc<Field>> =
+            resolve_data_fields(&data_names, &self.base_schema)?
+                .into_iter()
+                .map(|f| (f.name().clone(), f))
+                .collect();
+
+        let mut fields: Vec<Arc<Field>> = Vec::with_capacity(ordered.len());
+        for name in &ordered {
+            if name == SCORE_COLUMN {
+                fields.push(Arc::new(Field::new(SCORE_COLUMN, DataType::Float32, true)));
+            } else if name == DOC_INDEX_COL {
+                fields.push(Arc::new(DOC_INDEX_FIELD.clone()));
+            } else if is_system_column(name) {
+                fields.push(Arc::new(Field::new(name.clone(), DataType::UInt64, true)));
+            } else if let Some(field) = by_name.remove(&top_level_of(name)?) {
+                // `remove` is what collapses a second mention of the same
+                // parent (`meta.a` then `meta.c`) into the single merged field.
+                fields.push(field);
+            }
+        }
+        Ok(Arc::new(Schema::new(fields)))
     }
 
     fn empty_plan(&self, schema: &SchemaRef) -> Result<Arc<dyn ExecutionPlan>> {
@@ -1203,9 +1382,10 @@ mod tests {
     use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
     use crate::dataset::{Dataset, WriteParams};
     use arrow_array::builder::{ListBuilder, StringBuilder};
+    use arrow_array::cast::AsArray;
     use arrow_array::{
-        Array, BooleanArray, Int32Array, ListArray, RecordBatch, RecordBatchIterator, StringArray,
-        UInt32Array,
+        Array, BooleanArray, Float32Array, Int32Array, ListArray, RecordBatch, RecordBatchIterator,
+        StringArray, UInt32Array,
     };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use futures::TryStreamExt;
@@ -1314,6 +1494,156 @@ mod tests {
                 .unwrap();
         }
         dataset
+    }
+
+    /// `fts_schema` plus `meta: Struct<a: Int64, b: Utf8>`.
+    fn nested_fts_schema() -> Arc<ArrowSchema> {
+        let mut id_meta = HashMap::new();
+        id_meta.insert(
+            "lance-schema:unenforced-primary-key".to_string(),
+            "true".to_string(),
+        );
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(id_meta),
+            Field::new("text", DataType::Utf8, true),
+            Field::new("meta", DataType::Struct(nested_meta_fields()), true),
+        ]))
+    }
+
+    fn nested_meta_fields() -> arrow_schema::Fields {
+        arrow_schema::Fields::from(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Utf8, true),
+        ])
+    }
+
+    /// The children `meta` carries in `schema`, in order.
+    fn meta_children(schema: &ArrowSchema) -> Vec<String> {
+        let DataType::Struct(fields) = schema
+            .field_with_name("meta")
+            .expect("meta survived canonicalization")
+            .data_type()
+            .clone()
+        else {
+            panic!("meta is not a struct");
+        };
+        fields.iter().map(|f| f.name().clone()).collect()
+    }
+
+    /// The FTS planner builds its own canonical target, so it needs the same
+    /// nested-path resolver as every other arm. A flat `field_with_name`
+    /// lookup misses `meta.a` entirely and `project_to_canonical` then drops
+    /// the column from every source — a silent truncation, since
+    /// `validate_projection_names` accepts the name.
+    #[tokio::test]
+    async fn nested_projection_survives_fts_canonicalization() {
+        let schema = nested_fts_schema();
+        let meta = arrow_array::StructArray::new(
+            nested_meta_fields(),
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![10i64, 20])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec!["b_1", "b_2"])) as Arc<dyn Array>,
+            ],
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["lance rocks", "unrelated"])),
+                Arc::new(meta),
+            ],
+        )
+        .unwrap();
+
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
+        indexes.add_fts("text_fts".to_string(), 1, "text".to_string());
+        batch_store.append(batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&batch, 0, Some(0))
+            .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                uuid::Uuid::new_v4(),
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store: Arc::new(indexes),
+                        schema: schema.clone(),
+                        generation: 1,
+                    },
+                    frozen: vec![],
+                },
+            );
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
+
+        let projection = vec!["meta.a".to_string()];
+        let plan = planner
+            .plan_search(
+                FullTextSearchQuery::new("lance".to_string())
+                    .with_column("text".to_string())
+                    .unwrap(),
+                Some(10),
+                Some(&projection),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(meta_children(&plan.schema()), vec!["a"]);
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        let batches: Vec<RecordBatch> = plan
+            .execute(0, ctx.task_ctx())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 1, "only id=1 contains 'lance'");
+        let hit = batches.iter().find(|b| b.num_rows() > 0).unwrap();
+        assert_eq!(meta_children(hit.schema_ref()), vec!["a"]);
+        assert_eq!(
+            hit.column_by_name("meta")
+                .unwrap()
+                .as_struct()
+                .column_by_name("a")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::Int64Array>()
+                .unwrap()
+                .value(0),
+            10
+        );
+    }
+
+    /// The no-source arm builds the same canonical target, so an empty result
+    /// still reports the narrowed struct rather than dropping it.
+    #[tokio::test]
+    async fn empty_fts_plan_preserves_nested_projection() {
+        let schema = nested_fts_schema();
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![]);
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
+
+        let projection = vec!["meta.a".to_string()];
+        let plan = planner
+            .plan_search(
+                FullTextSearchQuery::new("lance".to_string())
+                    .with_column("text".to_string())
+                    .unwrap(),
+                Some(1),
+                Some(&projection),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(meta_children(&plan.schema()), vec!["a"]);
     }
 
     #[tokio::test]
@@ -1870,6 +2200,119 @@ mod tests {
         );
     }
 
+    /// Refused rather than ranked on the wrong column: rebinding the tree to
+    /// one name would answer a different question.
+    #[tokio::test]
+    async fn a_cross_column_predicate_over_a_renamed_generation_is_refused() {
+        use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
+        use crate::index::DatasetIndexExt;
+        use lance_core::datatypes::LANCE_FIELD_ID_KEY;
+        use lance_index::IndexType;
+        use lance_index::scalar::inverted::query::{BooleanQuery, MatchQuery, Occur};
+        use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
+
+        let stored_schema = two_column_fts_schema();
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let shard_id = uuid::Uuid::new_v4();
+
+        // The generation holds `title` and `body`, indexed under those names.
+        let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
+        let mut gen1 = write_dataset(
+            &gen1_uri,
+            vec![make_two_column_batch(
+                &stored_schema,
+                &[(1, "alpha", "beta")],
+            )],
+        )
+        .await;
+        for column in ["title", "body"] {
+            gen1.create_index(
+                &[column],
+                IndexType::Inverted,
+                Some(format!("{column}_fts")),
+                &InvertedIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        }
+
+        // The table has since renamed `title` to `heading`. The id stays, which
+        // is what lets the generation be recognised as holding the same column.
+        let stamp = |name: &str, id: i32, nullable: bool| {
+            Field::new(name, DataType::Utf8, nullable).with_metadata(HashMap::from([(
+                LANCE_FIELD_ID_KEY.to_string(),
+                id.to_string(),
+            )]))
+        };
+        let mut pk_meta = HashMap::from([(LANCE_FIELD_ID_KEY.to_string(), "0".to_string())]);
+        pk_meta.insert(
+            "lance-schema:unenforced-primary-key".to_string(),
+            "true".to_string(),
+        );
+        let table_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(pk_meta),
+            stamp("heading", 1, true),
+            stamp("body", 2, true),
+        ]));
+
+        let snapshot = ShardSnapshot::new(shard_id)
+            .with_current_generation(2)
+            .with_sstable(1, "gen_1".to_string());
+        let collector =
+            LsmDataSourceCollector::without_base_table(base_uri.clone(), vec![snapshot]);
+        let planner =
+            LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], table_schema.clone())
+                .with_identity_schema(Arc::clone(&table_schema));
+
+        // One predicate over both fields, under the names the table uses now.
+        let query = |first: &str| {
+            FullTextSearchQuery::new_query(IndexFtsQuery::Boolean(BooleanQuery::new(vec![
+                (
+                    Occur::Must,
+                    MatchQuery::new("alpha".to_string())
+                        .with_column(Some(first.to_string()))
+                        .into(),
+                ),
+                (
+                    Occur::Must,
+                    MatchQuery::new("beta".to_string())
+                        .with_column(Some("body".to_string()))
+                        .into(),
+                ),
+            ])))
+        };
+
+        let error = planner
+            .plan_search(query("heading"), Some(10), None)
+            .await
+            .expect_err("a renamed column in a cross-column predicate must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("renamed") && message.contains("heading"),
+            "the refusal should name the column that moved, got: {message}"
+        );
+
+        // The control: the same generation, the same predicate, but the table
+        // still calls the column what the generation does. Nothing to rebind,
+        // so the tree reaches the scanner and the arm plans.
+        let unmoved = Arc::new(ArrowSchema::new(vec![
+            table_schema.field(0).clone(),
+            stamp("title", 1, true),
+            stamp("body", 2, true),
+        ]));
+        let snapshot = ShardSnapshot::new(shard_id)
+            .with_current_generation(2)
+            .with_sstable(1, "gen_1".to_string());
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![snapshot]);
+        LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], unmoved.clone())
+            .with_identity_schema(unmoved)
+            .plan_search(query("title"), Some(10), None)
+            .await
+            .expect("an unmoved cross-column predicate still plans over the generation");
+    }
+
     /// The SSTable arm must apply the filter as a true FTS prefilter, and that
     /// prefiltered candidate set must compose with cross-generation block-list
     /// filtering plus over-fetch. Gen 1's best predicate-matching hit (id=3) is
@@ -2158,9 +2601,18 @@ mod tests {
         );
     }
 
+    /// A single-column multi-match takes the same bound path as a plain match:
+    /// without a primary key there is nothing to collapse by, and nothing that
+    /// needs collapsing.
+    #[rstest::rstest]
+    #[case::match_query(false)]
+    #[case::single_column_multi_match(true)]
     #[tokio::test]
-    async fn active_filtered_search_without_pk_applies_small_limit_after_filter() {
+    async fn active_filtered_search_without_pk_applies_small_limit_after_filter(
+        #[case] multi_match: bool,
+    ) {
         use datafusion::prelude::{col, lit};
+        use lance_index::scalar::inverted::query::MultiMatchQuery;
 
         let schema = fts_schema();
         let batch_store = Arc::new(BatchStore::with_capacity(16));
@@ -2195,14 +2647,17 @@ mod tests {
 
         let planner = LsmFtsSearchPlanner::new(collector, vec![], schema)
             .with_filter(Some(col("id").gt_eq(lit(1i32))));
+        let query = if multi_match {
+            FullTextSearchQuery::new_query(IndexFtsQuery::MultiMatch(
+                MultiMatchQuery::try_new("lance".to_string(), vec!["text".to_string()]).unwrap(),
+            ))
+        } else {
+            FullTextSearchQuery::new("lance".to_string())
+                .with_column("text".to_string())
+                .unwrap()
+        };
         let plan = planner
-            .plan_search(
-                FullTextSearchQuery::new("lance".to_string())
-                    .with_column("text".to_string())
-                    .unwrap(),
-                Some(2),
-                None,
-            )
+            .plan_search(query, Some(2), None)
             .await
             .expect("planner should produce an active-only filtered plan");
 
@@ -2933,6 +3388,340 @@ mod tests {
         let stream = plan.execute(0, ctx.task_ctx()).unwrap();
         let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+    }
+
+    /// A multi-match decomposes per leaf only when its leaves span columns.
+    /// Naming one column — through however many leaves — it is a single-index
+    /// query and stays on the bound path, which needs no primary key.
+    #[rstest::rstest]
+    #[case::one_leaf(vec!["text"], false)]
+    #[case::two_leaves_one_column(vec!["text", "text"], false)]
+    #[case::one_leaf_per_column(vec!["title", "body"], true)]
+    #[case::mixed(vec!["title", "title", "body"], true)]
+    fn multi_match_decomposes_only_when_it_spans_columns(
+        #[case] leaves: Vec<&str>,
+        #[case] spans_columns: bool,
+    ) {
+        use lance_index::scalar::inverted::query::MultiMatchQuery;
+
+        let multi = MultiMatchQuery::try_new(
+            "lance".to_string(),
+            leaves.iter().map(|leaf| leaf.to_string()).collect(),
+        )
+        .unwrap();
+        match fts_plan_shape(&IndexFtsQuery::MultiMatch(multi)).unwrap() {
+            FtsPlanShape::Bound(columns) => {
+                assert!(!spans_columns, "expected one arm per leaf for {leaves:?}");
+                assert_eq!(columns, vec![leaves[0].to_string()]);
+            }
+            FtsPlanShape::PerColumn(arms) => {
+                assert!(spans_columns, "expected the bound path for {leaves:?}");
+                assert_eq!(
+                    arms.iter()
+                        .map(|(column, _)| column.as_str())
+                        .collect::<Vec<_>>(),
+                    leaves
+                );
+            }
+        }
+    }
+
+    /// Two leaves on one column evaluate whole on the bound path, each row
+    /// scored by its best leaf — the same rows and scores as the dominating
+    /// leaf alone.
+    #[tokio::test]
+    async fn single_column_multi_match_scores_each_row_by_its_best_leaf() {
+        use lance_index::scalar::inverted::query::MultiMatchQuery;
+
+        let schema = fts_schema();
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
+        indexes.add_fts("text_fts".to_string(), 1, "text".to_string());
+        let active_batch = make_batch(
+            &schema,
+            &[1, 2, 3],
+            &["lance rocks", "lance lance", "nothing"],
+        );
+        let (_, row_offset, batch_position) = batch_store.append(active_batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&active_batch, row_offset, Some(batch_position))
+            .unwrap();
+        let indexes = Arc::new(indexes);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                uuid::Uuid::new_v4(),
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store: indexes,
+                        schema: schema.clone(),
+                        generation: 1,
+                    },
+                    frozen: vec![],
+                },
+            );
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
+        let ctx = datafusion::prelude::SessionContext::new();
+        let scores_for = |query: FullTextSearchQuery| {
+            let planner = &planner;
+            let ctx = &ctx;
+            async move {
+                let plan = planner
+                    .plan_search(query, Some(10), Some(&["id".to_string()]))
+                    .await
+                    .expect("plans");
+                let batches: Vec<RecordBatch> = plan
+                    .execute(0, ctx.task_ctx())
+                    .unwrap()
+                    .try_collect()
+                    .await
+                    .unwrap();
+                let mut scores: Vec<(i32, f32)> = batches
+                    .iter()
+                    .flat_map(|batch| {
+                        let ids = batch
+                            .column_by_name("id")
+                            .unwrap()
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .unwrap();
+                        let scores = batch
+                            .column_by_name(SCORE_COLUMN)
+                            .unwrap()
+                            .as_any()
+                            .downcast_ref::<Float32Array>()
+                            .unwrap();
+                        (0..batch.num_rows())
+                            .map(|i| (ids.value(i), scores.value(i)))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+                scores.sort_by_key(|(id, _)| *id);
+                scores
+            }
+        };
+
+        let multi = MultiMatchQuery::try_new(
+            "lance".to_string(),
+            vec!["text".to_string(), "text".to_string()],
+        )
+        .unwrap()
+        .try_with_boosts(vec![1.0, 2.0])
+        .unwrap();
+        let fused = scores_for(FullTextSearchQuery::new_query(IndexFtsQuery::MultiMatch(
+            multi,
+        )))
+        .await;
+        let dominating = scores_for(FullTextSearchQuery::new_query(IndexFtsQuery::Match(
+            MatchQuery::new("lance".to_string())
+                .with_column(Some("text".to_string()))
+                .with_boost(2.0),
+        )))
+        .await;
+
+        assert_eq!(
+            fused.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![1, 2],
+            "each matching row once; id=3 matches nothing"
+        );
+        assert_eq!(fused.len(), dominating.len());
+        for ((id, fused_score), (_, dominating_score)) in fused.iter().zip(&dominating) {
+            assert!(
+                (fused_score - dominating_score).abs() < 1e-6,
+                "id={id}: best-leaf score {fused_score} != boost-2 leaf alone {dominating_score}"
+            );
+        }
+    }
+
+    /// A multi-match below the root is one clause of the enclosing tree. The
+    /// memtable scores it as a best-child node and routes each leaf to its own
+    /// column's index, so a MUST over it excludes what MUST_NOT names.
+    #[tokio::test]
+    async fn nested_multi_match_reaches_the_active_memtable() {
+        use lance_index::scalar::inverted::query::{BooleanQuery, MultiMatchQuery, Occur};
+
+        let schema = two_column_fts_schema();
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
+        indexes.add_fts("title_fts".to_string(), 1, "title".to_string());
+        indexes.add_fts("body_fts".to_string(), 2, "body".to_string());
+        let active_batch = make_two_column_batch(
+            &schema,
+            &[
+                (1, "lance title", "unrelated body"),  // title only
+                (2, "unrelated title", "lance body"),  // body only
+                (3, "lance title", "lance body"),      // both -> once
+                (4, "spam lance title", "lance body"), // excluded by MUST_NOT
+                (5, "nothing", "nothing"),             // neither
+            ],
+        );
+        let (_, row_offset, batch_position) = batch_store.append(active_batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&active_batch, row_offset, Some(batch_position))
+            .unwrap();
+        let indexes = Arc::new(indexes);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                uuid::Uuid::new_v4(),
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store: indexes,
+                        schema: schema.clone(),
+                        generation: 1,
+                    },
+                    frozen: vec![],
+                },
+            );
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
+
+        let multi = IndexFtsQuery::MultiMatch(
+            MultiMatchQuery::try_new(
+                "lance".to_string(),
+                vec!["title".to_string(), "body".to_string()],
+            )
+            .unwrap(),
+        );
+        let spam = IndexFtsQuery::Match(
+            MatchQuery::new("spam".to_string()).with_column(Some("title".to_string())),
+        );
+        let query =
+            FullTextSearchQuery::new_query(IndexFtsQuery::Boolean(BooleanQuery::new(vec![
+                (Occur::Must, multi),
+                (Occur::MustNot, spam),
+            ])));
+        let plan = planner
+            .plan_search(query, Some(10), Some(&["id".to_string()]))
+            .await
+            .expect("a boolean over a multi-match must plan");
+        let ctx = datafusion::prelude::SessionContext::new();
+        let batches: Vec<RecordBatch> = plan
+            .execute(0, ctx.task_ctx())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3],
+            "both columns searched through the nested multi-match, id=4 excluded, id=3 once"
+        );
+    }
+
+    /// A column with no FTS index is served by a transient index over the
+    /// visible prefix. The base answers a phrase there from a flat scan, so the
+    /// transient index has to carry positions or every phrase hit in fresh rows
+    /// is silently lost while a plain match on the same rows succeeds.
+    #[tokio::test]
+    async fn phrase_over_an_unindexed_column_reaches_the_active_memtable() {
+        use lance_index::scalar::inverted::query::PhraseQuery;
+
+        let schema = fts_schema();
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
+        // Deliberately no FTS index on `text`.
+        let active_batch = make_batch(
+            &schema,
+            &[1, 2, 3],
+            &["alpha prose here", "prose alpha reversed", "nothing"],
+        );
+        let (_, row_offset, batch_position) = batch_store.append(active_batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&active_batch, row_offset, Some(batch_position))
+            .unwrap();
+        let indexes = Arc::new(indexes);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                uuid::Uuid::new_v4(),
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store: indexes,
+                        schema: schema.clone(),
+                        generation: 1,
+                    },
+                    frozen: vec![],
+                },
+            );
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
+        let ctx = datafusion::prelude::SessionContext::new();
+        let ids_for = |query: FullTextSearchQuery| {
+            let planner = &planner;
+            let ctx = &ctx;
+            async move {
+                let plan = planner
+                    .plan_search(query, Some(10), Some(&["id".to_string()]))
+                    .await
+                    .expect("plans");
+                let batches: Vec<RecordBatch> = plan
+                    .execute(0, ctx.task_ctx())
+                    .unwrap()
+                    .try_collect()
+                    .await
+                    .unwrap();
+                let mut ids: Vec<i32> = batches
+                    .iter()
+                    .flat_map(|batch| {
+                        batch
+                            .column_by_name("id")
+                            .unwrap()
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .unwrap()
+                            .values()
+                            .to_vec()
+                    })
+                    .collect();
+                ids.sort_unstable();
+                ids
+            }
+        };
+
+        let matched = ids_for(FullTextSearchQuery::new_query(IndexFtsQuery::Match(
+            MatchQuery::new("alpha".to_string()).with_column(Some("text".to_string())),
+        )))
+        .await;
+        assert_eq!(
+            matched,
+            vec![1, 2],
+            "precondition: the transient index serves a match"
+        );
+
+        let phrase = ids_for(FullTextSearchQuery::new_query(IndexFtsQuery::Phrase(
+            PhraseQuery::new("alpha prose".to_string()).with_column(Some("text".to_string())),
+        )))
+        .await;
+        assert_eq!(
+            phrase,
+            vec![1],
+            "the phrase matches row 1 only; row 2 carries the terms reversed"
+        );
     }
 
     /// A multi-match reaches the active memtable across every queried column,
