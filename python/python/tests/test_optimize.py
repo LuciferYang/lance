@@ -176,6 +176,10 @@ def test_compact_files_repacks_columns(tmp_path: Path):
     dataset = _backfilled(tmp_path)
     expected = dataset.to_table()
     assert _files_per_fragment(dataset) == [3, 3]
+    assert dataset.stats.column_layout_stats() == [
+        {"fragment_id": 0, "live_file_count": 3, "overlay_count": 0},
+        {"fragment_id": 1, "live_file_count": 3, "overlay_count": 0},
+    ]
 
     metrics = dataset.optimize.compact_files(
         max_data_files_per_fragment=1, scope="repack_columns"
@@ -184,6 +188,7 @@ def test_compact_files_repacks_columns(tmp_path: Path):
     assert metrics.files_added == 2
     assert metrics.fragments_added == 0
     assert _files_per_fragment(dataset) == [1, 1]
+    assert [s["live_file_count"] for s in dataset.stats.column_layout_stats()] == [1, 1]
     assert dataset.to_table() == expected
     assert [f.fragment_id for f in dataset.get_fragments()] == [0, 1]
 

@@ -8032,6 +8032,15 @@ class DatasetStats(TypedDict):
     num_small_files: int
 
 
+class FragmentColumnLayoutStats(TypedDict):
+    fragment_id: int
+    #: Data files holding at least one column of the schema. This is the count
+    #: ``max_data_files_per_fragment`` in compaction is compared with.
+    live_file_count: int
+    #: Data overlay files attached to the fragment.
+    overlay_count: int
+
+
 class LanceStats:
     """
     Statistics about a LanceDataset.
@@ -8067,6 +8076,17 @@ class LanceStats:
         Statistics about the data in the dataset.
         """
         return self._ds.data_stats()
+
+    def column_layout_stats(self) -> List[FragmentColumnLayoutStats]:
+        """
+        How many data files and overlay files each fragment holds, in manifest
+        fragment order.
+
+        Compaction repacks a fragment's columns into fewer files when
+        ``live_file_count`` is above ``max_data_files_per_fragment``. Only
+        manifest metadata is read.
+        """
+        return self._ds.column_layout_stats()
 
 
 def write_dataset(

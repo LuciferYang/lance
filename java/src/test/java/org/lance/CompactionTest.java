@@ -42,6 +42,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -285,6 +286,11 @@ public class CompactionTest {
             new SqlExpressions.Builder().withExpression("double_id", "id * 2").build(),
             Optional.empty());
         assertEquals(2, dataset.getFragments().get(0).metadata().getFiles().size());
+        ColumnLayoutStatistics layout = dataset.getColumnLayoutStatistics();
+        assertEquals(2, layout.size());
+        assertArrayEquals(new long[] {0, 1}, layout.getFragmentIds());
+        assertArrayEquals(new int[] {2, 2}, layout.getLiveFileCounts());
+        assertArrayEquals(new int[] {0, 0}, layout.getOverlayCounts());
 
         CompactionOptions options =
             CompactionOptions.builder()
@@ -315,6 +321,8 @@ public class CompactionTest {
         for (Fragment fragment : dataset.getFragments()) {
           assertEquals(1, fragment.metadata().getFiles().size());
         }
+        assertArrayEquals(
+            new int[] {1, 1}, dataset.getColumnLayoutStatistics().getLiveFileCounts());
       }
     }
   }

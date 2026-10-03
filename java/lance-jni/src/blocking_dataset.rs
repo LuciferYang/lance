@@ -1953,6 +1953,63 @@ fn inner_get_fragment_statistics<'local>(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeGetColumnLayoutStatistics<'a>(
+    mut env: JNIEnv<'a>,
+    jdataset: JObject,
+) -> JObject<'a> {
+    ok_or_throw!(env, inner_get_column_layout_statistics(&mut env, jdataset))
+}
+
+/// `Dataset::column_layout_stats` as parallel Java primitive arrays.
+fn inner_get_column_layout_statistics<'local>(
+    env: &mut JNIEnv<'local>,
+    jdataset: JObject,
+) -> Result<JObject<'local>> {
+    let stats = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
+        dataset.inner.column_layout_stats()
+    };
+    let len = i32::try_from(stats.len()).map_err(|_| {
+        Error::runtime_error(format!(
+            "Column layout statistics contain {} fragments, exceeding the Java array limit of {}",
+            stats.len(),
+            i32::MAX
+        ))
+    })?;
+    let to_int = |value: usize| {
+        i32::try_from(value)
+            .map_err(|_| Error::runtime_error(format!("{value} does not fit in a Java int")))
+    };
+    let fragment_ids: Vec<i64> = stats.iter().map(|s| s.fragment_id as i64).collect();
+    let live_file_counts = stats
+        .iter()
+        .map(|s| to_int(s.live_file_count))
+        .collect::<Result<Vec<_>>>()?;
+    let overlay_counts = stats
+        .iter()
+        .map(|s| to_int(s.overlay_count))
+        .collect::<Result<Vec<_>>>()?;
+
+    let jfragment_ids = env.new_long_array(len)?;
+    let jlive_file_counts = env.new_int_array(len)?;
+    let joverlay_counts = env.new_int_array(len)?;
+    env.set_long_array_region(&jfragment_ids, 0, &fragment_ids)?;
+    env.set_int_array_region(&jlive_file_counts, 0, &live_file_counts)?;
+    env.set_int_array_region(&joverlay_counts, 0, &overlay_counts)?;
+
+    Ok(env.new_object(
+        "org/lance/ColumnLayoutStatistics",
+        "([J[I[I)V",
+        &[
+            JValue::Object(&jfragment_ids),
+            JValue::Object(&jlive_file_counts),
+            JValue::Object(&joverlay_counts),
+        ],
+    )?)
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_getFragmentNative<'a>(
     mut env: JNIEnv<'a>,
     jdataset: JObject,
