@@ -2011,9 +2011,11 @@ fn inner_get_column_layout_statistics<'local>(
         let jsizes = env.new_long_array(to_int(sizes.len())?)?;
         env.set_long_array_region(&jsizes, 0, &sizes)?;
         env.set_object_array_element(&jfile_sizes, index as i32, &jsizes)?;
+        env.delete_local_ref(jsizes)?;
         let jfields = env.new_int_array(to_int(fields.len())?)?;
         env.set_int_array_region(&jfields, 0, &fields)?;
         env.set_object_array_element(&jfields_per_file, index as i32, &jfields)?;
+        env.delete_local_ref(jfields)?;
     }
 
     Ok(env.new_object(
