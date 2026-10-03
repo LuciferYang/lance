@@ -290,6 +290,10 @@ public class CompactionTest {
         assertEquals(2, layout.size());
         assertArrayEquals(new long[] {0, 1}, layout.getFragmentIds());
         assertArrayEquals(new int[] {2, 2}, layout.getLiveFileCounts());
+        assertArrayEquals(new int[] {2, 1}, layout.getFieldsPerFile()[0]);
+        assertEquals(2, layout.getFileSizes()[0].length);
+        assertTrue(layout.getFileSizes()[0][0] > 0);
+        assertArrayEquals(new double[] {0.0, 0.0}, layout.getTombstonedFieldRatios());
         assertArrayEquals(new int[] {0, 0}, layout.getOverlayCounts());
 
         CompactionOptions options =
@@ -321,8 +325,9 @@ public class CompactionTest {
         for (Fragment fragment : dataset.getFragments()) {
           assertEquals(1, fragment.metadata().getFiles().size());
         }
-        assertArrayEquals(
-            new int[] {1, 1}, dataset.getColumnLayoutStatistics().getLiveFileCounts());
+        ColumnLayoutStatistics repacked = dataset.getColumnLayoutStatistics();
+        assertArrayEquals(new int[] {1, 1}, repacked.getLiveFileCounts());
+        assertArrayEquals(new int[] {3}, repacked.getFieldsPerFile()[0]);
       }
     }
   }

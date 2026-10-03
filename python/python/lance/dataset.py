@@ -8037,6 +8037,15 @@ class FragmentColumnLayoutStats(TypedDict):
     #: Data files holding at least one column of the schema. This is the count
     #: ``max_data_files_per_fragment`` in compaction is compared with.
     live_file_count: int
+    #: Recorded size in bytes of each data file, in the fragment's file order;
+    #: ``None`` when the manifest has no size for the file.
+    file_sizes: List[Optional[int]]
+    #: Number of schema fields each data file holds, in the fragment's file order.
+    fields_per_file: List[int]
+    #: Share of the fragment's field slots holding no live data (tombstoned by a
+    #: column update or repack, or left by a dropped column). Spilled row
+    #: lineage is not counted. A fragment rewrite reclaims these slots.
+    tombstoned_field_ratio: float
     #: Data overlay files attached to the fragment.
     overlay_count: int
 
@@ -8079,8 +8088,8 @@ class LanceStats:
 
     def column_layout_stats(self) -> List[FragmentColumnLayoutStats]:
         """
-        How many data files and overlay files each fragment holds, in manifest
-        fragment order.
+        How each fragment's columns are laid out across data files, in
+        manifest fragment order.
 
         Compaction repacks a fragment's columns into fewer files when
         ``live_file_count`` is above ``max_data_files_per_fragment``. Only

@@ -544,7 +544,7 @@ dataset.optimize.compact_files(max_data_files_per_fragment=2)
 # Only repack, and keep the embedding in a file of its own.
 dataset.optimize.compact_files(column_groups=[["embedding"]], scope="repack_columns")
 
-# How many data files each fragment holds now.
+# Per fragment: live data files, file sizes, fields per file, dead field slots.
 dataset.stats.column_layout_stats()
 ```
 
