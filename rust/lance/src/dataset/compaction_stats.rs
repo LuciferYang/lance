@@ -11,10 +11,12 @@
 
 use std::collections::HashSet;
 
+use lance_table::format::overlay::TOMBSTONE_FIELD_ID;
+
 use super::Dataset;
 
 /// Column-layout statistics for a single fragment.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FragmentColumnLayoutStats {
     /// The fragment these stats describe.
     pub fragment_id: u64,
@@ -24,6 +26,18 @@ pub struct FragmentColumnLayoutStats {
     /// columns, or kept only for the fragment's spilled row lineage, holds no
     /// column a read touches and is not counted.
     pub live_file_count: usize,
+    /// Recorded size in bytes of each data file, in the fragment's file order.
+    /// `None` when the manifest has no size for the file.
+    pub file_sizes: Vec<Option<u64>>,
+    /// Number of fields of the dataset schema each data file holds, in the
+    /// fragment's file order. A file counted in `live_file_count` holds at
+    /// least one.
+    pub fields_per_file: Vec<usize>,
+    /// The share of the fragment's field slots that hold no live data: slots
+    /// tombstoned by a column update, or left by a dropped column.
+    /// The reserved ids of spilled row lineage are not counted on either side.
+    /// A fragment rewrite reclaims these slots.
+    pub tombstoned_field_ratio: f64,
     /// Number of overlay files attached to the fragment.
     pub overlay_count: usize,
 }
@@ -42,14 +56,42 @@ impl Dataset {
         self.manifest
             .fragments
             .iter()
-            .map(|fragment| FragmentColumnLayoutStats {
-                fragment_id: fragment.id,
-                live_file_count: fragment
+            .map(|fragment| {
+                let fields_per_file: Vec<usize> = fragment
                     .files
                     .iter()
-                    .filter(|file| file.fields.iter().any(|id| schema_ids.contains(id)))
-                    .count(),
-                overlay_count: fragment.overlays.len(),
+                    .map(|file| {
+                        file.fields
+                            .iter()
+                            .filter(|id| schema_ids.contains(id))
+                            .count()
+                    })
+                    .collect();
+                // Field slots of user columns, live or dead; the other negative
+                // ids are spilled row lineage and are left out.
+                let user_slots = fragment
+                    .files
+                    .iter()
+                    .flat_map(|file| file.fields.iter())
+                    .filter(|id| **id >= 0 || **id == TOMBSTONE_FIELD_ID)
+                    .count();
+                let live_slots: usize = fields_per_file.iter().sum();
+                FragmentColumnLayoutStats {
+                    fragment_id: fragment.id,
+                    live_file_count: fields_per_file.iter().filter(|count| **count > 0).count(),
+                    file_sizes: fragment
+                        .files
+                        .iter()
+                        .map(|file| file.file_size_bytes.get().map(|size| size.get()))
+                        .collect(),
+                    fields_per_file,
+                    tombstoned_field_ratio: if user_slots == 0 {
+                        0.0
+                    } else {
+                        (user_slots - live_slots) as f64 / user_slots as f64
+                    },
+                    overlay_count: fragment.overlays.len(),
+                }
             })
             .collect()
     }
@@ -112,6 +154,37 @@ mod tests {
             stats.iter().all(|s| s.live_file_count == 2),
             "each fragment should now have 2 data files: {stats:?}"
         );
+        for s in &stats {
+            assert_eq!(s.fields_per_file, vec![1, 1]);
+            assert!(s.file_sizes.iter().all(Option::is_some), "{s:?}");
+            assert_eq!(s.tombstoned_field_ratio, 0.0);
+        }
+    }
+
+    /// A dropped column leaves its field id in the file that held it, which
+    /// counts as a dead slot.
+    #[tokio::test]
+    async fn column_layout_stats_counts_dropped_columns_as_dead_slots() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..4)),
+                Arc::new(Int32Array::from_iter_values(4..8)),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new([Ok(batch)], schema);
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+        dataset.drop_columns(&["b"]).await.unwrap();
+
+        let stats = dataset.column_layout_stats();
+        assert_eq!(stats[0].live_file_count, 1);
+        assert_eq!(stats[0].fields_per_file, vec![1]);
+        assert_eq!(stats[0].tombstoned_field_ratio, 0.5);
     }
 
     /// Only files holding a schema column count. The extra files are added to
@@ -122,9 +195,7 @@ mod tests {
     #[tokio::test]
     async fn column_layout_stats_skips_files_without_schema_columns() {
         use lance_file::version::ConcreteFileVersion;
-        use lance_table::format::{
-            DataFile, ROW_ID_FIELD_ID, RowIdMeta, overlay::TOMBSTONE_FIELD_ID,
-        };
+        use lance_table::format::{DataFile, ROW_ID_FIELD_ID, RowIdMeta};
 
         let schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "a",
@@ -164,5 +235,10 @@ mod tests {
 
         let stats = dataset.column_layout_stats();
         assert_eq!(stats[0].live_file_count, 1, "{stats:?}");
+        assert_eq!(stats[0].fields_per_file, vec![1, 0, 0, 0]);
+        assert!(stats[0].file_sizes[0].is_some());
+        assert_eq!(stats[0].file_sizes[1..], [None, None, None]);
+        // `a`, two tombstones and the dropped id; the row id slot is lineage.
+        assert_eq!(stats[0].tombstoned_field_ratio, 0.75);
     }
 }
