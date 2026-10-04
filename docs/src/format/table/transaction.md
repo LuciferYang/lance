@@ -185,8 +185,7 @@ row ids feature is enable, then the rewrite operation is compatible with index c
 that are retryable conflicts with index creation:
 
 - Rewrite (only if overlapping fragments, no stable row ids, and no fragment reuse index)
-- DataReplacement (only if overlapping fragments, the column being replaced is being indexed, and `data_change` is not
-  false)
+- DataReplacement (only if the column being replaced is being indexed and `data_change` is not false)
 
 Some indices are special singleton indices. For example, the fragment reuse index and the mem wal index. If a conflict occurs
 between two operations that are modifying the same singleton index, then we must rebase the operation and merge the indexes.
@@ -446,7 +445,7 @@ The groups apply in order, each to the target fragment as it stands when the tra
 groups left it), not to the fragment as the writer read it:
 
 - If one of the fragment's data files lists the same field ids as the new file, in the same order and file version, the
-  new file takes its place.
+  new file's path, size and base replace that data file's.
 - If none of the fragment's data files holds any of the new file's fields (for example, a column added as all nulls),
   the new file is appended.
 - If the fragment's data files hold all of the new file's fields, those fields are replaced with the tombstone id (`-2`)
@@ -482,8 +481,9 @@ a field's nullability. A compaction that repacks a fragment's columns into fewer
 
 A DataReplacement operation only replaces the data of the fields its new files carry. As a result, it can be safer and
 simpler than Merge or Update operations. It rewrites column files positionally against the fragments it targets, so a
-concurrent operation only conflicts when it removes one of those fragments or invalidates the rows the column files
-cover. Here are the operations that conflict with DataReplacement (non-retryable):
+concurrent operation conflicts when it removes one of those fragments or one of the replaced fields, moves or rewrites
+the rows the column files cover, or depends on the replaced values. Here are the operations that conflict with
+DataReplacement (non-retryable):
 
 - Overwrite
 - Restore
@@ -492,8 +492,8 @@ cover. Here are the operations that conflict with DataReplacement (non-retryable
 - Update (only if it removes a target fragment outright)
 - Project (only if it drops a field being replaced)
 
-The last three are retryable instead when `data_change` is false: retrying a replacement that only moves values plans
-the move again against the new version, while a replacement that changes data would need new values from its caller.
+The last three are retryable instead when `data_change` is false: a replacement that only moves values can be planned
+again against the new version, while one that changes data would need new values from its caller.
 
 The following operations are retryable conflicts with DataReplacement:
 
