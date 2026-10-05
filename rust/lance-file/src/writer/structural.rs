@@ -532,30 +532,10 @@ impl EncodingPipeline {
         Ok(())
     }
 
-    fn verify_nullability_constraints(&self, batch: &RecordBatch) -> Result<()> {
-        let schema = self.schema.as_ref().unwrap();
-        let batch_schema = batch.schema();
-        let columns = batch.columns();
-        for (field_index, field) in schema.fields.iter().enumerate() {
-            // `encode_batch` picks each field's column by name, so check the
-            // same column: the one at this position if its name matches,
-            // otherwise the one with this name.
-            let column = match columns.get(field_index) {
-                Some(column)
-                    if batch_schema
-                        .fields()
-                        .get(field_index)
-                        .is_some_and(|actual| actual.name() == field.name.as_str()) =>
-                {
-                    Some(column)
-                }
-                _ => batch_schema
-                    .column_with_name(&field.name)
-                    .and_then(|(index, _)| columns.get(index)),
-            };
-            if let Some(column) = column {
-                Self::verify_field_nullability(column.as_ref(), field)?;
-            }
+    fn verify_nullability_constraints(&self, field_arrays: &[(usize, ArrayRef)]) -> Result<()> {
+        let fields = &self.schema.as_ref().unwrap().fields;
+        for (field_index, array) in field_arrays {
+            Self::verify_field_nullability(array.as_ref(), &fields[*field_index])?;
         }
         Ok(())
     }
@@ -584,13 +564,9 @@ impl EncodingPipeline {
             .collect()
     }
 
-    fn encode_batch(
-        &mut self,
-        batch: &RecordBatch,
-        external_buffers: &mut OutOfLineBuffers,
-    ) -> Result<Vec<Vec<EncodeTask>>> {
-        let field_arrays = self
-            .schema
+    /// Select each schema field's column from `batch` by name.
+    fn field_arrays(&self, batch: &RecordBatch) -> Result<Vec<(usize, ArrayRef)>> {
+        self.schema
             .as_ref()
             .unwrap()
             .fields
@@ -608,8 +584,7 @@ impl EncodingPipeline {
                 })?;
                 Ok((field_index, array.clone()))
             })
-            .collect::<Result<Vec<_>>>()?;
-        self.encode_columns(&field_arrays, external_buffers)
+            .collect()
     }
 
     #[instrument(skip_all, level = "debug")]
@@ -631,7 +606,6 @@ impl EncodingPipeline {
         self.expected_types
             .get_or_insert_with(|| ExpectedTypes::new(schema))
             .check_batch(batch)?;
-        self.verify_nullability_constraints(batch)?;
         let num_rows = batch.num_rows() as u64;
         if num_rows == 0 {
             return Ok(());
@@ -641,10 +615,13 @@ impl EncodingPipeline {
                 "cannot write Lance files with more than 2^32 rows".into(),
             ));
         }
+        // Check the same arrays that get encoded, before any encoder sees one.
+        let field_arrays = self.field_arrays(batch)?;
+        self.verify_nullability_constraints(&field_arrays)?;
 
         let mut external_buffers =
             OutOfLineBuffers::new(sink.tell().await?, PAGE_BUFFER_ALIGNMENT as u64);
-        let encoding_tasks = self.encode_batch(batch, &mut external_buffers)?;
+        let encoding_tasks = self.encode_columns(&field_arrays, &mut external_buffers)?;
         for external_buffer in external_buffers.take_buffers() {
             sink.write_aligned_buffer(&external_buffer).await?;
         }

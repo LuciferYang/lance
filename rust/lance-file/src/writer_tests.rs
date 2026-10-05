@@ -810,6 +810,64 @@ mod tests {
         }
     }
 
+    /// With duplicate column names the encoder writes the first column of a
+    /// field's name, so that is the one whose nulls must be checked.
+    #[rstest]
+    #[tokio::test]
+    async fn test_writer_checks_nullability_of_first_duplicate_column(
+        #[values(
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+    ) {
+        let lance_schema = LanceSchema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("b", DataType::Int32, true),
+            ArrowField::new("a", DataType::Int32, false),
+        ]))
+        .unwrap();
+        let batch_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("b", DataType::Int32, true),
+        ]));
+        let duplicated = |first: Vec<Option<i32>>, second: Vec<Option<i32>>| {
+            RecordBatch::try_new(
+                batch_schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(first)) as ArrayRef,
+                    Arc::new(Int32Array::from(second)),
+                    Arc::new(Int32Array::from(vec![5, 6])),
+                ],
+            )
+            .unwrap()
+        };
+
+        let fs = FsFixture::default();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            lance_schema,
+            version,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+        let error = writer
+            .write_batch(&duplicated(vec![None, Some(1)], vec![Some(1), Some(2)]))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        let message = error.to_string();
+        assert!(message.contains("`a` contained null values"), "{message}");
+
+        // A null in the second `a` is never encoded, so it does not count.
+        writer
+            .write_batch(&duplicated(vec![Some(1), Some(2)], vec![None, Some(1)]))
+            .await
+            .unwrap();
+        writer.finish().await.unwrap();
+    }
+
     /// Writer preflight uses the same name-selected arrays as encoding, so a
     /// rejected reordered batch cannot leave earlier field encoders mutated.
     #[tokio::test]
