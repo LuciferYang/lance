@@ -2334,6 +2334,7 @@ mod tests {
             DataType::Struct(struct_children.clone()),
             true,
         ));
+        fields.push(ArrowField::new("a`b", DataType::Int32, true));
         let schema = Schema::try_from(&ArrowSchema::new(fields.clone())).unwrap();
         let merged_s = ArrowField::new(
             "s",
@@ -2363,11 +2364,25 @@ mod tests {
         expected.push(merged_s);
         assert_eq!(ArrowSchema::from(&indexed), ArrowSchema::new(expected));
 
-        // A quoted first segment names a top-level field literally; it is not
-        // re-split into the nested path `s.a`.
-        assert!(schema.project(&["`s.a`"]).is_err());
+        // A quoted first segment names a top-level field literally: `a``b`
+        // finds the field named a`b, and `s.a` is not re-split into the
+        // nested path s.a.
+        let quoted = fields.last().unwrap().clone();
+        let scanned = schema.project(&["`a``b`"]).unwrap();
+        assert_eq!(
+            ArrowSchema::from(&scanned),
+            ArrowSchema::new(vec![quoted.clone()])
+        );
+        let indexed = schema
+            .project(&["`a``b`"; MIN_COLUMNS_FOR_NAME_INDEX])
+            .unwrap();
+        assert_eq!(ArrowSchema::from(&indexed), ArrowSchema::new(vec![quoted]));
+
+        let err = schema.project(&["`s.a`"]).unwrap_err();
+        assert!(matches!(err, Error::FieldNotFound { .. }), "{err}");
         wide.push("`s.a`".to_string());
-        assert!(schema.project(&wide).is_err());
+        let err = schema.project(&wide).unwrap_err();
+        assert!(matches!(err, Error::FieldNotFound { .. }), "{err}");
     }
 
     #[test]
