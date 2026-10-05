@@ -533,12 +533,29 @@ impl EncodingPipeline {
     }
 
     fn verify_nullability_constraints(&self, batch: &RecordBatch) -> Result<()> {
-        for (column, field) in batch
-            .columns()
-            .iter()
-            .zip(self.schema.as_ref().unwrap().fields.iter())
-        {
-            Self::verify_field_nullability(column.as_ref(), field)?;
+        let schema = self.schema.as_ref().unwrap();
+        let batch_schema = batch.schema();
+        let columns = batch.columns();
+        for (field_index, field) in schema.fields.iter().enumerate() {
+            // `encode_batch` picks each field's column by name, so check the
+            // same column: the one at this position if its name matches,
+            // otherwise the one with this name.
+            let column = match columns.get(field_index) {
+                Some(column)
+                    if batch_schema
+                        .fields()
+                        .get(field_index)
+                        .is_some_and(|actual| actual.name() == field.name.as_str()) =>
+                {
+                    Some(column)
+                }
+                _ => batch_schema
+                    .column_with_name(&field.name)
+                    .and_then(|(index, _)| columns.get(index)),
+            };
+            if let Some(column) = column {
+                Self::verify_field_nullability(column.as_ref(), field)?;
+            }
         }
         Ok(())
     }

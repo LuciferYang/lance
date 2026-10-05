@@ -728,6 +728,88 @@ mod tests {
         )
     }
 
+    /// A batch may list its columns in a different order than the writer
+    /// schema. The nullability check must look at the column the encoder
+    /// writes for each field, or it rejects a null in the nullable column
+    /// and writes a null into the non-nullable one.
+    #[rstest]
+    #[tokio::test]
+    async fn test_writer_checks_nullability_of_reordered_columns(
+        #[values(
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+    ) {
+        let lance_schema = LanceSchema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Int32, true),
+        ]))
+        .unwrap();
+        let batch_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("b", DataType::Int32, true),
+            ArrowField::new("a", DataType::Int32, true),
+        ]));
+        let reordered = |b: Vec<Option<i32>>, a: Vec<Option<i32>>| {
+            RecordBatch::try_new(
+                batch_schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(b)) as ArrayRef,
+                    Arc::new(Int32Array::from(a)),
+                ],
+            )
+            .unwrap()
+        };
+
+        let fs = FsFixture::default();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            lance_schema.clone(),
+            version,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+
+        writer
+            .write_batch(&reordered(vec![Some(1), None], vec![Some(3), Some(4)]))
+            .await
+            .unwrap();
+        let error = writer
+            .write_batch(&reordered(vec![Some(1), Some(2)], vec![Some(3), None]))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("`a`"), "{error}");
+        writer.finish().await.unwrap();
+
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        for (name, expected) in [("a", vec![Some(3), Some(4)]), ("b", vec![Some(1), None])] {
+            let actual = read_int32_column(
+                &reader,
+                &lance_schema,
+                version,
+                name,
+                lance_io::ReadBatchParams::RangeFull,
+            )
+            .await;
+            assert_eq!(actual, expected, "column {name}");
+        }
+    }
+
     /// Writer preflight uses the same name-selected arrays as encoding, so a
     /// rejected reordered batch cannot leave earlier field encoders mutated.
     #[tokio::test]
