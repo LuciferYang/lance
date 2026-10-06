@@ -894,49 +894,6 @@ pub trait CompactionPlanner: Send + Sync {
     async fn plan(&self, dataset: &Dataset) -> Result<CompactionPlan>;
 }
 
-/// Runs one task of a [`CompactionPlan`]. Pass an implementation to
-/// [`compact_files_with_executor`] to run the tasks somewhere else (say, on a
-/// cluster) or to wrap the default one; [`CompactionTask::execute`] runs the
-/// default one for a task executed by hand.
-///
-/// The result goes to [`commit_compaction`], which commits it by its kind.
-#[async_trait::async_trait]
-pub trait CompactionExecutor: Send + Sync {
-    /// Execute `task` against `dataset`, which is at the plan's read version.
-    async fn execute(
-        &self,
-        dataset: &Dataset,
-        task: TaskData,
-        options: &CompactionOptions,
-    ) -> Result<RewriteResult>;
-}
-
-/// Runs each kind of task the way this crate does: a
-/// [`CompactionTaskKind::RewriteFragments`] task rewrites its fragments into
-/// new ones, a [`CompactionTaskKind::RepackColumns`] task writes new data
-/// files for its fragment.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct DefaultCompactionExecutor;
-
-#[async_trait::async_trait]
-impl CompactionExecutor for DefaultCompactionExecutor {
-    async fn execute(
-        &self,
-        dataset: &Dataset,
-        task: TaskData,
-        options: &CompactionOptions,
-    ) -> Result<RewriteResult> {
-        match task.kind {
-            CompactionTaskKind::RewriteFragments => {
-                rewrite_files(Cow::Borrowed(dataset), task, options).await
-            }
-            CompactionTaskKind::RepackColumns { .. } => {
-                repack::execute_repack(dataset, task, options).await
-            }
-        }
-    }
-}
-
 /// Formulate a plan to compact the files in a dataset
 ///
 /// The compaction plan will contain a list of tasks to execute. Each task
@@ -1305,23 +1262,6 @@ pub async fn compact_files_with_planner(
     remap_options: Option<Arc<dyn IndexRemapperOptions>>, // These will be deprecated later
     planner: &dyn CompactionPlanner,
 ) -> Result<CompactionMetrics> {
-    Box::pin(compact_files_with_executor(
-        dataset,
-        remap_options,
-        planner,
-        &DefaultCompactionExecutor,
-    ))
-    .await
-}
-
-/// Plan with `planner`, run every task with `executor`, and commit the
-/// results with [`commit_compaction`].
-pub async fn compact_files_with_executor(
-    dataset: &mut Dataset,
-    remap_options: Option<Arc<dyn IndexRemapperOptions>>, // These will be deprecated later
-    planner: &dyn CompactionPlanner,
-    executor: &dyn CompactionExecutor,
-) -> Result<CompactionMetrics> {
     let compaction_plan: CompactionPlan = planner.plan(dataset).await?;
 
     // A tagged FRI history is maintained by appending transitions to the
@@ -1365,8 +1305,8 @@ pub async fn compact_files_with_executor(
     // Execute against an immutable snapshot; the commit takes `&mut dataset`
     // once every task has finished.
     let snapshot = &dataset.clone();
-    let results: Vec<RewriteResult> = futures::stream::iter(compaction_plan.tasks.clone())
-        .map(|task| executor.execute(snapshot, task, options))
+    let results: Vec<RewriteResult> = futures::stream::iter(compaction_plan.compaction_tasks())
+        .map(|task| async move { task.execute(snapshot).await })
         .buffer_unordered(concurrency.max(1))
         .try_collect()
         .await?;
@@ -2492,7 +2432,10 @@ pub struct CompactionTask {
 }
 
 impl CompactionTask {
-    /// Run the compaction task and return the result.
+    /// Run the compaction task and return the result. A
+    /// [`CompactionTaskKind::RewriteFragments`] task rewrites its fragments
+    /// into new ones; a [`CompactionTaskKind::RepackColumns`] task writes new
+    /// data files for its fragment.
     ///
     /// This result should be later passed to [commit_compaction()] to commit
     /// the changes to the dataset.
@@ -2506,9 +2449,15 @@ impl CompactionTask {
         } else {
             Cow::Owned(dataset.checkout_version(self.read_version).await?)
         };
-        DefaultCompactionExecutor
-            .execute(dataset.as_ref(), self.task.clone(), &self.options)
-            .await
+        let task = self.task.clone();
+        match task.kind {
+            CompactionTaskKind::RewriteFragments => {
+                rewrite_files(dataset, task, &self.options).await
+            }
+            CompactionTaskKind::RepackColumns { .. } => {
+                repack::execute_repack(&dataset, task, &self.options).await
+            }
+        }
     }
 }
 
