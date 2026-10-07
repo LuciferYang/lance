@@ -1188,40 +1188,57 @@ mod tests {
         assert_eq!(decompressed.as_ref(), &sample_list);
     }
 
-    #[test]
-    fn test_nested_fsl_simple_per_value() {
-        // Nested non-nullable FSL routed to simple_per_value_fsl: the
-        // cumulative dimension must multiply EACH layer's own dimension
-        // (outer 22 * inner 3), not the outer dimension once per level.
-        let leaf = Arc::new(Int32Array::from_iter((0..22 * 3 * 3).map(|v| v as i32))) as ArrayRef;
+    /// A null-free nested FSL is flattened by `simple_per_value_fsl`; each value
+    /// spans `outer * inner` leaves, so the width must multiply both layers'
+    /// dimensions rather than the outer one once per level.
+    #[rstest::rstest]
+    #[case::outer_wider(22, 3)]
+    #[case::inner_wider(3, 22)]
+    fn test_nested_fsl_simple_per_value(#[case] outer_dim: i32, #[case] inner_dim: i32) {
+        let num_rows = 3;
+        let inner_field = Arc::new(Field::new("item", DataType::Int32, false));
+        let leaf = Arc::new(Int32Array::from_iter_values(
+            0..num_rows * outer_dim * inner_dim,
+        )) as ArrayRef;
         let inner = Arc::new(FixedSizeListArray::new(
-            Arc::new(Field::new("inner", DataType::Int32, false)),
-            3,
+            inner_field.clone(),
+            inner_dim,
             leaf,
             None,
         )) as ArrayRef;
-        let outer = FixedSizeListArray::new(
+        let outer = Arc::new(FixedSizeListArray::new(
             Arc::new(Field::new(
-                "outer",
-                DataType::FixedSizeList(Arc::new(Field::new("inner", DataType::Int32, false)), 3),
+                "item",
+                DataType::FixedSizeList(inner_field, inner_dim),
                 false,
             )),
-            22,
+            outer_dim,
             inner,
             None,
-        );
+        )) as ArrayRef;
 
-        let starting_data = DataBlock::from_array(Arc::new(outer.clone()) as ArrayRef);
         let encoder = ValueEncoder::default();
-        let (data, _) = PerValueCompressor::compress(&encoder, starting_data).unwrap();
-
+        let (data, compression) =
+            PerValueCompressor::compress(&encoder, DataBlock::from_array(outer.clone())).unwrap();
         let PerValueDataBlock::Fixed(data) = data else {
             panic!()
         };
-        assert_eq!(data.num_values, 3);
-        // 32 bits * (22 outer * 3 inner), not 32 bits * 22 * 22.
-        assert_eq!(data.bits_per_value, 32 * 22 * 3);
-        assert_eq!(data.data.len(), 22 * 3 * 3 * 4);
+        assert_eq!(data.num_values, num_rows as u64);
+        assert_eq!(data.bits_per_value, 32 * (outer_dim * inner_dim) as u64);
+
+        let Compression::FixedSizeList(fsl) = compression.compression.unwrap() else {
+            panic!()
+        };
+        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref()).unwrap();
+        let num_values = data.num_values;
+        let decompressed =
+            FixedPerValueDecompressor::decompress(&decompressor, data, num_values).unwrap();
+        let decompressed = make_array(
+            decompressed
+                .into_arrow(outer.data_type().clone(), true)
+                .unwrap(),
+        );
+        assert_eq!(decompressed.as_ref(), outer.as_ref());
     }
 
     #[test_log::test(tokio::test)]
