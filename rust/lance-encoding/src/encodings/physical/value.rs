@@ -350,37 +350,14 @@ impl ValueEncoder {
     fn simple_per_value_fsl(fsl: FixedSizeListBlock) -> (PerValueDataBlock, CompressiveEncoding) {
         // The simple case is zero-copy, we just return the flattened inner buffer
         let encoding = Self::fsl_to_encoding(&fsl);
-        let num_values = fsl.num_values();
-        let mut child = *fsl.child;
-        let mut cum_dim = 1;
-        // Track the dimension of the layer being flattened: multiplying the
-        // outer dimension once per level computes outer^depth instead of the
-        // product of each layer's own dimension for nested FSL.
-        let mut dimension = fsl.dimension;
-        loop {
-            cum_dim *= dimension;
-            match child {
-                DataBlock::Nullable(nullable) => {
-                    child = *nullable.data;
-                }
-                DataBlock::FixedSizeList(inner) => {
-                    dimension = inner.dimension;
-                    child = *inner.child;
-                }
-                DataBlock::FixedWidth(inner) => {
-                    let data = FixedWidthDataBlock {
-                        bits_per_value: inner.bits_per_value * cum_dim,
-                        num_values,
-                        data: inner.data,
-                        block_info: BlockInfo::new(),
-                    };
-                    return (PerValueDataBlock::Fixed(data), encoding);
-                }
-                _ => unreachable!(
-                    "Unexpected data block type in value encoder's simple_per_value_fsl"
-                ),
-            }
-        }
+        let Some(flat) = fsl.try_into_flat() else {
+            unreachable!("per_value_fsl only sends FSL blocks without nullable children here")
+        };
+        let data = FixedWidthDataBlock {
+            block_info: BlockInfo::new(),
+            ..flat
+        };
+        (PerValueDataBlock::Fixed(data), encoding)
     }
 
     fn nullable_per_value_fsl(fsl: FixedSizeListBlock) -> (PerValueDataBlock, CompressiveEncoding) {
@@ -1189,8 +1166,7 @@ mod tests {
     }
 
     /// A null-free nested FSL is flattened by `simple_per_value_fsl`; each value
-    /// spans `outer * inner` leaves, so the width must multiply both layers'
-    /// dimensions rather than the outer one once per level.
+    /// spans `outer * inner` leaves.
     #[rstest::rstest]
     #[case::outer_wider(22, 3)]
     #[case::inner_wider(3, 22)]

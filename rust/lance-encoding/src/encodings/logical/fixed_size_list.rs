@@ -804,9 +804,9 @@ mod tests {
         assert_eq!(result.len(), 3);
     }
 
-    /// A null-free nested FSL of at least 256 bytes per row is written through the
-    /// full-zip per-value path. Both layers are nullable, as Arrow and pyarrow build
-    /// them by default, and the data carries no nulls.
+    /// A null-free nested FSL written with a forced full-zip layout goes through the
+    /// per-value path that flattens it. Both layers are nullable, as Arrow and pyarrow
+    /// build them by default, and the data carries no nulls.
     #[rstest]
     #[case::outer_wider(22, 3)]
     #[case::inner_wider(3, 22)]
@@ -836,7 +836,10 @@ mod tests {
                 .with_range(0..1)
                 .with_range(1..3)
                 .with_indices(vec![0, 2]),
-            HashMap::new(),
+            HashMap::from([(
+                STRUCTURAL_ENCODING_META_KEY.to_string(),
+                STRUCTURAL_ENCODING_FULLZIP.to_string(),
+            )]),
         )
         .await;
     }
