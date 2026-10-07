@@ -353,13 +353,18 @@ impl ValueEncoder {
         let num_values = fsl.num_values();
         let mut child = *fsl.child;
         let mut cum_dim = 1;
+        // Track the dimension of the layer being flattened: multiplying the
+        // outer dimension once per level computes outer^depth instead of the
+        // product of each layer's own dimension for nested FSL.
+        let mut dimension = fsl.dimension;
         loop {
-            cum_dim *= fsl.dimension;
+            cum_dim *= dimension;
             match child {
                 DataBlock::Nullable(nullable) => {
                     child = *nullable.data;
                 }
                 DataBlock::FixedSizeList(inner) => {
+                    dimension = inner.dimension;
                     child = *inner.child;
                 }
                 DataBlock::FixedWidth(inner) => {
@@ -1181,6 +1186,42 @@ mod tests {
         );
 
         assert_eq!(decompressed.as_ref(), &sample_list);
+    }
+
+    #[test]
+    fn test_nested_fsl_simple_per_value() {
+        // Nested non-nullable FSL routed to simple_per_value_fsl: the
+        // cumulative dimension must multiply EACH layer's own dimension
+        // (outer 22 * inner 3), not the outer dimension once per level.
+        let leaf = Arc::new(Int32Array::from_iter((0..22 * 3 * 3).map(|v| v as i32))) as ArrayRef;
+        let inner = Arc::new(FixedSizeListArray::new(
+            Arc::new(Field::new("inner", DataType::Int32, false)),
+            3,
+            leaf,
+            None,
+        )) as ArrayRef;
+        let outer = FixedSizeListArray::new(
+            Arc::new(Field::new(
+                "outer",
+                DataType::FixedSizeList(Arc::new(Field::new("inner", DataType::Int32, false)), 3),
+                false,
+            )),
+            22,
+            inner,
+            None,
+        );
+
+        let starting_data = DataBlock::from_array(Arc::new(outer.clone()) as ArrayRef);
+        let encoder = ValueEncoder::default();
+        let (data, _) = PerValueCompressor::compress(&encoder, starting_data).unwrap();
+
+        let PerValueDataBlock::Fixed(data) = data else {
+            panic!()
+        };
+        assert_eq!(data.num_values, 3);
+        // 32 bits * (22 outer * 3 inner), not 32 bits * 22 * 22.
+        assert_eq!(data.bits_per_value, 32 * 22 * 3);
+        assert_eq!(data.data.len(), 22 * 3 * 3 * 4);
     }
 
     #[test_log::test(tokio::test)]

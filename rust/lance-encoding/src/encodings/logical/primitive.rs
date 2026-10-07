@@ -8143,6 +8143,52 @@ mod tests {
         Arc::new(dictionary.slice(1, 1))
     }
 
+    #[tokio::test]
+    async fn test_nested_fsl_fullzip_round_trip() {
+        // Nested fixed-size lists wide enough to take the fullzip per-value
+        // route (>= 256 flattened bytes per top row). The fields are declared
+        // nullable but carry no nulls, which still routes the null-free
+        // DataBlock through simple_per_value_fsl - whose cumulative
+        // dimension used to multiply the outer dimension once per level and
+        // panicked the write in serialize_full_zip_fixed.
+        use arrow_array::Int32Array;
+
+        let outer_dim = 22usize;
+        let inner_dim = 3usize;
+        let num_rows = 3usize;
+        let leaf = Arc::new(Int32Array::from_iter(
+            (0..num_rows * outer_dim * inner_dim).map(|v| v as i32),
+        )) as ArrayRef;
+        let inner_field = Arc::new(arrow_schema::Field::new("item", DataType::Int32, true));
+        let inner = Arc::new(arrow_array::FixedSizeListArray::new(
+            inner_field.clone(),
+            inner_dim as i32,
+            leaf,
+            None,
+        )) as ArrayRef;
+        let outer = Arc::new(arrow_array::FixedSizeListArray::new(
+            Arc::new(arrow_schema::Field::new(
+                "item",
+                DataType::FixedSizeList(inner_field, inner_dim as i32),
+                true,
+            )),
+            outer_dim as i32,
+            inner,
+            None,
+        )) as ArrayRef;
+
+        check_round_trip_encoding_of_data(
+            vec![outer],
+            &TestCases::default()
+                .with_structural_encodings()
+                .with_range(0..1)
+                .with_range(1..2)
+                .with_indices(vec![0]),
+            HashMap::new(),
+        )
+        .await;
+    }
+
     #[rstest::rstest]
     #[case::empty_after_value(vec![valued_dictionary(), empty_dictionary()])]
     #[case::empty_before_value(vec![empty_dictionary(), valued_dictionary()])]
