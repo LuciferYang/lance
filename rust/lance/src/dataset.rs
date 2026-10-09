@@ -75,6 +75,7 @@ mod data_file_part;
 pub mod delta;
 pub mod files;
 pub mod fragment;
+pub(crate) mod fragment_slice;
 mod hash_joiner;
 pub mod index;
 pub mod mem_wal;
