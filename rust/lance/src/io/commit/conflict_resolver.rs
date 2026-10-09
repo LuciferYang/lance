@@ -6525,6 +6525,9 @@ mod tests {
                 },
                 Compatible,
             ),
+            // A moved replacement still retries against anything that wrote
+            // new values into a field it moves: committed over them, it would
+            // publish the values it read before they changed.
             (
                 "Moved DataReplacement vs DataReplacement of an overlapping field",
                 Operation::DataReplacement {
@@ -6540,9 +6543,6 @@ mod tests {
                 },
                 Retryable,
             ),
-            // A moved replacement still retries against anything that wrote
-            // new values into a field it moves: committed over them, it would
-            // publish the values it read before they changed.
             (
                 "Moved DataReplacement vs Update (RewriteColumns) that rewrote one of its fields",
                 Operation::DataReplacement {
