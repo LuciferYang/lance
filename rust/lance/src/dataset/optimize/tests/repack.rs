@@ -492,25 +492,136 @@ async fn repack_against_concurrent_drop(#[case] dropped: &str, #[case] commits: 
     dataset.validate().await.unwrap();
 }
 
-/// A concurrent update that writes new values into a moved column makes the
-/// repack retry rather than publish the old values over the new ones.
+/// How a concurrent commit writes `d = 100` into the row `a = 2`.
+#[derive(Debug, Clone, Copy)]
+enum NewValueOfD {
+    /// An `Update` that moves the row to a new fragment.
+    RowRewrite,
+    /// An `Update` that rewrites `d` in place (`UpdateMode::RewriteColumns`).
+    InPlaceUpdate,
+    /// A `DataReplacement` of `d` with `data_change: true`.
+    Replacement,
+}
+
+async fn write_new_value_of_d(dataset: &mut Dataset, how: NewValueOfD) {
+    use crate::dataset::transaction::UpdateMode;
+    use crate::dataset::{MergeInsertBuilder, MergeInsertWriteMode, WhenMatched, WhenNotMatched};
+
+    match how {
+        NewValueOfD::RowRewrite => {
+            crate::dataset::UpdateBuilder::new(Arc::new(dataset.clone()))
+                .update_where("a = 2")
+                .unwrap()
+                .set("d", "100")
+                .unwrap()
+                .build()
+                .unwrap()
+                .execute()
+                .await
+                .unwrap();
+        }
+        NewValueOfD::InPlaceUpdate => {
+            let schema = Arc::new(Schema::from(
+                &dataset.schema().project(&["a", "d"]).unwrap(),
+            ));
+            let source = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int32Array::from(vec![2])),
+                    Arc::new(Int32Array::from(vec![100])),
+                ],
+            )
+            .unwrap();
+            MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["a".into()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .write_mode(MergeInsertWriteMode::RewriteColumns)
+                .try_build()
+                .unwrap()
+                .execute_batches(vec![source])
+                .await
+                .unwrap();
+        }
+        NewValueOfD::Replacement => {
+            // Fragment 0 holds a = 0..4, so d = a + 1 = [1, 2, 3, 4].
+            let schema = dataset.schema().project(&["d"]).unwrap();
+            let batch = RecordBatch::try_new(
+                Arc::new(Schema::from(&schema)),
+                vec![Arc::new(Int32Array::from(vec![1, 2, 100, 4]))],
+            )
+            .unwrap();
+            let group = dataset
+                .get_fragment(0)
+                .unwrap()
+                .write_columns(futures::stream::iter([Ok(batch)]), &schema)
+                .await
+                .unwrap();
+            let read_version = dataset.manifest.version;
+            Dataset::commit(
+                WriteDestination::Dataset(Arc::new(dataset.clone())),
+                Operation::DataReplacement {
+                    replacements: vec![group],
+                    data_change: true,
+                },
+                Some(read_version),
+                None,
+                None,
+                Arc::new(Default::default()),
+                false,
+            )
+            .await
+            .unwrap();
+        }
+    }
+    dataset.checkout_latest().await.unwrap();
+
+    // Each case has to keep testing the commit shape it names.
+    let d_id = dataset.schema().field("d").unwrap().id as u32;
+    let operation = dataset.read_transaction().await.unwrap().unwrap().operation;
+    let shape_matches = match how {
+        NewValueOfD::RowRewrite => matches!(
+            operation,
+            Operation::Update {
+                update_mode: Some(UpdateMode::RewriteRows),
+                ..
+            }
+        ),
+        NewValueOfD::InPlaceUpdate => matches!(
+            &operation,
+            Operation::Update {
+                update_mode: Some(UpdateMode::RewriteColumns),
+                fields_modified,
+                ..
+            } if fields_modified.contains(&d_id)
+        ),
+        NewValueOfD::Replacement => matches!(
+            operation,
+            Operation::DataReplacement {
+                data_change: true,
+                ..
+            }
+        ),
+    };
+    assert!(shape_matches, "{how:?}: {operation:?}");
+}
+
+/// A concurrent commit that writes a new value into a moved column makes the
+/// repack retry rather than publish the old value over the new one, however
+/// the new value was written.
+#[rstest]
+#[case::row_rewrite(NewValueOfD::RowRewrite)]
+#[case::in_place_update(NewValueOfD::InPlaceUpdate)]
+#[case::data_changing_replacement(NewValueOfD::Replacement)]
 #[tokio::test]
-async fn repack_against_concurrent_update_of_moved_column() {
+async fn repack_against_concurrent_new_value_of_moved_column(#[case] how: NewValueOfD) {
     let mut dataset = write_backfilled().await;
+    // Moves every column of each fragment, d included, into one file.
     let stale = stale_repack_results(&dataset, &repack_options(Some(1), vec![])).await;
 
-    crate::dataset::UpdateBuilder::new(Arc::new(dataset.clone()))
-        .update_where("a = 2")
-        .unwrap()
-        .set("d", "100")
-        .unwrap()
-        .build()
-        .unwrap()
-        .execute()
-        .await
-        .unwrap();
-    dataset.checkout_latest().await.unwrap();
+    write_new_value_of_d(&mut dataset, how).await;
     let expected = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(dataset.count_rows(Some("d = 100".into())).await.unwrap(), 1);
 
     let err = commit_results(&mut dataset, stale).await.unwrap_err();
     assert!(

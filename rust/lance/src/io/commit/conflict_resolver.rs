@@ -6528,7 +6528,7 @@ mod tests {
             (
                 "Moved DataReplacement vs DataReplacement of an overlapping field",
                 Operation::DataReplacement {
-                    replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01)],
+                    replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
                     data_change: false,
                 },
                 Operation::DataReplacement {
@@ -6537,6 +6537,81 @@ mod tests {
                         DataFile::new_legacy_from_fields("path0_1", vec![1], None),
                     )],
                     data_change: true,
+                },
+                Retryable,
+            ),
+            // A moved replacement still loses to anything that wrote new values
+            // into a field it moves, in either commit order: committed over
+            // them, it would publish the values it read before they changed.
+            (
+                "Moved DataReplacement vs Update (RewriteColumns) that rewrote one of its fields",
+                Operation::DataReplacement {
+                    replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    data_change: false,
+                },
+                Operation::Update {
+                    updated_fragments: vec![Fragment::new(0)],
+                    removed_fragment_ids: vec![],
+                    new_fragments: vec![],
+                    fields_modified: vec![1],
+                    compacted_sstables: Vec::new(),
+                    fields_for_preserving_frag_bitmap: vec![],
+                    update_mode: Some(RewriteColumns),
+                    inserted_rows_filter: None,
+                    updated_fragment_offsets: None,
+                },
+                Retryable,
+            ),
+            (
+                "Moved DataReplacement vs Update (RewriteRows) that moved its rows",
+                Operation::DataReplacement {
+                    replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    data_change: false,
+                },
+                Operation::Update {
+                    updated_fragments: vec![Fragment::new(0)],
+                    removed_fragment_ids: vec![],
+                    new_fragments: vec![Fragment::new(5)],
+                    fields_modified: vec![],
+                    compacted_sstables: Vec::new(),
+                    fields_for_preserving_frag_bitmap: vec![],
+                    update_mode: Some(RewriteRows),
+                    inserted_rows_filter: None,
+                    updated_fragment_offsets: None,
+                },
+                Retryable,
+            ),
+            (
+                "Update (RewriteColumns) of a field vs moved DataReplacement of that field",
+                Operation::Update {
+                    updated_fragments: vec![Fragment::new(0)],
+                    removed_fragment_ids: vec![],
+                    new_fragments: vec![],
+                    fields_modified: vec![1],
+                    compacted_sstables: Vec::new(),
+                    fields_for_preserving_frag_bitmap: vec![],
+                    update_mode: Some(RewriteColumns),
+                    inserted_rows_filter: None,
+                    updated_fragment_offsets: None,
+                },
+                Operation::DataReplacement {
+                    replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    data_change: false,
+                },
+                Retryable,
+            ),
+            (
+                "DataReplacement vs moved DataReplacement of an overlapping field",
+                Operation::DataReplacement {
+                    replacements: vec![DataReplacementGroup(
+                        0,
+                        DataFile::new_legacy_from_fields("path0_1", vec![1], None),
+                    )],
+                    data_change: true,
+                },
+                Operation::DataReplacement {
+                    replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01)],
+                    data_change: false,
                 },
                 Retryable,
             ),
