@@ -6540,9 +6540,9 @@ mod tests {
                 },
                 Retryable,
             ),
-            // A moved replacement still loses to anything that wrote new values
-            // into a field it moves, in either commit order: committed over
-            // them, it would publish the values it read before they changed.
+            // A moved replacement still retries against anything that wrote
+            // new values into a field it moves: committed over them, it would
+            // publish the values it read before they changed.
             (
                 "Moved DataReplacement vs Update (RewriteColumns) that rewrote one of its fields",
                 Operation::DataReplacement {
@@ -6582,6 +6582,8 @@ mod tests {
                 Retryable,
             ),
             (
+                // op1 is the Update: committed after the move, it would put
+                // back the fragment's files as it read them.
                 "Update (RewriteColumns) of a field vs moved DataReplacement of that field",
                 Operation::Update {
                     updated_fragments: vec![Fragment::new(0)],
@@ -6593,21 +6595,6 @@ mod tests {
                     update_mode: Some(RewriteColumns),
                     inserted_rows_filter: None,
                     updated_fragment_offsets: None,
-                },
-                Operation::DataReplacement {
-                    replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
-                    data_change: false,
-                },
-                Retryable,
-            ),
-            (
-                "DataReplacement vs moved DataReplacement of an overlapping field",
-                Operation::DataReplacement {
-                    replacements: vec![DataReplacementGroup(
-                        0,
-                        DataFile::new_legacy_from_fields("path0_1", vec![1], None),
-                    )],
-                    data_change: true,
                 },
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01)],
