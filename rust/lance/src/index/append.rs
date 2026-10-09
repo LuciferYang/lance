@@ -477,7 +477,7 @@ async fn rebuild_scalar_segment(
         &params,
         true,
         None,
-        Some(training_data),
+        Some((training_data, update_criteria.data_criteria.clone())),
         Arc::new(NoopIndexBuildProgress),
     )
     .await
@@ -1541,7 +1541,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                             &params,
                             true,
                             None,
-                            Some(new_data_stream),
+                            Some((new_data_stream, update_criteria.data_criteria.clone())),
                             Arc::new(NoopIndexBuildProgress),
                         )
                         .await?;
@@ -1647,7 +1647,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                                 &reference_index.derive_index_params()?,
                                 true,
                                 None,
-                                Some(new_data_stream),
+                                Some((new_data_stream, update_criteria.data_criteria.clone())),
                                 Arc::new(NoopIndexBuildProgress),
                             )
                             .await?,
