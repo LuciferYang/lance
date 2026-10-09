@@ -1036,7 +1036,8 @@ async fn test_index_on_rewritten_column_is_not_stale() {
 
 /// The complete logical blob layout names a byte range of an external object.
 /// The manifest stores the minimal `data, uri` layout, so projecting onto it
-/// would drop the range and store the whole object instead.
+/// would drop the range and store the whole object instead. The deleted row
+/// between the two live ones gets a placeholder in the same layout.
 #[rstest]
 #[tokio::test]
 async fn test_keeps_external_blob_range(
@@ -1068,8 +1069,9 @@ async fn test_keeps_external_blob_range(
     };
     let column = if nested { "info.blob" } else { "blob" };
 
-    let mut builder = BlobArrayBuilder::new(2);
+    let mut builder = BlobArrayBuilder::new(3);
     builder.push_bytes(b"one").unwrap();
+    builder.push_bytes(b"deleted").unwrap();
     builder.push_bytes(b"two").unwrap();
     let (base_field, base_array) = wrap(blob_field("blob", true), builder.finish().unwrap());
     let schema = Arc::new(ArrowSchema::new(vec![
@@ -1078,10 +1080,10 @@ async fn test_keeps_external_blob_range(
     ]));
     let batch = RecordBatch::try_new(
         schema.clone(),
-        vec![Arc::new(Int32Array::from(vec![0, 1])), base_array],
+        vec![Arc::new(Int32Array::from(vec![0, 1, 2])), base_array],
     )
     .unwrap();
-    let dataset = Dataset::write(
+    let mut dataset = Dataset::write(
         RecordBatchIterator::new([Ok(batch)], schema),
         &table,
         Some(WriteParams {
@@ -1097,6 +1099,7 @@ async fn test_keeps_external_blob_range(
     )
     .await
     .unwrap();
+    dataset.delete("id = 1").await.unwrap();
     let fragment = only_fragment(&dataset);
     let (addrs, _) = live_rows(&fragment).await;
 
@@ -1465,4 +1468,142 @@ async fn test_overwrites_blob_v2_column() {
         contents.push(blob.unwrap().read().await.unwrap().to_vec());
     }
     assert_eq!(contents, vec![b"new zero".to_vec(), b"new two".to_vec()]);
+}
+
+/// The new data file holds a placeholder for every deleted row. Wherever the
+/// deleted rows fall, the placeholders must be storable on the file version (no
+/// struct null on 2.0, no null in a non-nullable column), and every live value
+/// must land on its own row.
+#[rstest]
+#[tokio::test]
+async fn test_fills_deleted_rows(
+    #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1, LanceFileVersion::V2_2)]
+    version: LanceFileVersion,
+    #[values("id < 17", "id >= 20", "id >= 8 AND id < 24", DELETE_PREDICATE)] predicate: &str,
+) {
+    use arrow_array::builder::{ListBuilder, StringBuilder};
+
+    let st_fields = Fields::from(vec![
+        ArrowField::new("x", DataType::Int32, true),
+        ArrowField::new("s", DataType::Utf8, true),
+    ]);
+    let value_fields = vec![
+        ArrowField::new("st", DataType::Struct(st_fields.clone()), true),
+        ArrowField::new("name", DataType::Utf8, false),
+        ArrowField::new(
+            "tags",
+            DataType::List(Arc::new(ArrowField::new("item", DataType::Utf8, true))),
+            true,
+        ),
+    ];
+    let tags = |rows: Vec<Option<Vec<String>>>| {
+        let mut builder = ListBuilder::new(StringBuilder::new());
+        for row in rows {
+            if let Some(values) = &row {
+                values.iter().for_each(|v| builder.values().append_value(v));
+            }
+            builder.append(row.is_some());
+        }
+        Arc::new(builder.finish()) as ArrayRef
+    };
+    let st = |x: Vec<Option<i32>>, s: Vec<Option<String>>| {
+        Arc::new(StructArray::new(
+            st_fields.clone(),
+            vec![
+                Arc::new(Int32Array::from(x)),
+                Arc::new(StringArray::from(s)),
+            ],
+            None,
+        )) as ArrayRef
+    };
+
+    let schema = Arc::new(ArrowSchema::new(
+        [
+            vec![ArrowField::new("id", DataType::Int32, false)],
+            value_fields.clone(),
+        ]
+        .concat(),
+    ));
+    let all = (0..ROWS).collect::<Vec<_>>();
+    let base = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(all.clone())),
+            st(
+                vec![Some(-1); all.len()],
+                vec![Some("old".into()); all.len()],
+            ),
+            Arc::new(StringArray::from_iter_values(
+                all.iter().map(|id| format!("old{id}")),
+            )),
+            tags(vec![Some(vec!["old".into()]); all.len()]),
+        ],
+    )
+    .unwrap();
+    let test_uri = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(base)], schema),
+        &test_uri,
+        Some(WriteParams {
+            data_storage_version: Some(version),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset.delete(predicate).await.unwrap();
+    let fragment = only_fragment(&dataset);
+    let (addrs, ids) = live_rows(&fragment).await;
+
+    // The stream's first row holds nulls wherever the column allows them, since
+    // placeholders may be derived from it.
+    let first = ids[0];
+    let stream_schema = Arc::new(ArrowSchema::new(
+        [
+            vec![ArrowField::new(ROW_ADDR, DataType::UInt64, true)],
+            value_fields,
+        ]
+        .concat(),
+    ));
+    let update = RecordBatch::try_new(
+        stream_schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(addrs)),
+            st(
+                ids.iter()
+                    .map(|id| (id % 5 != 0).then_some(id * 10))
+                    .collect(),
+                ids.iter()
+                    .map(|id| (*id != first).then(|| format!("s{id}")))
+                    .collect(),
+            ),
+            Arc::new(StringArray::from_iter_values(
+                ids.iter().map(|id| format!("n{id}")),
+            )),
+            tags(
+                ids.iter()
+                    .map(|id| (*id != first).then(|| vec![format!("t{id}"); (id % 3) as usize]))
+                    .collect(),
+            ),
+        ],
+    )
+    .unwrap();
+    let result = fragment
+        .update_columns_from_stream(reader_of(stream_schema, chunked(&update)), Some(BATCH_SIZE))
+        .await
+        .unwrap();
+    let dataset = commit_rewrite(&dataset, result).await;
+    dataset.validate().await.unwrap();
+    let fragment = only_fragment(&dataset);
+    fragment.validate().await.unwrap();
+    assert_eq!(
+        fragment.count_deletions().await.unwrap(),
+        ROWS as usize - ids.len()
+    );
+
+    let read = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(read["id"].as_ref(), &Int32Array::from(ids));
+    for column in ["st", "name", "tags"] {
+        assert_eq!(read[column].to_data(), update[column].to_data(), "{column}");
+    }
 }
