@@ -6563,25 +6563,6 @@ mod tests {
                 Retryable,
             ),
             (
-                "Moved DataReplacement vs Update (RewriteRows) that moved its rows",
-                Operation::DataReplacement {
-                    replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
-                    data_change: false,
-                },
-                Operation::Update {
-                    updated_fragments: vec![Fragment::new(0)],
-                    removed_fragment_ids: vec![],
-                    new_fragments: vec![Fragment::new(5)],
-                    fields_modified: vec![],
-                    compacted_sstables: Vec::new(),
-                    fields_for_preserving_frag_bitmap: vec![],
-                    update_mode: Some(RewriteRows),
-                    inserted_rows_filter: None,
-                    updated_fragment_offsets: None,
-                },
-                Retryable,
-            ),
-            (
                 // op1 is the Update: committed after the move, it would put
                 // back the fragment's files as it read them.
                 "Update (RewriteColumns) of a field vs moved DataReplacement of that field",

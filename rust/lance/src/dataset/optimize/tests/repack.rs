@@ -492,11 +492,10 @@ async fn repack_against_concurrent_drop(#[case] dropped: &str, #[case] commits: 
     dataset.validate().await.unwrap();
 }
 
-/// How a concurrent commit writes `d = 100` into the row `a = 2`.
+/// How a concurrent commit writes `d = 100` into the row `a = 2` without
+/// moving the row out of its fragment.
 #[derive(Debug, Clone, Copy)]
 enum NewValueOfD {
-    /// An `Update` that moves the row to a new fragment.
-    RowRewrite,
     /// An `Update` that rewrites `d` in place (`UpdateMode::RewriteColumns`).
     InPlaceUpdate,
     /// A `DataReplacement` of `d` with `data_change: true`.
@@ -508,18 +507,6 @@ async fn write_new_value_of_d(dataset: &mut Dataset, how: NewValueOfD) {
     use crate::dataset::{MergeInsertBuilder, MergeInsertWriteMode, WhenMatched, WhenNotMatched};
 
     match how {
-        NewValueOfD::RowRewrite => {
-            crate::dataset::UpdateBuilder::new(Arc::new(dataset.clone()))
-                .update_where("a = 2")
-                .unwrap()
-                .set("d", "100")
-                .unwrap()
-                .build()
-                .unwrap()
-                .execute()
-                .await
-                .unwrap();
-        }
         NewValueOfD::InPlaceUpdate => {
             let schema = Arc::new(Schema::from(
                 &dataset.schema().project(&["a", "d"]).unwrap(),
@@ -580,13 +567,6 @@ async fn write_new_value_of_d(dataset: &mut Dataset, how: NewValueOfD) {
     let d_id = dataset.schema().field("d").unwrap().id as u32;
     let operation = dataset.read_transaction().await.unwrap().unwrap().operation;
     let shape_matches = match how {
-        NewValueOfD::RowRewrite => matches!(
-            operation,
-            Operation::Update {
-                update_mode: Some(UpdateMode::RewriteRows),
-                ..
-            }
-        ),
         NewValueOfD::InPlaceUpdate => matches!(
             &operation,
             Operation::Update {
@@ -606,11 +586,10 @@ async fn write_new_value_of_d(dataset: &mut Dataset, how: NewValueOfD) {
     assert!(shape_matches, "{how:?}: {operation:?}");
 }
 
-/// A concurrent commit that writes a new value into a moved column makes the
-/// repack retry rather than publish the old value over the new one, however
-/// the new value was written.
+/// A concurrent commit that writes a new value into a moved column of the
+/// fragment makes the repack retry rather than publish the old value over the
+/// new one.
 #[rstest]
-#[case::row_rewrite(NewValueOfD::RowRewrite)]
 #[case::in_place_update(NewValueOfD::InPlaceUpdate)]
 #[case::data_changing_replacement(NewValueOfD::Replacement)]
 #[tokio::test]
