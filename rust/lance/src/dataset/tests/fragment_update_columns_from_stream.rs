@@ -1036,13 +1036,15 @@ async fn test_index_on_rewritten_column_is_not_stale() {
 
 /// The complete logical blob layout names a byte range of an external object.
 /// The manifest stores the minimal `data, uri` layout, so projecting onto it
-/// would drop the range and store the whole object instead. The deleted row
-/// between the two live ones gets a placeholder in the same layout.
+/// would drop the range and store the whole object instead. One of the three
+/// rows is deleted, and with one row per batch its placeholder is written
+/// before, between or after the live rows, in the same layout.
 #[rstest]
 #[tokio::test]
 async fn test_keeps_external_blob_range(
     #[values(false, true)] nested: bool,
     #[values(false, true)] reversed: bool,
+    #[values(0, 1, 2)] deleted: i32,
 ) {
     use crate::blob::{BlobArrayBuilder, blob_field};
     use arrow_array::LargeBinaryArray;
@@ -1099,7 +1101,7 @@ async fn test_keeps_external_blob_range(
     )
     .await
     .unwrap();
-    dataset.delete("id = 1").await.unwrap();
+    dataset.delete(&format!("id = {deleted}")).await.unwrap();
     let fragment = only_fragment(&dataset);
     let (addrs, _) = live_rows(&fragment).await;
 
@@ -1134,7 +1136,7 @@ async fn test_keeps_external_blob_range(
     )
     .unwrap();
     let result = fragment
-        .update_columns_from_stream(reader_of(stream_schema, vec![update]), None)
+        .update_columns_from_stream(reader_of(stream_schema, vec![update]), Some(1))
         .await
         .unwrap();
     let dataset = Arc::new(commit_rewrite(&dataset, result).await);
@@ -1486,6 +1488,7 @@ async fn test_fills_deleted_rows(
     let st_fields = Fields::from(vec![
         ArrowField::new("x", DataType::Int32, true),
         ArrowField::new("s", DataType::Utf8, true),
+        ArrowField::new("k", DataType::Utf8, false),
     ]);
     let value_fields = vec![
         ArrowField::new("st", DataType::Struct(st_fields.clone()), true),
@@ -1506,12 +1509,13 @@ async fn test_fills_deleted_rows(
         }
         Arc::new(builder.finish()) as ArrayRef
     };
-    let st = |x: Vec<Option<i32>>, s: Vec<Option<String>>| {
+    let st = |x: Vec<Option<i32>>, s: Vec<Option<String>>, k: Vec<String>| {
         Arc::new(StructArray::new(
             st_fields.clone(),
             vec![
                 Arc::new(Int32Array::from(x)),
                 Arc::new(StringArray::from(s)),
+                Arc::new(StringArray::from(k)),
             ],
             None,
         )) as ArrayRef
@@ -1532,6 +1536,7 @@ async fn test_fills_deleted_rows(
             st(
                 vec![Some(-1); all.len()],
                 vec![Some("old".into()); all.len()],
+                vec!["old".into(); all.len()],
             ),
             Arc::new(StringArray::from_iter_values(
                 all.iter().map(|id| format!("old{id}")),
@@ -1576,6 +1581,7 @@ async fn test_fills_deleted_rows(
                 ids.iter()
                     .map(|id| (*id != first).then(|| format!("s{id}")))
                     .collect(),
+                ids.iter().map(|id| format!("k{id}")).collect(),
             ),
             Arc::new(StringArray::from_iter_values(
                 ids.iter().map(|id| format!("n{id}")),
