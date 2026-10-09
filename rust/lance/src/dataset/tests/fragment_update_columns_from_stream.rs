@@ -1613,3 +1613,50 @@ async fn test_fills_deleted_rows(
         assert_eq!(read[column].to_data(), update[column].to_data(), "{column}");
     }
 }
+
+/// An empty slice of a large batch has no rows but still holds the large
+/// batch's buffers. Each empty batch must be released before the next one is
+/// pulled, rather than kept until enough live rows have arrived.
+#[tokio::test]
+async fn test_releases_empty_batches() {
+    use datafusion::error::DataFusionError;
+    use datafusion::execution::SendableRecordBatchStream;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use std::sync::Mutex;
+
+    const EMPTY_BATCHES: usize = 4;
+    let test_uri = TempStrDir::default();
+    let dataset = base_dataset(&test_uri, LanceFileVersion::Stable, false, false).await;
+    let fragment = only_fragment(&dataset);
+    let (addrs, ids) = live_rows(&fragment).await;
+    let addrs = addrs.into_iter().map(Some).collect::<Vec<_>>();
+    let update = new_values(&addrs, &ids);
+
+    // The empty batches are slices of `parent`; `tracked` is its `v` buffer.
+    let parent = new_values(&addrs, &ids);
+    let tracked = parent["v"].to_data().buffers()[0].clone();
+    // How many references the buffer has as each batch is about to be produced.
+    let counts = Arc::new(Mutex::new(Vec::new()));
+    let observed = counts.clone();
+    let batches = (0..=EMPTY_BATCHES).map(move |i| {
+        observed.lock().unwrap().push(tracked.strong_count());
+        let batch = if i < EMPTY_BATCHES {
+            parent.slice(0, 0)
+        } else {
+            update.clone()
+        };
+        Ok::<_, DataFusionError>(batch)
+    });
+    let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+        values_schema(),
+        futures::stream::iter(batches),
+    ));
+    let result = fragment
+        .update_columns_from_stream(stream, None)
+        .await
+        .unwrap();
+    commit_rewrite(&dataset, result).await;
+
+    let counts = counts.lock().unwrap().clone();
+    assert_eq!(counts, vec![counts[0]; EMPTY_BATCHES + 1]);
+}

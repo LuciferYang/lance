@@ -346,6 +346,11 @@ impl FileFragment {
                         ))
                     })??;
                     self.check_batch_schema(&batch, columns)?;
+                    // An empty slice still holds its parent's buffers, so it is
+                    // dropped here instead of being kept in `parts`.
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
                     batch
                 }
             };
