@@ -21,6 +21,7 @@ import org.lance.compaction.CompactionPlan;
 import org.lance.compaction.CompactionScope;
 import org.lance.compaction.CompactionTask;
 import org.lance.compaction.RewriteResult;
+import org.lance.compaction.TaskData;
 import org.lance.schema.SqlExpressions;
 
 import org.apache.arrow.memory.RootAllocator;
@@ -44,6 +45,7 @@ import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -329,6 +331,80 @@ public class CompactionTest {
         assertArrayEquals(new int[] {1, 1}, repacked.getLiveFileCounts());
         assertArrayEquals(new int[] {3}, repacked.getFieldsPerFile()[0]);
       }
+    }
+  }
+
+  @Test
+  public void testRepackColumnGroups(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("test_repack_column_groups").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 10)) {
+        // Files [id, name] and [double_id].
+        dataset.addColumns(
+            new SqlExpressions.Builder().withExpression("double_id", "id * 2").build(),
+            Optional.empty());
+
+        List<List<String>> groups = Collections.singletonList(Arrays.asList("name", "double_id"));
+        CompactionOptions options =
+            CompactionOptions.builder()
+                .withColumnGroups(groups)
+                .withScope(CompactionScope.REPACK_COLUMNS)
+                .build();
+        CompactionPlan plan = Compaction.planCompaction(dataset, options);
+        assertEquals(groups, plan.getCompactionOptions().getColumnGroups());
+        assertEquals(1, plan.getCompactionTasks().size());
+        CompactionTask task = plan.getCompactionTasks().get(0);
+        assertEquals(
+            Collections.singletonList(Arrays.asList(1, 2)), task.getTaskData().getRepackFiles());
+
+        Compaction.commitCompaction(
+            dataset, Collections.singletonList(task.execute(dataset)), plan.getCompactionOptions());
+        dataset.checkoutLatest();
+        assertArrayEquals(new int[] {2}, dataset.getColumnLayoutStatistics().getLiveFileCounts());
+      }
+    }
+  }
+
+  /**
+   * A TaskData and a RewriteResult serialized by the classes as they were before the repack fields
+   * were added (TaskData with no fragments; RewriteResult with metrics 1/2/3/4, no fragments, read
+   * version 7 and no row addresses).
+   */
+  private static final String PRE_REPACK_TASK_DATA_BASE64 =
+      "rO0ABXNyAB1vcmcubGFuY2UuY29tcGFjdGlvbi5UYXNrRGF0Ybw2TJq93F8EAgABTAAJZnJhZ21lbnRzdAAQTGphdmEv"
+          + "dXRpbC9MaXN0O3hwc3IAE2phdmEudXRpbC5BcnJheUxpc3R4gdIdmcdhnQMAAUkABHNpemV4cAAAAAB3BAAAAAB4";
+
+  private static final String PRE_REPACK_REWRITE_RESULT_BASE64 =
+      "rO0ABXNyACJvcmcubGFuY2UuY29tcGFjdGlvbi5SZXdyaXRlUmVzdWx0Pnmr3WCAdsoCAAVKAAtyZWFkVmVyc2lvbk"
+          + "wAB21ldHJpY3N0AChMb3JnL2xhbmNlL2NvbXBhY3Rpb24vQ29tcGFjdGlvbk1ldHJpY3M7TAAMbmV3RnJhZ21lbnRz"
+          + "dAAQTGphdmEvdXRpbC9MaXN0O0wAEW9yaWdpbmFsRnJhZ21lbnRzcQB+AAJbAAhyb3dBZGRyc3QAAltCeHAAAAAAAA"
+          + "AAB3NyACZvcmcubGFuY2UuY29tcGFjdGlvbi5Db21wYWN0aW9uTWV0cmljc+SyuONVONrVAgAESgAKZmlsZXNBZGRl"
+          + "ZEoADGZpbGVzUmVtb3ZlZEoADmZyYWdtZW50c0FkZGVkSgAQZnJhZ21lbnRzUmVtb3ZlZHhwAAAAAAAAAAQAAAAAAA"
+          + "AAAwAAAAAAAAACAAAAAAAAAAFzcgATamF2YS51dGlsLkFycmF5TGlzdHiB0h2Zx2GdAwABSQAEc2l6ZXhwAAAAAHcE"
+          + "AAAAAHhzcQB+AAcAAAAAdwQAAAAAeHA=";
+
+  @Test
+  public void testDeserializeTaskAndResultFromOlderVersion() throws Exception {
+    TaskData task = deserialize(PRE_REPACK_TASK_DATA_BASE64);
+    assertEquals(Collections.emptyList(), task.getFragments());
+    assertNull(task.getRepackFiles(), "an older task reads as a fragment rewrite");
+
+    RewriteResult result = deserialize(PRE_REPACK_REWRITE_RESULT_BASE64);
+    assertEquals(7L, result.getReadVersion());
+    assertEquals(1L, result.getMetrics().getFragmentsRemoved());
+    assertEquals(4L, result.getMetrics().getFilesAdded());
+    assertNull(result.getRepackedFragmentId());
+    assertNull(result.getRepackedFiles(), "an older result reads as a fragment rewrite");
+  }
+
+  @SuppressWarnings("unchecked")
+  private static <T> T deserialize(String base64) throws IOException, ClassNotFoundException {
+    byte[] serialized = Base64.getDecoder().decode(base64);
+    try (ObjectInputStream in = new ObjectInputStream(new ByteArrayInputStream(serialized))) {
+      return (T) in.readObject();
     }
   }
 

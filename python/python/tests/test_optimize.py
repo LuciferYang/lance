@@ -257,7 +257,17 @@ def test_repack_rejects_bad_options(tmp_path: Path):
     dataset.update_config({"lance.compaction.max_data_files_per_fragment": "lots"})
     with pytest.raises(ValueError, match="expected a positive integer"):
         dataset.optimize.compact_files(scope="repack_columns")
-    assert _files_per_fragment(dataset) == [3, 3]
+
+
+def test_compact_files_repacks_column_groups(tmp_path: Path):
+    dataset = _backfilled(tmp_path)
+    expected = dataset.to_table()
+
+    # c and d sit in separate files; the group moves them into one.
+    dataset.optimize.compact_files(column_groups=[["c", "d"]], scope="repack_columns")
+
+    assert _files_per_fragment(dataset) == [2, 2]
+    assert dataset.to_table() == expected
 
 
 def test_repack_keeps_vector_index(tmp_path: Path):

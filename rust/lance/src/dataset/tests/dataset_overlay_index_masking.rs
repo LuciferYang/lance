@@ -318,9 +318,10 @@ async fn repack_columns_preserves_data_overlay() {
     .await;
     assert_eq!(ids_matching(&dataset, "age = 999").await, vec![1]);
 
-    // Split `id` into a file of its own; the overlay on `age` must survive.
+    // Move `age`, the overlaid column, into a file of its own. Its values only
+    // moved, so the overlay on `age` must survive and keep shadowing the base.
     let options = crate::dataset::optimize::CompactionOptions {
-        column_groups: vec![vec!["id".into()]],
+        column_groups: vec![vec!["age".into()]],
         scope: crate::dataset::optimize::CompactionScope::RepackColumns,
         ..Default::default()
     };

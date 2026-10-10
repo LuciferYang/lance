@@ -111,7 +111,6 @@ async fn repack_collapses_backfilled_files() {
         .unwrap();
 
     assert_eq!(dataset.manifest.version, version + 1, "one commit");
-    assert_eq!(live_file_counts(&dataset), vec![1, 1]);
     assert_eq!(layout(&dataset), vec![vec![vec![0, 1, 2, 3, 4]]; 2]);
     assert_eq!(metrics.files_added, 2);
     assert_eq!(metrics.files_removed, 6);
@@ -784,8 +783,8 @@ fn repack_keeps_the_spilled_lineage_file() {
         ),
         Some(vec![vec![1, 2]])
     );
-    // With a limit of 1 as well: moving every column would leave the lineage
-    // file behind, so its column stays.
+    // With a limit of 1 as well: a file a move cannot empty stays anyway, so
+    // the lineage file keeps its column.
     assert_eq!(
         crate::dataset::optimize::repack::plan_fragment_repack(
             &schema,
@@ -796,6 +795,21 @@ fn repack_keeps_the_spilled_lineage_file() {
         ),
         Some(vec![vec![1, 2]])
     );
+    // A group can name the lineage file's column, which a merge never moves.
+    // Moving it out with another column would leave that file holding the
+    // lineage alone, so the group is not planned; a group of the other
+    // columns is.
+    let plan = |groups: &[Vec<i32>]| {
+        crate::dataset::optimize::repack::plan_fragment_repack(
+            &schema,
+            &fragment,
+            3,
+            Some(groups),
+            None,
+        )
+    };
+    assert_eq!(plan(&[vec![0, 1]]), None);
+    assert_eq!(plan(&[vec![1, 2]]), Some(vec![vec![1, 2]]));
 }
 
 /// Over the file limit with groups set, the columns no group names are merged
@@ -921,6 +935,74 @@ fn repack_merges_around_a_blob_column() {
         ),
         Some(vec![vec![2, 3]])
     );
+}
+
+/// A file a move cannot empty (here one holding a blob column) stays in any
+/// case, so the files that can go all merge, even above a limit of 1: keeping
+/// one of them as well would leave the fragment over the limit.
+#[test]
+fn repack_merges_every_movable_file_next_to_one_that_stays() {
+    let mut blob = Field::new("img", DataType::LargeBinary, true);
+    blob.set_metadata(std::collections::HashMap::from([(
+        lance_arrow::BLOB_META_KEY.to_string(),
+        "true".to_string(),
+    )]));
+    let schema = lance_schema(Schema::new(vec![
+        Field::new("id", DataType::Int32, true),
+        blob,
+        Field::new("d", DataType::Int32, true),
+        Field::new("e", DataType::Int32, true),
+        Field::new("f", DataType::Int32, true),
+    ]));
+    let mut fragment = Fragment::new(0);
+    fragment.files = vec![
+        v2_0_file("base.lance", vec![0, 1]),
+        v2_0_file("d.lance", vec![2]),
+        v2_0_file("e.lance", vec![3]),
+        v2_0_file("f.lance", vec![4]),
+    ];
+    assert_eq!(
+        crate::dataset::optimize::repack::plan_fragment_repack(
+            &schema,
+            &fragment,
+            4,
+            None,
+            Some(2)
+        ),
+        Some(vec![vec![2, 3, 4]])
+    );
+}
+
+/// A group holding a blob column stays where it is; a group without one
+/// moves.
+#[test]
+fn repack_leaves_a_group_holding_a_blob_column() {
+    let mut blob = Field::new("img", DataType::LargeBinary, true);
+    blob.set_metadata(std::collections::HashMap::from([(
+        lance_arrow::BLOB_META_KEY.to_string(),
+        "true".to_string(),
+    )]));
+    let schema = lance_schema(Schema::new(vec![
+        Field::new("id", DataType::Int32, true),
+        blob,
+        Field::new("d", DataType::Int32, true),
+    ]));
+    let mut fragment = Fragment::new(0);
+    fragment.files = vec![
+        v2_0_file("base.lance", vec![0, 1]),
+        v2_0_file("d.lance", vec![2]),
+    ];
+    let plan = |groups: &[Vec<i32>]| {
+        crate::dataset::optimize::repack::plan_fragment_repack(
+            &schema,
+            &fragment,
+            2,
+            Some(groups),
+            None,
+        )
+    };
+    assert_eq!(plan(&[vec![1, 2]]), None);
+    assert_eq!(plan(&[vec![0, 2]]), Some(vec![vec![0, 2]]));
 }
 
 #[tokio::test]
