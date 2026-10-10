@@ -76,14 +76,14 @@ fn file_coverage(file: &DataFile, schema: &Schema) -> HashSet<i32> {
 /// which hold no spilled lineage and share no column with a file holding it,
 /// and whose other fields (a struct header) belong to columns that move too.
 /// The files left keep the columns that do not move. Without groups, when
-/// every file holding a column can be emptied, one of them stays unless
-/// `max_files` is 1 or none can. Trying the files largest first by recorded
-/// size, the one kept is the first whose merge (of the files sharing no column
-/// with it, else of every other file, as long as it keeps a column) leaves the
-/// largest file in place, or failing that the first with any merge. When no
-/// such merge takes two files, they all merge, as under a limit of 1. Nothing
-/// is merged unless at least two files would be emptied, so a merge lowers the
-/// file count.
+/// every file holding a column can be emptied, one file stays unless
+/// `max_files` is 1. Trying the files largest first by recorded size, the one
+/// kept is the first whose merge (of the files sharing no column with it, else
+/// of every other file, as long as it keeps a column) leaves the largest file
+/// in place, or failing that the first with any merge. When neither merge
+/// takes two files for any file kept, none stays: they all merge, as under a
+/// limit of 1. Nothing is merged unless at least two files would be emptied,
+/// so a merge lowers the file count.
 ///
 /// A column the fragment has no data for (added as all nulls) is left out of
 /// its group, and a group holding a blob column, or a column whose fields are
@@ -248,7 +248,7 @@ pub(super) fn plan_fragment_repack(
             let all = emptied(candidates);
             let holding = file_columns.iter().filter(|c| !c.is_empty()).count();
             // A file a move cannot empty stays anyway. Otherwise one file
-            // stays unless the limit is 1 or none can (below).
+            // stays unless the limit is 1 or the search below finds no merge.
             let merged = if all.len() < 2 || all.len() < holding || max_files == Some(1) {
                 all
             } else {
@@ -282,9 +282,8 @@ pub(super) fn plan_fragment_repack(
                     .clone()
                     .find(|merged| !merged.contains(&largest))
                     .or_else(|| plans.clone().next())
-                    // No merge leaves a file in place: each would take a
-                    // single file or empty the kept one. They all merge, as
-                    // under a limit of 1.
+                    // Neither merge takes two files for any file kept, so
+                    // they all merge, as under a limit of 1.
                     .unwrap_or_else(|| all.clone())
             };
             if merged.len() > 1 {
