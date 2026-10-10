@@ -11094,6 +11094,14 @@ mod tests {
             knn_before,
             "search must return the same rows"
         );
+        let qa = PrimitiveArray::<Float32Type>::from_iter_values(query.iter().copied());
+        let mut scanner = dataset.scan();
+        scanner.nearest("vec", &qa, 5).unwrap();
+        let plan = scanner.explain_plan(true).await.unwrap();
+        assert!(
+            plan.contains("ANNIvfPartition"),
+            "the search uses the index: {plan}"
+        );
         dataset.validate().await.unwrap();
     }
 

@@ -237,6 +237,10 @@ async fn repack_keeps_scalar_index() {
     let after = dataset.load_indices().await.unwrap()[0].clone();
     assert_eq!(after.uuid, before.uuid, "the index is not rebuilt");
     assert_eq!(after.fragment_bitmap, before.fragment_bitmap);
+    let mut scanner = dataset.scan();
+    scanner.filter("d = 6").unwrap();
+    let plan = scanner.explain_plan(true).await.unwrap();
+    assert!(plan.contains("ScalarIndexQuery"), "{plan}");
     let filtered = dataset
         .scan()
         .filter("d = 6")
@@ -354,7 +358,33 @@ async fn compaction_scope_selects_task_kinds() {
 #[tokio::test]
 async fn compaction_plans_no_repack_by_default() {
     let dataset = write_backfilled().await;
-    let plan = plan_compaction(&dataset, &repack_options(None, vec![]))
+    let plan = plan_compaction(&dataset, &CompactionOptions::default())
+        .await
+        .unwrap();
+    assert!(
+        plan.tasks
+            .iter()
+            .all(|task| task.kind == CompactionTaskKind::RewriteFragments),
+        "{plan:?}"
+    );
+    let plan = plan_compaction(
+        &dataset,
+        &CompactionOptions {
+            scope: CompactionScope::RepackColumns,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(plan.tasks.is_empty(), "{plan:?}");
+}
+
+/// The limit is an upper bound: a fragment already at it is left alone.
+#[tokio::test]
+async fn repack_is_not_planned_at_the_limit() {
+    let dataset = write_backfilled().await;
+    assert_eq!(live_file_counts(&dataset), vec![3, 3]);
+    let plan = plan_compaction(&dataset, &repack_options(Some(3), vec![]))
         .await
         .unwrap();
     assert!(plan.tasks.is_empty(), "{plan:?}");
@@ -399,6 +429,20 @@ async fn repack_tasks_run_distributed() {
 fn task_data_without_kind_rewrites_fragments() {
     let task: TaskData = serde_json::from_str(r#"{"fragments": []}"#).unwrap();
     assert_eq!(task.kind, CompactionTaskKind::RewriteFragments);
+}
+
+/// A result serialized before `repacked_files` existed is a fragment rewrite.
+#[test]
+fn rewrite_result_without_repacked_files_is_a_rewrite() {
+    let json = r#"{
+        "metrics": {"fragments_removed": 0, "fragments_added": 0, "files_removed": 0, "files_added": 0},
+        "new_fragments": [],
+        "read_version": 1,
+        "original_fragments": [],
+        "row_addrs": null
+    }"#;
+    let result: RewriteResult = serde_json::from_str(json).unwrap();
+    assert!(result.repacked_files.is_none());
 }
 
 /// Run a repack of every fragment to the point of commit.
@@ -622,6 +666,36 @@ async fn repack_skips_legacy_files() {
     assert!(plan.tasks.is_empty(), "{plan:?}");
 }
 
+/// One legacy (V1) file is enough to leave the whole fragment alone, since
+/// its fields cannot be tombstoned one by one.
+#[test]
+fn repack_skips_a_fragment_holding_a_legacy_file() {
+    let schema = lance_schema(Schema::new(vec![
+        Field::new("a", DataType::Int32, true),
+        Field::new("b", DataType::Int32, true),
+        Field::new("c", DataType::Int32, true),
+    ]));
+    let mut fragment = Fragment::new(0);
+    fragment.files = vec![
+        lance_table::format::DataFile::new_legacy_from_fields("legacy.lance", vec![0], None),
+        v2_0_file("b.lance", vec![1]),
+        v2_0_file("c.lance", vec![2]),
+    ];
+    let plan = |fragment: &Fragment| {
+        crate::dataset::optimize::repack::plan_fragment_repack(
+            &schema,
+            fragment,
+            fragment.files.len(),
+            None,
+            Some(1),
+        )
+    };
+    assert_eq!(plan(&fragment), None);
+    // The same layout with a V2 file in its place is repacked.
+    fragment.files[0] = v2_0_file("a.lance", vec![0]);
+    assert_eq!(plan(&fragment), Some(vec![vec![0, 1, 2]]));
+}
+
 #[test]
 fn max_data_files_per_fragment_must_be_positive() {
     let mut options = CompactionOptions {
@@ -639,6 +713,31 @@ fn repack_options_parse_from_config() {
     )]);
     let options = CompactionOptions::from_dataset_config(&config).unwrap();
     assert_eq!(options.max_data_files_per_fragment, Some(4));
+
+    let config = HashMap::from([(
+        "lance.compaction.max_data_files_per_fragment".to_string(),
+        "lots".to_string(),
+    )]);
+    let err = CompactionOptions::from_dataset_config(&config).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("lance.compaction.max_data_files_per_fragment")
+            && err.to_string().contains("lots"),
+        "{err}"
+    );
+}
+
+#[test]
+fn compaction_scope_rejects_an_unknown_name() {
+    let err = CompactionScope::try_from("nonsense").unwrap_err();
+    assert!(
+        err.to_string().contains("Invalid compaction scope"),
+        "{err}"
+    );
+    assert_eq!(
+        CompactionScope::try_from("Repack_Columns").unwrap(),
+        CompactionScope::RepackColumns
+    );
 }
 
 /// The file holding a fragment's spilled row lineage keeps its columns: the
