@@ -358,15 +358,18 @@ async fn compaction_scope_selects_task_kinds() {
 #[tokio::test]
 async fn compaction_plans_no_repack_by_default() {
     let dataset = write_backfilled().await;
-    let plan = plan_compaction(&dataset, &CompactionOptions::default())
-        .await
-        .unwrap();
-    assert!(
-        plan.tasks
-            .iter()
-            .all(|task| task.kind == CompactionTaskKind::RewriteFragments),
-        "{plan:?}"
-    );
+    // Every default but a target that leaves the 4-row fragments alone, so
+    // that no rewrite claims them first.
+    let plan = plan_compaction(
+        &dataset,
+        &CompactionOptions {
+            target_rows_per_fragment: 4,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(plan.tasks.is_empty(), "{plan:?}");
     let plan = plan_compaction(
         &dataset,
         &CompactionOptions {
@@ -1339,10 +1342,9 @@ fn repack_keeps_the_largest_file_that_shares_a_struct() {
     assert_eq!(plan(&schema, &fragment), Some(vec![vec![1, 5]]));
 }
 
-/// When every column of every file also sits in another file, no file can
-/// stay with a column of its own, so the files all merge whatever the limit:
-/// a looser limit must not leave the fragment over it while a limit of 1
-/// fixes it.
+/// When no file can be kept while two others merge, the files all merge, as
+/// under a limit of 1: a looser limit must not leave the fragment over it
+/// while a limit of 1 fixes it.
 #[test]
 fn repack_merges_all_files_when_none_can_stay() {
     use arrow_schema::Fields;
@@ -1392,6 +1394,27 @@ fn repack_merges_all_files_when_none_can_stay() {
         v2_0_file("q.lance", vec![3, 5]),
     ];
     assert_eq!(plan(&schema, &fragment, 2), Some(vec![vec![0, 3]]));
+    assert_eq!(plan(&schema, &fragment, 2), plan(&schema, &fragment, 1));
+
+    // a=0, s=1 {x=2 (dropped), y=3}: two files hold a column and a third
+    // holds only s's header, so it counts toward the limit. Keeping either
+    // column file merges one file, so both merge and the header file goes
+    // with s.
+    let schema = lance_schema(Schema::new(vec![
+        child("a"),
+        Field::new(
+            "s",
+            DataType::Struct(Fields::from(vec![child("x"), child("y")])),
+            true,
+        ),
+    ]))
+    .project_by_ids(&[0, 1, 3], false);
+    fragment.files = vec![
+        v2_0_file("h.lance", vec![1, 2]),
+        v2_0_file("a.lance", vec![0]),
+        v2_0_file("sy.lance", vec![1, 3]),
+    ];
+    assert_eq!(plan(&schema, &fragment, 2), Some(vec![vec![0, 1]]));
     assert_eq!(plan(&schema, &fragment, 2), plan(&schema, &fragment, 1));
 }
 
