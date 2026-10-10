@@ -1342,9 +1342,9 @@ fn repack_keeps_the_largest_file_that_shares_a_struct() {
     assert_eq!(plan(&schema, &fragment), Some(vec![vec![1, 5]]));
 }
 
-/// When no file can be kept while two others merge, the files all merge, as
-/// under a limit of 1: a looser limit must not leave the fragment over it
-/// while a limit of 1 fixes it.
+/// When the search finds no file to keep while two others merge, the files
+/// all merge, as under a limit of 1: a looser limit must not leave the
+/// fragment over it while a limit of 1 fixes it.
 #[test]
 fn repack_merges_all_files_when_none_can_stay() {
     use arrow_schema::Fields;
