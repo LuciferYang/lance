@@ -363,7 +363,9 @@ public class CompactionTest {
         Compaction.commitCompaction(
             dataset, Collections.singletonList(task.execute(dataset)), plan.getCompactionOptions());
         dataset.checkoutLatest();
-        assertArrayEquals(new int[] {2}, dataset.getColumnLayoutStatistics().getLiveFileCounts());
+        // The base file keeps id; the new file holds the group. Before: {2, 1}.
+        assertArrayEquals(
+            new int[] {1, 2}, dataset.getColumnLayoutStatistics().getFieldsPerFile()[0]);
       }
     }
   }
