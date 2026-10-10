@@ -1240,6 +1240,62 @@ fn repack_keeps_the_largest_file_that_shares_a_struct() {
     assert_eq!(plan(&schema, &fragment), Some(vec![vec![1, 5]]));
 }
 
+/// When every column of every file also sits in another file, no file can
+/// stay with a column of its own, so the files all merge whatever the limit:
+/// a looser limit must not leave the fragment over it while a limit of 1
+/// fixes it.
+#[test]
+fn repack_merges_all_files_when_none_can_stay() {
+    use arrow_schema::Fields;
+    let child = |name: &str| Field::new(name, DataType::Int32, true);
+    let plan = |schema: &lance_core::datatypes::Schema, fragment: &Fragment, limit| {
+        crate::dataset::optimize::repack::plan_fragment_repack(
+            schema,
+            fragment,
+            fragment.files.len(),
+            None,
+            Some(limit),
+        )
+    };
+
+    // s=0 {x=1, y=2, z=3}, one child per file.
+    let schema = lance_schema(Schema::new(vec![Field::new(
+        "s",
+        DataType::Struct(Fields::from(vec![child("x"), child("y"), child("z")])),
+        true,
+    )]));
+    let mut fragment = Fragment::new(0);
+    fragment.files = vec![
+        v2_0_file("x.lance", vec![0, 1]),
+        v2_0_file("y.lance", vec![0, 2]),
+        v2_0_file("z.lance", vec![0, 3]),
+    ];
+    assert_eq!(plan(&schema, &fragment, 2), Some(vec![vec![0]]));
+    assert_eq!(plan(&schema, &fragment, 2), plan(&schema, &fragment, 1));
+
+    // s=0 {x=1, y=2}, t=3 {p=4, q=5}: the first file shares s with the
+    // second and t with the third.
+    let schema = lance_schema(Schema::new(vec![
+        Field::new(
+            "s",
+            DataType::Struct(Fields::from(vec![child("x"), child("y")])),
+            true,
+        ),
+        Field::new(
+            "t",
+            DataType::Struct(Fields::from(vec![child("p"), child("q")])),
+            true,
+        ),
+    ]));
+    fragment.files = vec![
+        v2_0_file("xp.lance", vec![0, 1, 3, 4]),
+        v2_0_file("y.lance", vec![0, 2]),
+        v2_0_file("q.lance", vec![3, 5]),
+    ];
+    assert_eq!(plan(&schema, &fragment, 2), Some(vec![vec![0, 3]]));
+    assert_eq!(plan(&schema, &fragment, 2), plan(&schema, &fragment, 1));
+}
+
 /// A V2.0 file holding only a struct header holds no column, so it does not
 /// stop the largest file from being kept; it goes when the struct moves.
 #[test]

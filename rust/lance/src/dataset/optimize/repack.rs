@@ -80,9 +80,10 @@ fn file_coverage(file: &DataFile, schema: &Schema) -> HashSet<i32> {
 /// unless `max_files` is 1. Trying the files largest first by recorded size,
 /// the one kept is the first whose merge (of the files sharing no column with
 /// it, else of every other file, as long as it keeps a column) leaves the
-/// largest file in place, or failing that the first with any merge. Nothing is merged
-/// unless at least two files would be emptied, so a merge lowers the file
-/// count.
+/// largest file in place, or failing that the first with any merge. When no
+/// file can be kept that way, they all merge, as under a limit of 1. Nothing
+/// is merged unless at least two files would be emptied, so a merge lowers the
+/// file count.
 ///
 /// A column the fragment has no data for (added as all nulls) is left out of
 /// its group, and a group holding a blob column, or a column whose fields are
@@ -281,7 +282,10 @@ pub(super) fn plan_fragment_repack(
                     .clone()
                     .find(|merged| !merged.contains(&largest))
                     .or_else(|| plans.clone().next())
-                    .unwrap_or_default()
+                    // No file can stay with a column of its own: every column
+                    // it holds also sits in another file. They all merge, as
+                    // under a limit of 1.
+                    .unwrap_or_else(|| all.clone())
             };
             if merged.len() > 1 {
                 vec![columns_of(&merged)]
