@@ -10342,6 +10342,60 @@ mod tests {
         );
     }
 
+    /// A compaction that remaps a BTree replaces its uuid, so an index drop
+    /// planned before it would remove nothing and report success. It conflicts
+    /// instead, and a retry from the latest version removes the remapped index.
+    #[tokio::test]
+    async fn test_drop_index_conflicts_with_a_compaction_that_remapped_it() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(4),
+                FragmentRowCount::from(100),
+                Some(WriteParams {
+                    enable_stable_row_ids: true,
+                    max_rows_per_file: 100,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let mut stale = dataset.clone();
+
+        compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+
+        // A drop planned before the compaction must not land on it.
+        let error = stale.drop_index("id_idx").await.unwrap_err();
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error}"
+        );
+
+        stale.checkout_latest().await.unwrap();
+        stale.drop_index("id_idx").await.unwrap();
+        assert!(
+            stale
+                .load_indices()
+                .await
+                .unwrap()
+                .iter()
+                .all(|index| index.name != "id_idx"),
+            "the dropped index must not survive under its remapped uuid"
+        );
+    }
+
     #[rstest]
     #[case(IndexRemapMode::Compact)]
     #[case(IndexRemapMode::Direct)]

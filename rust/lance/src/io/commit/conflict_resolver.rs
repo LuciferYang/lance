@@ -1341,7 +1341,7 @@ impl<'a> TransactionRebase<'a> {
                 Operation::Rewrite {
                     groups,
                     frag_reuse_index,
-                    ..
+                    rewritten_indices,
                 } => {
                     // A tagged trim carries no state worth defending: the
                     // rewrite's appended records live in the CURRENT manifest
@@ -1351,6 +1351,17 @@ impl<'a> TransactionRebase<'a> {
                     // concurrently appended transition is retained naturally.
                     if self_is_tagged_trim {
                         return Ok(());
+                    }
+                    // A rewrite that remapped an index replaced its uuid, so
+                    // removing the old one would match nothing and leave the
+                    // remapped index behind: a drop that reports success, or
+                    // a replace that keeps the index it replaced.
+                    if removed_indices.iter().any(|removed| {
+                        rewritten_indices
+                            .iter()
+                            .any(|rewritten| rewritten.old_id == removed.uuid)
+                    }) {
+                        return Err(self.retryable_conflict_err(other_transaction, other_version));
                     }
                     // if index remapping is deferred, there is no conflict with
                     // concurrent CreateIndex of column indices: the index keeps covering
