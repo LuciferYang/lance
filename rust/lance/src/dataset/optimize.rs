@@ -10297,6 +10297,24 @@ mod tests {
             .await
             .unwrap();
 
+        // A mapping shifted by a few rows keeps every count, so compare the
+        // values the index hands back too.
+        async fn ids_for(dataset: &Dataset, filter: &str) -> Vec<i32> {
+            let batch = dataset
+                .scan()
+                .filter(filter)
+                .unwrap()
+                .project(&["id"])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let mut ids = batch["id"].as_primitive::<Int32Type>().values().to_vec();
+            ids.sort_unstable();
+            ids
+        }
+        let ids_mid = ids_for(&dataset, "id >= 2000 and id < 3000").await;
+
         let options = CompactionOptions {
             target_rows_per_fragment: 50_000,
             index_remap_mode,
@@ -10340,6 +10358,7 @@ mod tests {
                 .unwrap(),
             count_high
         );
+        assert_eq!(ids_for(&dataset, "id >= 2000 and id < 3000").await, ids_mid);
     }
 
     /// A compaction that remaps a BTree replaces its uuid, so an index drop
