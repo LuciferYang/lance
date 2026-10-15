@@ -107,7 +107,7 @@ use crate::Dataset;
 use crate::Result;
 use crate::dataset::utils::CapturedRowIds;
 use crate::index::frag_reuse_with_stable_row_ids::ensure_frag_reuse_recording_allowed;
-use crate::index::{DatasetIndexInternalExt, index_is_usable, load_all_indices};
+use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, index_is_usable, load_all_indices};
 use crate::io::commit::{commit_transaction, default_commit_retry_timeout, migrate_fragments};
 use arrow::array::AsArray;
 use arrow::datatypes::{UInt8Type, UInt32Type, UInt64Type};
@@ -3268,6 +3268,48 @@ async fn records_stable_row_id_moves(
     Ok(true)
 }
 
+/// Whether the rewrite moves rows an index both stores the row addresses of
+/// and can remap.
+///
+/// Opens each candidate to ask: whether an index type can remap is decided by
+/// the index, and one that cannot would only be dropped by the remap anyway.
+async fn rewrite_covers_remappable_address_domain_index(
+    dataset: &Dataset,
+    completed_tasks: &[RewriteResult],
+) -> Result<bool> {
+    let rewritten: RoaringBitmap = completed_tasks
+        .iter()
+        .flat_map(|task| task.original_fragments.iter())
+        .filter_map(|fragment| u32::try_from(fragment.id).ok())
+        .collect();
+    for index in dataset.load_indices().await?.iter() {
+        if is_system_index(index) || !index.results_are_row_addrs() {
+            continue;
+        }
+        let Some(coverage) = index.fragment_bitmap.as_ref() else {
+            continue;
+        };
+        if coverage.is_disjoint(&rewritten) {
+            continue;
+        }
+        let Some(field_id) = index.keyed_field() else {
+            continue;
+        };
+        let Ok(field_path) = dataset.schema().field_path(field_id) else {
+            continue;
+        };
+        // One that cannot be opened is dropped from coverage as before.
+        if let Ok(scalar_index) = dataset
+            .open_scalar_index(&field_path, &index.uuid, &NoOpMetricsCollector)
+            .await
+            && scalar_index.can_remap()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Commit the results of file compaction.
 ///
 /// It is not required that all tasks are passed to this method. If some failed,
@@ -3320,8 +3362,24 @@ pub async fn commit_compaction(
     };
 
     let has_address_style = completed_tasks.iter().any(|t| t.row_addrs.is_some());
+    // On a stable-row-id table that does not record its moves, an index that
+    // stores row addresses is remapped here, from the source fragments' own
+    // metadata, the way every index is remapped without stable row ids.
+    //
+    // Those addresses pair with the rewritten rows in task order, which holds
+    // only for a task listing its fragments in ascending id order; any other
+    // task leaves the coverage to be dropped as before.
+    let remaps_address_domain = uses_stable_row_ids
+        && !records_row_addrs
+        && completed_tasks.iter().all(|task| {
+            task.original_fragments
+                .windows(2)
+                .all(|pair| pair[0].id < pair[1].id)
+        })
+        && rewrite_covers_remappable_address_domain_index(dataset, &completed_tasks).await?;
     // Address-style results require immediate index remapping unless it is deferred.
-    let needs_remapping = !uses_stable_row_ids && !options.defer_index_remap && has_address_style;
+    let needs_remapping = (!uses_stable_row_ids && !options.defer_index_remap && has_address_style)
+        || remaps_address_domain;
 
     // Confirm there is a remapper before materializing the potentially very large row address map.
     let index_remapper = if needs_remapping {
@@ -3360,12 +3418,13 @@ pub async fn commit_compaction(
         .flat_map(|t| t.new_fragments.iter().cloned())
         .collect();
 
-    // Single reserve_fragment_ids for all address-style tasks
+    // Single reserve_fragment_ids for all address-style tasks, and for every
+    // task when the remap below has to know where the rows went.
     let mut reserved_version = None;
-    if has_address_style {
+    if has_address_style || remaps_address_domain {
         let frags: Vec<&mut Fragment> = completed_tasks
             .iter_mut()
-            .filter(|t| t.row_addrs.is_some())
+            .filter(|t| t.row_addrs.is_some() || remaps_address_domain)
             .flat_map(|t| t.new_fragments.iter_mut())
             .collect();
         match reserve_fragment_ids(dataset, frags.into_iter()).await {
@@ -3439,9 +3498,18 @@ pub async fn commit_compaction(
         };
 
         if index_remapper.is_some() {
-            if let Some(row_addrs_bytes) = task.row_addrs {
-                let row_addrs =
-                    RoaringTreemap::deserialize_from(&mut Cursor::new(&row_addrs_bytes))?;
+            // A stable-row-id rewrite scans row ids, not addresses, so the
+            // addresses it moved come from the sources' own metadata.
+            let row_addrs = match task.row_addrs {
+                Some(row_addrs_bytes) => Some(RoaringTreemap::deserialize_from(&mut Cursor::new(
+                    &row_addrs_bytes,
+                ))?),
+                None if remaps_address_domain => Some(
+                    live_row_addrs(dataset, &task.original_fragments, &task.new_fragments).await?,
+                ),
+                None => None,
+            };
+            if let Some(row_addrs) = row_addrs {
                 match options.index_remap_mode {
                     IndexRemapMode::Direct => {
                         let transposed = remapping::transpose_row_addrs(
@@ -3583,7 +3651,7 @@ pub async fn commit_compaction(
                 new_index_files: rewritten.files,
             })
             .collect()
-    } else if !options.defer_index_remap && !has_address_style {
+    } else if !options.defer_index_remap && !has_address_style && !remaps_address_domain {
         // We need to reserve fragment ids here so that the fragment bitmap
         // can be updated for each index. Only needed for stable row IDs
         // since address-style IDs were already reserved above.
@@ -5903,16 +5971,18 @@ mod tests {
             .await
             .unwrap();
 
-        async fn index_set(dataset: &Dataset) -> HashSet<Uuid> {
+        async fn index_id(dataset: &Dataset, name: &str) -> Uuid {
             dataset
                 .load_indices()
                 .await
                 .unwrap()
                 .iter()
-                .map(|index| index.uuid)
-                .collect()
+                .find(|index| index.name == name)
+                .unwrap_or_else(|| panic!("index {name} must survive compaction"))
+                .uuid
         }
-        let indices = index_set(&dataset).await;
+        let vector_id = index_id(&dataset, "vector").await;
+        let scalar_id = index_id(&dataset, "scalar").await;
 
         async fn vector_query(dataset: &Dataset) -> RecordBatch {
             let mut scanner = dataset.scan();
@@ -5944,10 +6014,15 @@ mod tests {
         };
         let _metrics = compact_files(&mut dataset, options, None).await.unwrap();
 
-        // The indices should be unchanged after compaction, since we are using
-        // stable row ids.
-        let current_indices = index_set(&dataset).await;
-        assert_eq!(indices, current_indices);
+        // Stable row ids leave a row-id-domain index as it was. The scalar
+        // index is a BTree, which stores row addresses, so it is remapped
+        // instead and has to keep serving the filter.
+        assert_eq!(index_id(&dataset, "vector").await, vector_id);
+        assert_ne!(index_id(&dataset, "scalar").await, scalar_id);
+        let mut scanner = dataset.scan();
+        scanner.filter("i = 100").unwrap();
+        let plan = scanner.explain_plan(false).await.unwrap();
+        assert!(plan.contains("ScalarIndexQuery"), "{plan}");
 
         let after_vec_result = vector_query(&dataset).await;
         assert_eq!(before_vec_result, after_vec_result);
@@ -5963,7 +6038,11 @@ mod tests {
     /// fragments made a filtered scan fail with an internal error (a fragment referenced
     /// by the index no longer existed) or, once translation tolerated that, silently drop
     /// every match.
+    ///
+    /// A BTree stores row addresses too, but can be remapped, so compaction carries it
+    /// over to the fragments it wrote instead of giving up the coverage.
     #[rstest]
+    #[case::btree(BuiltinIndexType::BTree, IndexType::BTree, "i", "i = 7", 1)]
     #[case::zone_map(BuiltinIndexType::ZoneMap, IndexType::ZoneMap, "i", "i > 0", 199)]
     #[case::bloom_filter(BuiltinIndexType::BloomFilter, IndexType::BloomFilter, "i", "i = 0", 1)]
     #[case::fm(
@@ -6038,6 +6117,13 @@ mod tests {
         if defer_index_remap {
             // Readers translate its addresses through the fragment reuse index.
             assert_eq!(covered, Some(live_fragments));
+        } else if index_type == IndexType::BTree {
+            // Remapped in the commit, so it holds the new addresses.
+            assert_eq!(covered, Some(live_fragments));
+            let mut scanner = dataset.scan();
+            scanner.filter(query).unwrap();
+            let plan = scanner.explain_plan(false).await.unwrap();
+            assert!(plan.contains("ScalarIndexQuery"), "{plan}");
         } else {
             // The index only knows the pre-compaction fragments, so it must not claim
             // to cover the fragment they were rewritten into.
@@ -10159,14 +10245,27 @@ mod tests {
     #[case(IndexRemapMode::Compact)]
     #[case(IndexRemapMode::Direct)]
     #[tokio::test]
-    async fn test_btree_index_remap_after_compaction(#[case] index_remap_mode: IndexRemapMode) {
+    async fn test_btree_index_remap_after_compaction(
+        #[case] index_remap_mode: IndexRemapMode,
+        // A BTree stores row addresses either way, so it is remapped under
+        // stable row ids too.
+        #[values(false, true)] enable_stable_row_ids: bool,
+    ) {
         let mut dataset = lance_datagen::gen_batch()
             .col(
                 "vec",
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(32)),
             )
             .col("id", lance_datagen::array::step::<Int32Type>())
-            .into_ram_dataset(FragmentCount::from(6), FragmentRowCount::from(1000))
+            .into_ram_dataset_with_params(
+                FragmentCount::from(6),
+                FragmentRowCount::from(1000),
+                Some(WriteParams {
+                    enable_stable_row_ids,
+                    max_rows_per_file: 1000,
+                    ..Default::default()
+                }),
+            )
             .await
             .unwrap();
 

@@ -1088,8 +1088,16 @@ impl Transaction {
                 )?;
 
                 if next_row_id.is_some() {
-                    // We can re-use indices, but need to rewrite the fragment bitmaps
-                    debug_assert!(rewritten_indices.is_empty());
+                    // The commit remaps only address-domain indices here: a
+                    // remapped index holds the new addresses, so it follows its
+                    // data to the new fragments like any remapped index.
+                    Self::handle_rewrite_indices(
+                        &mut final_indices,
+                        rewritten_indices,
+                        &ordered_groups,
+                    )?;
+                    let remapped: HashSet<Uuid> =
+                        rewritten_indices.iter().map(|index| index.new_id).collect();
                     // If there is an FRI and the index uses addresses then we can
                     // migrate fragment support.
                     //
@@ -1099,7 +1107,7 @@ impl Transaction {
                     for index in final_indices.iter_mut() {
                         // Its bitmap is lineage, not coverage, and a straddling
                         // group would fail the recalculation.
-                        if is_frag_reuse_index_entry(index) {
+                        if is_frag_reuse_index_entry(index) || remapped.contains(&index.uuid) {
                             continue;
                         }
                         let results_are_row_addrs = index.results_are_row_addrs();
@@ -1107,12 +1115,12 @@ impl Transaction {
                             *fragment_bitmap = if results_are_row_addrs && !deferred_remap {
                                 // Stable row ids survive a rewrite, so a row-id-domain index
                                 // can simply follow its data to the new fragments. An
-                                // address-domain index cannot: its stored addresses point into
-                                // the fragments the rewrite dropped. Claiming coverage of the
-                                // new fragments would make it answer queries with addresses
-                                // that no longer resolve, so drop the rewritten fragments from
-                                // its coverage instead and let the scanner fall back to a full
-                                // scan for them.
+                                // address-domain index the commit did not remap cannot: its
+                                // stored addresses point into the fragments the rewrite
+                                // dropped. Claiming coverage of the new fragments would make
+                                // it answer queries with addresses that no longer resolve, so
+                                // drop the rewritten fragments from its coverage instead and
+                                // let the scanner fall back to a full scan for them.
                                 Self::drop_rewritten_fragments(fragment_bitmap, &ordered_groups)
                             } else {
                                 Self::recalculate_fragment_bitmap(fragment_bitmap, &ordered_groups)?

@@ -14,7 +14,8 @@ const NON_LEGACY_VERSIONS: [LanceFileVersion; 4] = [
 #[tokio::test]
 async fn test_binary_copy_merge_small_files() {
     for version in NON_LEGACY_VERSIONS {
-        do_test_binary_copy_merge_small_files(version).await;
+        // Boxed for CI clippy `large_futures`: the compaction future grew past 16 KiB.
+        Box::pin(do_test_binary_copy_merge_small_files(version)).await;
     }
 }
 
@@ -426,7 +427,8 @@ async fn do_test_binary_copy_with_defer_remap(version: LanceFileVersion) {
 #[case(LanceFileVersion::V2_3)]
 #[tokio::test]
 async fn test_binary_copy_preserves_stable_row_ids(#[case] version: LanceFileVersion) {
-    do_binary_copy_preserves_stable_row_ids(version).await;
+    // Boxed for CI clippy `large_futures`: the compaction future grew past 16 KiB.
+    Box::pin(do_binary_copy_preserves_stable_row_ids(version)).await;
 }
 
 async fn do_binary_copy_preserves_stable_row_ids(version: LanceFileVersion) {
@@ -473,16 +475,18 @@ async fn do_binary_copy_preserves_stable_row_ids(version: LanceFileVersion) {
         .await
         .unwrap();
 
-    async fn index_set(dataset: &Dataset) -> HashSet<Uuid> {
+    async fn index_id(dataset: &Dataset, name: &str) -> Uuid {
         dataset
             .load_indices()
             .await
             .unwrap()
             .iter()
-            .map(|index| index.uuid)
-            .collect()
+            .find(|index| index.name == name)
+            .unwrap_or_else(|| panic!("index {name} must survive compaction"))
+            .uuid
     }
-    let indices = index_set(&dataset).await;
+    let vector_id = index_id(&dataset, "vector").await;
+    let scalar_id = index_id(&dataset, "scalar").await;
 
     async fn vector_query(dataset: &Dataset) -> RecordBatch {
         let mut scanner = dataset.scan();
@@ -520,8 +524,15 @@ async fn do_binary_copy_preserves_stable_row_ids(version: LanceFileVersion) {
     };
     let _metrics = compact_files(&mut dataset, options, None).await.unwrap();
 
-    let current_indices = index_set(&dataset).await;
-    assert_eq!(indices, current_indices);
+    // Stable row ids leave a row-id-domain index as it was. The scalar index is
+    // a BTree, which stores row addresses, so it is remapped instead and has to
+    // keep serving the filter.
+    assert_eq!(index_id(&dataset, "vector").await, vector_id);
+    assert_ne!(index_id(&dataset, "scalar").await, scalar_id);
+    let mut scanner = dataset.scan();
+    scanner.filter("i = 100").unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(plan.contains("ScalarIndexQuery"), "{plan}");
 
     let after_vec_result = vector_query(&dataset).await;
     assert_eq!(before_vec_result, after_vec_result);
