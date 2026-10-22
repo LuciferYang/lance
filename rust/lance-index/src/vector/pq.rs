@@ -528,6 +528,13 @@ impl Quantization for ProductQuantizer {
 
         if let Some(codebook) = params.codebook.as_ref() {
             let dimension = fsl.value_length() as usize;
+            if *codebook.data_type() != fsl.value_type() {
+                return Err(Error::invalid_input(format!(
+                    "PQ codebook value type {} does not match the vector value type {}",
+                    codebook.data_type(),
+                    fsl.value_type()
+                )));
+            }
             validate_supplied_codebook(
                 codebook.len(),
                 dimension,
@@ -947,6 +954,29 @@ mod tests {
     /// size that disagrees with the column has to be rejected here: oversized
     /// would read the sub-vector boundaries at the wrong offsets and train a
     /// garbage index, undersized would slice out of bounds and panic.
+    #[test]
+    fn test_build_rejects_codebook_value_type_mismatch() {
+        use arrow_array::Float16Array;
+        const DIM: usize = 8;
+
+        // An f16 column with an f32 flat codebook: the length check passes
+        // and the quantizer builds, but every later `as_primitive::<T>` panics
+        // (or trains on garbage), so the mismatch must be rejected at the boundary.
+        let values = Float16Array::from_iter((0..64 * DIM).map(|v| half::f16::from_f32(v as f32)));
+        let fsl = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
+        let codebook =
+            Arc::new(Float32Array::from_iter((0..256 * DIM).map(|v| v as f32))) as ArrayRef;
+
+        let params = PQBuildParams::with_codebook(8, 8, codebook);
+        let error =
+            <ProductQuantizer as Quantization>::build(&fsl, DistanceType::L2, &params).unwrap_err();
+        assert!(matches!(&error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error.to_string().contains("codebook"),
+            "the error must name the codebook: {error}"
+        );
+    }
+
     #[test]
     fn test_validate_supplied_codebook() {
         const DIM: usize = 128;

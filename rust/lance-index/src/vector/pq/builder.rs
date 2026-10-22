@@ -258,6 +258,20 @@ impl PQBuildParams {
                     codebook.data_type()
                 ))
             })?;
+            if codebook.value_length() != fsl.value_length() {
+                return Err(Error::invalid_input(format!(
+                    "PQ codebook child width {} does not match the vector dimension {}",
+                    codebook.value_length(),
+                    fsl.value_length()
+                )));
+            }
+            if codebook.value_type() != fsl.value_type() {
+                return Err(Error::invalid_input(format!(
+                    "PQ codebook value type {} does not match the vector value type {}",
+                    codebook.value_type(),
+                    fsl.value_type()
+                )));
+            }
             validate_supplied_codebook(
                 codebook.values().len(),
                 fsl.value_length() as usize,
@@ -290,7 +304,7 @@ impl PQBuildParams {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::Float32Array;
+    use arrow_array::{Float16Array, Float32Array};
 
     #[test]
     fn test_build_samples_before_materializing_subvectors() {
@@ -467,6 +481,51 @@ mod tests {
     /// size that disagrees with the column used to pass through here: oversized
     /// read the sub-vector boundaries at the wrong offsets and trained a garbage
     /// quantizer, undersized sliced out of bounds and panicked.
+    #[test]
+    fn test_build_rejects_mismatched_codebook_type_and_width() {
+        const DIM: usize = 8;
+        const NUM_SUB_VECTORS: usize = 2;
+        const NUM_BITS: usize = 2;
+        const K: usize = 1 << NUM_BITS;
+
+        let values = Float32Array::from_iter((0..64 * DIM).map(|v| v as f32));
+        let fsl = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
+
+        // Same total value count but a different child width would silently
+        // warm-start k-means on misaligned centroids.
+        let error = PQBuildParams::with_codebook(
+            NUM_SUB_VECTORS,
+            NUM_BITS,
+            Arc::new(
+                FixedSizeListArray::try_new_from_values(
+                    // K/2 rows of width 2*DIM keeps the total at K*DIM
+                    Float32Array::from_iter((0..K * DIM).map(|v| v as f32)),
+                    (DIM * 2) as i32,
+                )
+                .unwrap(),
+            ),
+        )
+        .build(&fsl, DistanceType::L2)
+        .unwrap_err();
+        assert!(matches!(&error, Error::InvalidInput { .. }), "{error}");
+
+        // A value type different from the column's panics later inside the
+        // training worker's `as_primitive`, so it must be rejected here.
+        let f16_codebook = FixedSizeListArray::try_new_from_values(
+            Float16Array::from_iter((0..K * DIM).map(|v| half::f16::from_f32(v as f32))),
+            DIM as i32,
+        )
+        .unwrap();
+        let error = PQBuildParams::with_codebook(NUM_SUB_VECTORS, NUM_BITS, Arc::new(f16_codebook))
+            .build(&fsl, DistanceType::L2)
+            .unwrap_err();
+        assert!(matches!(&error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error.to_string().contains("type"),
+            "the error must name the codebook value type mismatch: {error}"
+        );
+    }
+
     #[test]
     fn test_build_rejects_mismatched_codebook() {
         const DIM: usize = 8;
