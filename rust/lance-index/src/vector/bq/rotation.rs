@@ -231,4 +231,83 @@ mod tests {
         apply_fast_rotation(&input, &mut output, &signs);
         assert_eq!(output.len(), 129);
     }
+
+    /// RaBitQ's error-bound math rests on the fast rotation being close to
+    /// orthonormal. For power-of-two dims the pipeline is exactly orthogonal
+    /// up to f32 rounding; non-power-of-two dims pad, so norms are only
+    /// approximately preserved.
+    #[test]
+    fn test_fast_rotation_is_orthonormal_and_norm_preserving() {
+        // Rotating each basis vector yields the rotation's columns; their
+        // pairwise structure is the orthonormality statement.
+        for dim in [8_usize, 64, 128] {
+            let mut rng = smallrand();
+            let signs = seeded_signs(dim, &mut rng);
+            let mut columns = vec![vec![0.0f32; dim]; dim];
+            for (col, basis) in columns.iter_mut().enumerate() {
+                let mut one_hot = vec![0.0f32; dim];
+                one_hot[col] = 1.0;
+                apply_fast_rotation(&one_hot, basis, &signs);
+            }
+            for (i, col) in columns.iter().enumerate() {
+                let norm_sq: f32 = col.iter().map(|v| v * v).sum();
+                assert!(
+                    (norm_sq - 1.0).abs() < 1e-5,
+                    "dim {dim}: column {i} norm squared {norm_sq}"
+                );
+                for (j, other) in columns.iter().enumerate().skip(i + 1) {
+                    let dot: f32 = col.iter().zip(other).map(|(a, b)| a * b).sum();
+                    assert!(dot.abs() < 1e-5, "dim {dim}: columns {i},{j} dot {dot}");
+                }
+            }
+        }
+
+        // Random vectors keep their norm tightly for power-of-two dims...
+        let mut rng = smallrand();
+        use rand::Rng;
+        for dim in [8_usize, 64, 128] {
+            let signs = seeded_signs(dim, &mut rng);
+            for _ in 0..8 {
+                let input: Vec<f32> = (0..dim).map(|_| rng.random::<f32>() - 0.5).collect();
+                let mut output = vec![0.0f32; dim];
+                apply_fast_rotation(&input, &mut output, &signs);
+                let in_sq: f32 = input.iter().map(|v| v * v).sum();
+                let out_sq: f32 = output.iter().map(|v| v * v).sum();
+                assert!(
+                    (in_sq - out_sq).abs() < 1e-5 * in_sq.max(1.0),
+                    "dim {dim}: input norm {in_sq}, output norm {out_sq}"
+                );
+            }
+        }
+        // ...and approximately (within ~5%) for padded, non-power-of-two dims.
+        for dim in [24_usize, 129, 200] {
+            let signs = seeded_signs(dim, &mut rng);
+            for _ in 0..8 {
+                let input: Vec<f32> = (0..dim).map(|_| rng.random::<f32>() - 0.5).collect();
+                let mut output = vec![0.0f32; dim];
+                apply_fast_rotation(&input, &mut output, &signs);
+                let in_sq: f32 = input.iter().map(|v| v * v).sum();
+                let out_sq: f32 = output.iter().map(|v| v * v).sum();
+                assert!(
+                    (in_sq - out_sq).abs() < 0.05 * in_sq,
+                    "dim {dim}: input norm {in_sq}, output norm {out_sq}"
+                );
+            }
+        }
+    }
+
+    /// Deterministic RNG helper for the tests above.
+    fn smallrand() -> rand::rngs::SmallRng {
+        use rand::SeedableRng;
+        rand::rngs::SmallRng::seed_from_u64(42)
+    }
+
+    /// Deterministic stand-in for random_fast_rotation_signs, so the
+    /// tolerance assertions below are stable across runs instead of sampling
+    /// the tail of a random distribution.
+    fn seeded_signs(dim: usize, rng: &mut impl rand::RngCore) -> Vec<u8> {
+        let mut signs = vec![0u8; super::fast_rotation_signs_len(dim)];
+        rng.fill_bytes(&mut signs);
+        signs
+    }
 }
