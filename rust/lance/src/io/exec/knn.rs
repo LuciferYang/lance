@@ -1990,7 +1990,8 @@ impl ANNIvfSubIndexExec {
                 return futures::stream::empty().boxed();
             }
 
-            if found_so_far >= query.k {
+            let effective_k = query.k * query.refine_factor.unwrap_or(1) as usize;
+            if found_so_far >= effective_k {
                 // We found enough results, no need for late search
                 return futures::stream::empty().boxed();
             }
@@ -2059,9 +2060,11 @@ impl ANNIvfSubIndexExec {
                 }
             }
 
-            // Stop searching if we have k results or we've found all the results
+            // Stop searching if we have k*refine_factor results or we've found all the results
             // that could possible match the prefilter
-            let max_results = max_results.unwrap_or(usize::MAX).min(query.k);
+            let max_results = max_results
+                .unwrap_or(usize::MAX)
+                .min(query.k * query.refine_factor.unwrap_or(1) as usize);
 
             let state_clone = state.clone();
 
