@@ -406,16 +406,24 @@ pub async fn init_writer_for_rq(
 /// Stream and write a range of rows from reader into writer.
 ///
 /// The caller is responsible for ensuring that `range` corresponds to a
+/// Rows per read while streaming a shard partition during a merge; keeps
+/// peak memory bounded instead of materializing the whole range at once.
+const MERGE_READ_BATCH_ROWS: u32 = 10_240;
+
 /// contiguous row interval for a single IVF partition.
 pub async fn write_partition_rows(
     reader: &V2Reader,
     w: &mut FileWriter,
     range: Range<usize>,
 ) -> Result<()> {
+    // Batch the read like the sibling writers below: u32::MAX materializes
+    // the whole shard-partition range as one RecordBatch, which for wide
+    // flat/SQ shards can exceed memory (a 6M-row x 768-dim f32 partition is
+    // ~18 GB) where bounded batches stream.
     let mut stream = reader
         .read_stream(
             lance_io::ReadBatchParams::Range(range),
-            u32::MAX,
+            MERGE_READ_BATCH_ROWS,
             4,
             lance_encoding::decoder::FilterExpression::no_filter(),
         )
@@ -438,7 +446,7 @@ async fn write_filtered_partition_rows(
     let mut stream = reader
         .read_stream(
             lance_io::ReadBatchParams::Range(range),
-            u32::MAX,
+            MERGE_READ_BATCH_ROWS,
             4,
             lance_encoding::decoder::FilterExpression::no_filter(),
         )
