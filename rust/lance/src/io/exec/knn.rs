@@ -1713,6 +1713,11 @@ impl ANNIvfEarlySearchResults {
     }
 
     async fn wait_for_minimum_to_finish(&self) -> usize {
+        // Create the Notified future before checking the condition:
+        // notify_waiters() only wakes futures registered at call time, so a
+        // notified() created after fetch_sub can miss the notification and
+        // hang forever if the last delta completes in between.
+        let notified = self.all_deltas_done.notified();
         if self.deltas_remaining.fetch_sub(1, Ordering::Relaxed) == 1 {
             {
                 let new_num_results_found = self.initial_ids.lock().unwrap().len();
@@ -1721,7 +1726,7 @@ impl ANNIvfEarlySearchResults {
             }
             self.all_deltas_done.notify_waiters();
         } else {
-            self.all_deltas_done.notified().await;
+            notified.await;
         }
         self.num_results_found.load(Ordering::Relaxed)
     }
