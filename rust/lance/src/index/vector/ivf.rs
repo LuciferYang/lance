@@ -6253,6 +6253,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_create_ivf_rejects_zero_target_partition_size() {
+        let test_dir = TempStrDir::default();
+        let (mut dataset, _) = generate_test_dataset(test_dir.as_str(), 0.0..1.0).await;
+
+        // A zero target partition size used to reach num_rows / 0 and panic;
+        // it must be rejected at the boundary (an explicit num_partitions is
+        // still fine - the target is then unused).
+        let ivf_params = IvfBuildParams::with_target_partition_size(0);
+        let params = VectorIndexParams::with_ivf_flat_params(MetricType::L2, ivf_params);
+        let err = dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("target_partition_size"), "{err}");
+    }
+
+    #[tokio::test]
     async fn test_create_ivf_pq_with_centroids() {
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
