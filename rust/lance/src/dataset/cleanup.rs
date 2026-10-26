@@ -55,7 +55,7 @@ use lance_core::{
 use lance_io::object_store::ObjectStore;
 use lance_table::{
     feature_flags::{ensure_can_read_manifest, ensure_can_write_manifest},
-    format::{IndexMetadata, Manifest},
+    format::{IndexMetadata, Manifest, is_detached_version},
     io::{
         commit::{ManifestLocation, ManifestNamingScheme},
         deletion::deletion_file_path,
@@ -571,6 +571,16 @@ impl<'a> CleanupTask<'a> {
         include_referenced_branches: bool,
         mut delete_execution: Option<Arc<DeleteExecution>>,
     ) -> Result<Self> {
+        // Cleanup keeps the versions at or after the one it reads from. A detached
+        // version sorts after every attached one, so from a detached checkout the
+        // latest attached version would expire with the rest.
+        let read_version = operation.dataset.version().version;
+        if is_detached_version(read_version) {
+            return Err(Error::invalid_input(format!(
+                "cannot clean up from detached version {read_version}; \
+                 check out an attached version of the dataset first"
+            )));
+        }
         if action.deletes_files() && delete_execution.is_none() {
             let concurrency = operation
                 .delete_concurrency
@@ -591,7 +601,7 @@ impl<'a> CleanupTask<'a> {
             dataset: operation.dataset,
             policy: operation.policy.clone(),
             action,
-            read_version: operation.dataset.version().version,
+            read_version,
             ignored_manifests,
             track_removed_manifests,
             include_referenced_branches,
@@ -2570,7 +2580,10 @@ mod tests {
     use crate::index::DatasetIndexExt;
     use crate::{
         dataset::transaction::{Operation, Transaction},
-        dataset::{AutoCleanupParams, ReadParams, WriteMode, WriteParams, builder::DatasetBuilder},
+        dataset::{
+            AutoCleanupParams, CommitBuilder, DeleteBuilder, ReadParams, WriteMode, WriteParams,
+            builder::DatasetBuilder,
+        },
         index::vector::VectorIndexParams,
     };
     use all_asserts::{assert_gt, assert_lt};
@@ -5265,6 +5278,47 @@ mod tests {
                 )
                 .await
                 .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_rejects_a_detached_checkout() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.append_some_data().await.unwrap();
+        let dataset = Arc::new(*fixture.open().await.unwrap());
+        let delete = DeleteBuilder::new(dataset.clone(), "true")
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let detached = CommitBuilder::new(dataset.clone())
+            .with_detached(true)
+            .execute(delete.transaction)
+            .await
+            .unwrap();
+        assert!(is_detached_version(detached.version_id()));
+        let before = fixture.count_files().await.unwrap();
+
+        // Every attached version is older than the policy's cutoff.
+        let operation = detached.cleanup(
+            CleanupPolicyBuilder::default()
+                .before_timestamp(utc_now() + TimeDelta::days(1))
+                .build(),
+        );
+        for error in [
+            operation.explain().await.unwrap_err(),
+            operation.execute().await.unwrap_err(),
+        ] {
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+            assert_contains!(error.to_string(), "detached version");
+        }
+
+        let after = fixture.count_files().await.unwrap();
+        assert_eq!(after.num_manifest_files, before.num_manifest_files);
+        assert_eq!(after.num_bytes, before.num_bytes);
+        assert_eq!(
+            fixture.open().await.unwrap().version_id(),
+            dataset.version_id()
         );
     }
 
