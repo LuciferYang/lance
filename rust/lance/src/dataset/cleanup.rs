@@ -6930,13 +6930,15 @@ mod tests {
         .await
         .unwrap();
         fixture.overwrite_some_data().await.unwrap();
-        // Lance 2.x and earlier write branch files without an `identifier` field.
+        // Lance 2.x and earlier write branch files with neither `identifier` nor `metadata`.
         for name in ["legacy", "legacy/child"] {
             let path = branch_contents_path(&main.base, name);
             let mut contents: serde_json::Value =
                 serde_json::from_slice(&main.object_store.read_one_all(&path).await.unwrap())
                     .unwrap();
-            contents.as_object_mut().unwrap().remove("identifier");
+            let contents_map = contents.as_object_mut().unwrap();
+            contents_map.remove("identifier");
+            contents_map.remove("metadata");
             main.object_store
                 .put(&path, &serde_json::to_vec(&contents).unwrap())
                 .await
@@ -6948,8 +6950,14 @@ mod tests {
         let policy = CleanupPolicyBuilder::default()
             .before_timestamp(before)
             .build();
-        cleanup_old_versions(&legacy, policy).await.unwrap();
-        fixture.run_cleanup(before).await.unwrap();
+        // legacy:v1 is the only version nothing else was created from.
+        let removed = cleanup_old_versions(&legacy, policy).await.unwrap();
+        assert_eq!(removed.old_versions, 1);
+        assert_eq!(removed.data_files_removed, 0);
+        // main:v1 is where legacy was created from.
+        let removed = fixture.run_cleanup(before).await.unwrap();
+        assert_eq!(removed.old_versions, 0);
+        assert_eq!(removed.data_files_removed, 0);
 
         let mut main = fixture.load().await.unwrap();
         let child = main.checkout_version(("legacy/child", None)).await.unwrap();

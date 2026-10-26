@@ -899,7 +899,8 @@ impl BranchIdentifier {
     }
 
     /// Collects all branches that reference this branch, returning (branch_name, version) tuples.
-    /// Results are in post-order traversal (deepest branches first).
+    /// Results are in post-order traversal (deepest branches first). Branches written without
+    /// an identifier are not ordered by depth, so one may come before its descendants.
     pub fn collect_referenced_versions(
         &self,
         branches: &HashMap<String, BranchContents>,
@@ -926,16 +927,16 @@ impl BranchIdentifier {
 
     /// Finds the version of this branch that a branch with a legacy root was created from.
     ///
-    /// Branch files written without an identifier get a synthetic `[(0, hash)]` one that does
-    /// not record the parent, and branches created from them later carry it as a prefix.
-    /// [`Self::find_referenced_version`] cannot match those against the ancestors of the
+    /// Branch files written without an identifier read back with a version-0 placeholder that
+    /// does not record the parent, and branches created from them later keep it as their first
+    /// entry. [`Self::find_referenced_version`] cannot match those against the ancestors of the
     /// legacy branch, so follow `parent_branch` up to the branch created from this one.
     fn find_legacy_referenced_version(
         &self,
         branch: &BranchContents,
         branches: &HashMap<String, BranchContents>,
     ) -> Option<u64> {
-        if branch.identifier.version_mapping.first()?.0 != 0 {
+        if branch.identifier == *self || branch.identifier.version_mapping.first()?.0 != 0 {
             return None;
         }
         let mut child = branch;
@@ -1577,36 +1578,41 @@ mod tests {
         assert_eq!(children[3].1, 1);
     }
 
+    fn build_legacy_branch(
+        name: &str,
+        parent_branch: Option<&str>,
+        parent_version: u64,
+    ) -> BranchContents {
+        BranchContents {
+            parent_branch: parent_branch.map(String::from),
+            identifier: BranchIdentifier::synthetic_identifier(
+                name,
+                parent_branch,
+                parent_version,
+                0,
+            ),
+            parent_version,
+            create_at: 0,
+            manifest_size: 1,
+            metadata: HashMap::new(),
+        }
+    }
+
     /// `legacy` and `legacy/child` have no stored identifier; `new_child` was created from
     /// `legacy` after identifiers were introduced.
     ///
     ///    main:v3 ──▶ legacy ─┬─ legacy:v2 ──▶ legacy/child
     ///                        └─ legacy:v4 ──▶ new_child
     fn build_legacy_branch_contents() -> HashMap<String, BranchContents> {
-        fn build(name: &str, parent_branch: Option<&str>, parent_version: u64) -> BranchContents {
-            BranchContents {
-                parent_branch: parent_branch.map(String::from),
-                identifier: BranchIdentifier::synthetic_identifier(
-                    name,
-                    parent_branch,
-                    parent_version,
-                    0,
-                ),
-                parent_version,
-                create_at: 0,
-                manifest_size: 1,
-                metadata: HashMap::new(),
-            }
-        }
         let mut contents = HashMap::new();
-        contents.insert("legacy".to_string(), build("legacy", None, 3));
+        contents.insert("legacy".to_string(), build_legacy_branch("legacy", None, 3));
         contents.insert(
             "legacy/child".to_string(),
-            build("legacy/child", Some("legacy"), 2),
+            build_legacy_branch("legacy/child", Some("legacy"), 2),
         );
         let new_child = BranchContents {
             identifier: BranchIdentifier::new(&contents["legacy"].identifier, 4),
-            ..build("new_child", Some("legacy"), 4)
+            ..build_legacy_branch("new_child", Some("legacy"), 4)
         };
         contents.insert("new_child".to_string(), new_child);
         contents
@@ -1632,5 +1638,25 @@ mod tests {
             .map(|(name, version)| (name.to_string(), *version))
             .collect::<Vec<_>>();
         assert_eq!(children, expected);
+    }
+
+    #[test]
+    fn test_collect_children_for_legacy_branch_cycle() {
+        // Deleting a branch and reusing its name can leave `parent_branch` links in a cycle.
+        let all_branches = HashMap::from([
+            ("a".to_string(), build_legacy_branch("a", Some("b"), 1)),
+            ("b".to_string(), build_legacy_branch("b", Some("a"), 2)),
+        ]);
+        assert!(
+            BranchIdentifier::main()
+                .collect_referenced_versions(&all_branches)
+                .is_empty()
+        );
+        // A branch never references itself, even when the cycle leads back to it.
+        let a_id = all_branches["a"].identifier.clone();
+        assert_eq!(
+            a_id.collect_referenced_versions(&all_branches),
+            vec![("b".to_string(), 2)]
+        );
     }
 }
