@@ -615,17 +615,19 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray,
-        UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+        ArrayRef, FixedSizeListArray, Float32Array, Int8Array, Int16Array, Int32Array, Int64Array,
+        LargeStringArray, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
     };
     use arrow_schema::{DataType, Field};
     use lance_arrow::DataTypeExt;
     use lance_datagen::{ArrayGeneratorExt, DEFAULT_SEED, RowCount, array};
     use rand::SeedableRng;
+    use rstest::rstest;
 
+    use crate::data::FixedSizeListBlock;
     use crate::statistics::{GetStat, Stat};
 
-    use super::DataBlock;
+    use super::{ComputeStat, DataBlock};
 
     use arrow_array::{
         Array,
@@ -634,36 +636,71 @@ mod tests {
     };
     use arrow_select::concat::concat;
 
-    /// `from_arrays` already computes the child's stats; the FSL wrapper's
-    /// `compute_stat` used to re-run the child's, which panicked for
-    /// variable-width children (they assert single computation) and doubled
-    /// every fixed-width statistic for all vector columns.
-    #[test]
-    fn test_fsl_of_variable_width_compute_stat_once() {
-        use arrow_array::FixedSizeListArray;
+    #[rstest]
+    #[case::vector(1)]
+    #[case::nested_vector(2)]
+    fn test_fixed_size_list_reuses_child_statistics(#[case] depth: u32) {
+        let mut block = DataBlock::from_array(Float32Array::from(vec![1.0, 2.0, 2.0, 4.0]));
+        let stats = [
+            Stat::DataSize,
+            Stat::BitWidth,
+            Stat::RunCount,
+            Stat::BytePositionEntropy,
+        ]
+        .map(|stat| (stat, block.expect_stat(stat)));
 
-        let values = Arc::new(StringArray::from(vec![
-            Some("aa"),
-            Some("bb"),
-            Some("cc"),
-            Some("dd"),
-        ]));
-        let array = Arc::new(FixedSizeListArray::new(
-            Arc::new(Field::new("item", DataType::Utf8, false)),
-            2,
-            values,
-            None,
-        )) as ArrayRef;
-        let block = DataBlock::from_arrays(&[array], 2);
-        assert!(matches!(block, DataBlock::FixedSizeList(_)));
-        // The child's MaxLength must be populated exactly once.
-        let child_max_length = match &block {
-            DataBlock::FixedSizeList(fsl) => fsl.child.get_stat(Stat::MaxLength),
-            _ => None,
-        };
-        assert!(
-            child_max_length.is_some(),
-            "child stats computed once by from_arrays"
+        for _ in 0..depth {
+            block = DataBlock::FixedSizeList(FixedSizeListBlock {
+                child: Box::new(block),
+                dimension: 2,
+            });
+        }
+        block.compute_stat();
+
+        for (stat, child_stat) in stats {
+            assert!(Arc::ptr_eq(&child_stat, &block.expect_stat(stat)), "{stat}");
+        }
+        assert_eq!(
+            block.expect_single_stat::<UInt64Type>(Stat::MaxLength),
+            4 * 2_u64.pow(depth)
+        );
+    }
+
+    #[rstest]
+    #[case::utf8(DataType::Utf8)]
+    #[case::large_utf8(DataType::LargeUtf8)]
+    #[case::utf8_view(DataType::Utf8View)]
+    #[case::binary(DataType::Binary)]
+    #[case::large_binary(DataType::LargeBinary)]
+    #[case::binary_view(DataType::BinaryView)]
+    fn test_fixed_size_list_variable_width_statistics(
+        #[case] child_type: DataType,
+        #[values(1, 2)] depth: u32,
+        #[values(false, true)] is_nullable: bool,
+    ) {
+        let strings = StringArray::from(vec![
+            Some("a"),
+            if is_nullable { None } else { Some("bb") },
+            Some("ccc"),
+            Some("dddd"),
+        ]);
+        let mut array = arrow_cast::cast(&strings, &child_type).unwrap();
+        let child_block = DataBlock::from_array(array.clone());
+        let child_size = child_block.expect_single_stat::<UInt64Type>(Stat::DataSize);
+
+        for _ in 0..depth {
+            let field = Arc::new(Field::new("item", array.data_type().clone(), true));
+            array = Arc::new(FixedSizeListArray::new(field, 2, array, None));
+        }
+
+        let block = DataBlock::from_arrays(&[array.clone()], array.len() as u64);
+        assert_eq!(
+            block.expect_single_stat::<UInt64Type>(Stat::DataSize),
+            child_size
+        );
+        assert_eq!(
+            block.expect_single_stat::<UInt64Type>(Stat::MaxLength),
+            4 * 2_u64.pow(depth)
         );
     }
 
