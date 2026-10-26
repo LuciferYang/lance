@@ -417,27 +417,14 @@ struct ShuffleInput {
     end: usize,
 }
 
-/// Translate a batch range into the row range to read from a v2 unsorted buffer.
-///
-/// The last batch of a file is partial whenever the row count is not a multiple of
-/// [`SHUFFLE_BATCH_SIZE`], so the end has to be clamped: `ReadBatchParams::Range`
-/// rejects a range that runs past the file (`valid_given_len` requires `end <= len`).
-
-/// Count one batch's partition ids into `partition_sizes`, rejecting null and
-/// out-of-range ids from external precomputed inputs (a stale partitions file
-/// or reused shuffle buffer) with a descriptive error instead of an index
-/// panic inside a spawned task.
+/// Count one batch's partition ids into `partition_sizes`. The ids can come
+/// from a precomputed partitions file or shuffle buffer, so an id past
+/// `num_partitions` is an input error, not an index panic in the counting task.
 fn count_partition_ids(
     part_ids: &UInt32Array,
     num_partitions: u32,
     partition_sizes: &mut [u64],
 ) -> Result<()> {
-    if part_ids.null_count() > 0 {
-        return Err(Error::invalid_input(format!(
-            "precomputed partition ids contain {} null values; every row must be assigned to one of {num_partitions} partitions",
-            part_ids.null_count()
-        )));
-    }
     for &part_id in part_ids.values() {
         let Some(size) = partition_sizes.get_mut(part_id as usize) else {
             return Err(Error::invalid_input(format!(
@@ -449,6 +436,11 @@ fn count_partition_ids(
     Ok(())
 }
 
+/// Translate a batch range into the row range to read from a v2 unsorted buffer.
+///
+/// The last batch of a file is partial whenever the row count is not a multiple of
+/// [`SHUFFLE_BATCH_SIZE`], so the end has to be clamped: `ReadBatchParams::Range`
+/// rejects a range that runs past the file (`valid_given_len` requires `end <= len`).
 fn shuffle_row_range(reader: &Lancev2FileReader, start: usize, end: usize) -> Range<usize> {
     let num_rows = reader.metadata().num_rows as usize;
     (start * SHUFFLE_BATCH_SIZE)..std::cmp::min(end * SHUFFLE_BATCH_SIZE, num_rows)
@@ -1037,46 +1029,44 @@ mod test {
         }
     }
 
+    /// Partition ids come from the caller's buffers, so one past the shuffler's
+    /// partition count is an input error in both buffer formats.
+    #[rstest::rstest]
     #[tokio::test]
-    async fn test_shuffler_rejects_bad_precomputed_partition_ids() {
-        // External precomputed inputs (a stale partitions file or reused
-        // shuffle buffer) must fail with a descriptive error, not an index
-        // panic inside a spawned counting task.
-        let make_stream = |part_ids: UInt32Array| {
+    async fn test_shuffler_rejects_out_of_range_partition_ids(#[values(false, true)] legacy: bool) {
+        // Four rows with partition ids 0..4, shuffled into two partitions.
+        let (dir_path, _temp_dir) = get_temp_dir().unwrap();
+        let mut shuffler = IvfShuffler::try_new(2, Some(dir_path.clone()), legacy, None).unwrap();
+        if legacy {
             let schema = make_schema(32);
-            let row_ids = Arc::new(UInt64Array::from_iter_values(0..part_ids.len() as u64));
             let codes = FixedSizeListArray::try_new_from_values(
-                Arc::new(UInt8Array::from_iter_values(
-                    (0..(part_ids.len() * 32)).map(|v| v as u8),
-                )) as Arc<dyn Array>,
+                Arc::new(UInt8Array::from_iter_values(0..128)) as Arc<dyn Array>,
                 32,
             )
             .unwrap();
-            let batch =
-                RecordBatch::try_new(schema, vec![row_ids, Arc::new(part_ids), Arc::new(codes)])
-                    .unwrap();
-            let schema = batch.schema();
-            Box::pin(lance_io::stream::RecordBatchStreamAdapter::new(
-                schema,
-                stream::once(async move { Ok(batch) }),
-            ))
-        };
-
-        let mut shuffler = IvfShuffler::try_new(1, None, true, None).unwrap();
-        shuffler
-            .write_unsorted_stream(make_stream(UInt32Array::from(vec![
-                Some(0_u32),
-                Some(5_u32),
-            ])))
-            .await
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(UInt64Array::from_iter_values(0..4)),
+                    Arc::new(UInt32Array::from_iter_values(0..4)),
+                    Arc::new(codes),
+                ],
+            )
             .unwrap();
+            let stream =
+                RecordBatchStreamAdapter::new(schema, stream::once(async move { Ok(batch) }));
+            shuffler.write_unsorted_stream(stream).await.unwrap();
+        } else {
+            write_v2_unsorted_buffer(&dir_path, "unsorted.lance", 4, 4, 32).await;
+            shuffler.set_unsorted_buffers(&["unsorted.lance"]);
+        }
         let err = shuffler.write_partitioned_shuffles(2, 1).await.unwrap_err();
-        assert!(err.to_string().contains("out of range"), "{err}");
-
-        // NOTE: a null part id cannot be driven through this API: the legacy
-        // buffer round-trip materializes null slots as 0 before the counting
-        // sees them (see count_partition_ids' null guard, which covers the
-        // v2 read path where validity is preserved).
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+        assert!(
+            err.to_string()
+                .contains("precomputed partition id 2 is out of range [0, 2)"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
