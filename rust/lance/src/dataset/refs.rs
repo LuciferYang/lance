@@ -1643,6 +1643,7 @@ mod tests {
     #[test]
     fn test_collect_children_for_legacy_branch_cycle() {
         // Deleting a branch and reusing its name can leave `parent_branch` links in a cycle.
+        // Neither branch leads back to main, so the walk must stop and report nothing.
         let all_branches = HashMap::from([
             ("a".to_string(), build_legacy_branch("a", Some("b"), 1)),
             ("b".to_string(), build_legacy_branch("b", Some("a"), 2)),

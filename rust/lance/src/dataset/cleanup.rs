@@ -6950,11 +6950,11 @@ mod tests {
         let policy = CleanupPolicyBuilder::default()
             .before_timestamp(before)
             .build();
-        // legacy:v1 is the only version nothing else was created from.
+        // legacy:v2 is kept for legacy/child and v3 is current, so only v1 goes.
         let removed = cleanup_old_versions(&legacy, policy).await.unwrap();
         assert_eq!(removed.old_versions, 1);
         assert_eq!(removed.data_files_removed, 0);
-        // main:v1 is where legacy was created from.
+        // main:v1 is kept for legacy and legacy/child.
         let removed = fixture.run_cleanup(before).await.unwrap();
         assert_eq!(removed.old_versions, 0);
         assert_eq!(removed.data_files_removed, 0);
