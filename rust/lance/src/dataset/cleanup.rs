@@ -571,9 +571,9 @@ impl<'a> CleanupTask<'a> {
         include_referenced_branches: bool,
         mut delete_execution: Option<Arc<DeleteExecution>>,
     ) -> Result<Self> {
-        // Cleanup keeps the versions at or after the one it reads from. A detached
-        // version sorts after every attached one, so from a detached checkout the
-        // latest attached version would expire with the rest.
+        // Cleanup keeps every version numbered at or above the one it reads from.
+        // Detached versions have the high bit set, so from a detached checkout every
+        // attached version, the latest included, could expire.
         let read_version = operation.dataset.version().version;
         if is_detached_version(read_version) {
             return Err(Error::invalid_input(format!(
