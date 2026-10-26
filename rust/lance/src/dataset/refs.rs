@@ -915,9 +915,46 @@ impl BranchIdentifier {
             .filter_map(|(branch_id, name)| {
                 branch_id
                     .find_referenced_version(self)
+                    .or_else(|| {
+                        let branch = branches.get(&name)?;
+                        self.find_legacy_referenced_version(branch, branches)
+                    })
                     .map(|version| (name, version))
             })
             .collect()
+    }
+
+    /// Finds the version of this branch that a branch with a legacy root was created from.
+    ///
+    /// Branch files written without an identifier get a synthetic `[(0, hash)]` one that does
+    /// not record the parent, and branches created from them later carry it as a prefix.
+    /// [`Self::find_referenced_version`] cannot match those against the ancestors of the
+    /// legacy branch, so follow `parent_branch` up to the branch created from this one.
+    fn find_legacy_referenced_version(
+        &self,
+        branch: &BranchContents,
+        branches: &HashMap<String, BranchContents>,
+    ) -> Option<u64> {
+        if branch.identifier.version_mapping.first()?.0 != 0 {
+            return None;
+        }
+        let mut child = branch;
+        // Deleting a branch and reusing its name can make `parent_branch` links cycle.
+        for _ in 0..branches.len() {
+            let parent = match child.parent_branch.as_deref() {
+                Some(name) => Some(branches.get(name)?),
+                None => None,
+            };
+            let is_created_from_self = match parent {
+                Some(parent) => parent.identifier == *self,
+                None => self.version_mapping.is_empty(),
+            };
+            if is_created_from_self {
+                return Some(child.parent_version);
+            }
+            child = parent?;
+        }
+        None
     }
 }
 
@@ -1538,5 +1575,62 @@ mod tests {
         assert_eq!(children[1].1, 1);
         assert_eq!(children[2].1, 1);
         assert_eq!(children[3].1, 1);
+    }
+
+    /// `legacy` and `legacy/child` have no stored identifier; `new_child` was created from
+    /// `legacy` after identifiers were introduced.
+    ///
+    ///    main:v3 ──▶ legacy ─┬─ legacy:v2 ──▶ legacy/child
+    ///                        └─ legacy:v4 ──▶ new_child
+    fn build_legacy_branch_contents() -> HashMap<String, BranchContents> {
+        fn build(name: &str, parent_branch: Option<&str>, parent_version: u64) -> BranchContents {
+            BranchContents {
+                parent_branch: parent_branch.map(String::from),
+                identifier: BranchIdentifier::synthetic_identifier(
+                    name,
+                    parent_branch,
+                    parent_version,
+                    0,
+                ),
+                parent_version,
+                create_at: 0,
+                manifest_size: 1,
+                metadata: HashMap::new(),
+            }
+        }
+        let mut contents = HashMap::new();
+        contents.insert("legacy".to_string(), build("legacy", None, 3));
+        contents.insert(
+            "legacy/child".to_string(),
+            build("legacy/child", Some("legacy"), 2),
+        );
+        let new_child = BranchContents {
+            identifier: BranchIdentifier::new(&contents["legacy"].identifier, 4),
+            ..build("new_child", Some("legacy"), 4)
+        };
+        contents.insert("new_child".to_string(), new_child);
+        contents
+    }
+
+    #[rstest]
+    #[case::main(None, &[("legacy", 3), ("legacy/child", 3), ("new_child", 3)])]
+    #[case::legacy(Some("legacy"), &[("legacy/child", 2), ("new_child", 4)])]
+    #[case::legacy_child(Some("legacy/child"), &[])]
+    #[case::new_child(Some("new_child"), &[])]
+    fn test_collect_children_for_legacy_branches(
+        #[case] branch: Option<&str>,
+        #[case] expected: &[(&str, u64)],
+    ) {
+        let all_branches = build_legacy_branch_contents();
+        let root_id = branch.map_or_else(BranchIdentifier::main, |name| {
+            all_branches[name].identifier.clone()
+        });
+        let mut children = root_id.collect_referenced_versions(&all_branches);
+        children.sort();
+        let expected = expected
+            .iter()
+            .map(|(name, version)| (name.to_string(), *version))
+            .collect::<Vec<_>>();
+        assert_eq!(children, expected);
     }
 }
