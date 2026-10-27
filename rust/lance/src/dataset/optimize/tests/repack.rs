@@ -658,6 +658,60 @@ async fn repack_against_concurrent_new_value_of_moved_column(#[case] how: NewVal
     dataset.validate().await.unwrap();
 }
 
+/// An in-place update of a column the repack leaves alone adds a file to the
+/// fragment. The repack applies to the fragment as the update left it, so it
+/// commits and the updated value stays.
+#[tokio::test]
+async fn repack_against_concurrent_update_of_another_column() {
+    use crate::dataset::{MergeInsertBuilder, MergeInsertWriteMode, WhenMatched, WhenNotMatched};
+
+    let mut dataset = write_backfilled().await;
+    // Moves d and e into one file and leaves [a, b, c] alone.
+    let stale = stale_repack_results(&dataset, &repack_options(Some(2), vec![])).await;
+
+    let schema = Arc::new(Schema::from(
+        &dataset.schema().project(&["a", "b"]).unwrap(),
+    ));
+    let source = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![2])),
+            Arc::new(Int32Array::from(vec![999])),
+        ],
+    )
+    .unwrap();
+    MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["a".into()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .write_mode(MergeInsertWriteMode::RewriteColumns)
+        .try_build()
+        .unwrap()
+        .execute_batches(vec![source])
+        .await
+        .unwrap();
+    dataset.checkout_latest().await.unwrap();
+    // The update tombstoned b in fragment 0's base file and wrote it anew.
+    assert_eq!(
+        layout(&dataset)[0],
+        vec![vec![0, -2, 2], vec![3], vec![4], vec![1]]
+    );
+    let expected = dataset.scan().try_into_batch().await.unwrap();
+
+    commit_results(&mut dataset, stale).await.unwrap();
+
+    assert_eq!(
+        layout(&dataset),
+        vec![
+            vec![vec![0, -2, 2], vec![1], vec![3, 4]],
+            vec![vec![0, 1, 2], vec![3, 4]],
+        ]
+    );
+    assert_eq!(dataset.count_rows(Some("b = 999".into())).await.unwrap(), 1);
+    assert_eq!(dataset.scan().try_into_batch().await.unwrap(), expected);
+    dataset.validate().await.unwrap();
+}
+
 #[tokio::test]
 async fn repack_skips_legacy_files() {
     let dir = TempStrDir::default();
@@ -1281,6 +1335,72 @@ async fn repack_with_a_dropped_struct_child_converges() {
         .await
         .unwrap();
     assert_eq!(dataset.manifest.version, version);
+}
+
+/// From V2.1 on, a data file lists no field id for a struct parent, only its
+/// leaves. The struct still moves by its leaves, only the new file answers for
+/// it, and the next run plans nothing.
+#[tokio::test]
+async fn repack_moves_a_struct_whose_parent_has_no_file_field() {
+    use arrow_array::{ArrayRef, StructArray};
+    use arrow_schema::Fields;
+    let fields = Fields::from(vec![
+        Field::new("x", DataType::Int32, false),
+        Field::new("y", DataType::Int32, false),
+    ]);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("z", DataType::Int32, false),
+        Field::new("s", DataType::Struct(fields.clone()), false),
+    ]));
+    let values =
+        |offset: i32| Arc::new(Int32Array::from_iter_values(offset..offset + 4)) as ArrayRef;
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            values(0),
+            Arc::new(StructArray::new(fields, vec![values(10), values(20)], None)),
+        ],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .add_columns(
+            NewColumnTransform::SqlExpressions(vec![("w".into(), "z * 5".into())]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    // z = 0, s = 1, s.x = 2, s.y = 3, w = 4; no file lists s itself.
+    assert_eq!(layout(&dataset), vec![vec![vec![0, 2, 3], vec![4]]]);
+    let before = dataset.scan().try_into_batch().await.unwrap();
+
+    let options = repack_options(None, vec![vec!["s", "w"]]);
+    compact_files(&mut dataset, options.clone(), None)
+        .await
+        .unwrap();
+
+    assert_eq!(layout(&dataset), vec![vec![vec![0, -2, -2], vec![2, 3, 4]]]);
+    let s_id = dataset.schema().field("s").unwrap().id;
+    let answering = dataset.manifest.fragments[0]
+        .files
+        .iter()
+        .filter(|file| file.schema(dataset.schema()).field_ids().contains(&s_id))
+        .count();
+    assert_eq!(answering, 1);
+    assert_eq!(dataset.scan().try_into_batch().await.unwrap(), before);
+    dataset.validate().await.unwrap();
+    let plan = plan_compaction(&dataset, &options).await.unwrap();
+    assert_eq!(plan.num_tasks(), 0);
 }
 
 /// Struct-header layouts for the merges the other planner tests don't reach:
