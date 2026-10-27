@@ -570,25 +570,9 @@ pub async fn build_pq_model_in_fragments(
     fragment_ids: Option<&[u32]>,
 ) -> Result<ProductQuantizer> {
     if let Some(codebook) = &params.codebook {
-        let column_field = dataset.schema().field(column).ok_or_else(|| {
-            Error::invalid_input(format!("PQ training column {column} not found"))
-        })?;
-        let column_value_type = match column_field.data_type() {
-            DataType::FixedSizeList(inner, _) => inner.data_type().clone(),
-            _ => {
-                return Err(Error::invalid_input(format!(
-                    "PQ codebook requires a FixedSizeList vector column, got {}",
-                    column_field.data_type()
-                )));
-            }
-        };
-        if *codebook.data_type() != column_value_type {
-            return Err(Error::invalid_input(format!(
-                "PQ codebook value type {} does not match the vector value type {}",
-                codebook.data_type(),
-                column_value_type
-            )));
-        }
+        let (_, value_type) =
+            crate::index::vector::utils::get_vector_type(dataset.schema(), column)?;
+        lance_index::vector::pq::validate_codebook_value_type(codebook.data_type(), &value_type)?;
         lance_index::vector::pq::validate_supplied_codebook(
             codebook.len(),
             dim,

@@ -118,6 +118,15 @@ impl ProductQuantizer {
         codebook: FixedSizeListArray,
         distance_type: DistanceType,
     ) -> Self {
+        // Every reachable Cosine pipeline normalizes the vectors before they
+        // reach PQ and re-scores from raw vectors, so quantization itself runs
+        // on L2. Convert here (as from_proto/from_metadata already do) so a
+        // Cosine-typed constructor cannot reach k-means' unsupported-metric
+        // panic on the first batch.
+        let distance_type = match distance_type {
+            DistanceType::Cosine => DistanceType::L2,
+            _ => distance_type,
+        };
         let l2_targets = Self::build_l2_targets(
             &codebook,
             distance_type,
@@ -510,6 +519,22 @@ pub fn validate_supplied_codebook(
     Ok(())
 }
 
+/// Check that a user-supplied PQ codebook has the value type of the vectors it
+/// will quantize. Quantization reads both as the vector type, so a mismatch
+/// would panic on the first batch instead of failing here.
+pub fn validate_codebook_value_type(
+    codebook_type: &DataType,
+    vector_type: &DataType,
+) -> Result<()> {
+    if codebook_type != vector_type {
+        return Err(Error::invalid_input(format!(
+            "PQ codebook value type {codebook_type} does not match the vector value type \
+             {vector_type}"
+        )));
+    }
+    Ok(())
+}
+
 impl Quantization for ProductQuantizer {
     type BuildParams = PQBuildParams;
     type Metadata = ProductQuantizationMetadata;
@@ -528,13 +553,7 @@ impl Quantization for ProductQuantizer {
 
         if let Some(codebook) = params.codebook.as_ref() {
             let dimension = fsl.value_length() as usize;
-            if *codebook.data_type() != fsl.value_type() {
-                return Err(Error::invalid_input(format!(
-                    "PQ codebook value type {} does not match the vector value type {}",
-                    codebook.data_type(),
-                    fsl.value_type()
-                )));
-            }
+            validate_codebook_value_type(codebook.data_type(), &fsl.value_type())?;
             validate_supplied_codebook(
                 codebook.len(),
                 dimension,
@@ -975,6 +994,29 @@ mod tests {
             error.to_string().contains("codebook"),
             "the error must name the codebook: {error}"
         );
+    }
+
+    #[test]
+    fn test_new_converts_cosine_to_l2() {
+        use arrow_array::Float32Array;
+        const DIM: usize = 8;
+        const NUM_SUB_VECTORS: usize = 2;
+
+        let codebook = FixedSizeListArray::try_new_from_values(
+            Float32Array::from_iter((0..256 * DIM).map(|v| v as f32)),
+            DIM as i32,
+        )
+        .unwrap();
+        let quantizer =
+            ProductQuantizer::new(NUM_SUB_VECTORS, 8, DIM, codebook, DistanceType::Cosine);
+        assert_eq!(quantizer.distance_type, DistanceType::L2);
+
+        // Quantizing through a Cosine-typed constructor used to reach
+        // k-means' unsupported-metric panic on the first batch.
+        let values = Float32Array::from_iter((0..64 * DIM).map(|v| v as f32));
+        let fsl = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
+        let codes = quantizer.quantize(&fsl).unwrap();
+        assert_eq!(codes.len(), 64);
     }
 
     #[test]

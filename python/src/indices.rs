@@ -426,6 +426,10 @@ pub fn transform_vectors(
         num_bits as usize,
     )
     .infer_error()?;
+    let (_, value_type) =
+        lance::index::vector::utils::get_vector_type(dataset.ds.schema(), column).infer_error()?;
+    lance_index::vector::pq::validate_codebook_value_type(&codebook.value_type(), &value_type)
+        .infer_error()?;
     let distance_type = DistanceType::try_from(distance_type).unwrap();
     let pq = ProductQuantizer::new(
         num_subvectors as usize,
