@@ -659,8 +659,8 @@ async fn repack_against_concurrent_new_value_of_moved_column(#[case] how: NewVal
 }
 
 /// An in-place update of a column the repack leaves alone adds a file to the
-/// fragment. The repack applies to the fragment as the update left it, so it
-/// commits and the updated value stays.
+/// fragment. The repack still commits, applied to the fragment as the update
+/// left it, so the updated value stays.
 #[tokio::test]
 async fn repack_against_concurrent_update_of_another_column() {
     use crate::dataset::{MergeInsertBuilder, MergeInsertWriteMode, WhenMatched, WhenNotMatched};
@@ -1338,11 +1338,13 @@ async fn repack_with_a_dropped_struct_child_converges() {
 }
 
 /// From V2.1 on, a data file lists a struct's leaves but not the struct
-/// itself, so the commit works out from the schema which files hold it. After
-/// the struct moves, the old file holds only `z`, the new file answers for
-/// `s`, and the next run plans nothing.
+/// itself. After the struct moves, the old file holds only `z`, the new file
+/// answers for `s`, and the next run plans nothing.
+#[rstest]
+#[case::v2_1(LanceFileVersion::V2_1)]
+#[case::v2_2(LanceFileVersion::V2_2)]
 #[tokio::test]
-async fn repack_moves_a_struct_whose_parent_has_no_file_field() {
+async fn repack_moves_a_struct_whose_parent_has_no_file_field(#[case] version: LanceFileVersion) {
     use arrow_array::{ArrayRef, StructArray};
     use arrow_schema::Fields;
     let fields = Fields::from(vec![
@@ -1367,7 +1369,7 @@ async fn repack_moves_a_struct_whose_parent_has_no_file_field() {
         RecordBatchIterator::new([Ok(batch)], schema),
         "memory://",
         Some(WriteParams {
-            data_storage_version: Some(LanceFileVersion::V2_2),
+            data_storage_version: Some(version),
             ..Default::default()
         }),
     )
