@@ -118,15 +118,6 @@ impl ProductQuantizer {
         codebook: FixedSizeListArray,
         distance_type: DistanceType,
     ) -> Self {
-        // Every reachable Cosine pipeline normalizes the vectors before they
-        // reach PQ and re-scores from raw vectors, so quantization itself runs
-        // on L2. Convert here (as from_proto/from_metadata already do) so a
-        // Cosine-typed constructor cannot reach k-means' unsupported-metric
-        // panic on the first batch.
-        let distance_type = match distance_type {
-            DistanceType::Cosine => DistanceType::L2,
-            _ => distance_type,
-        };
         let l2_targets = Self::build_l2_targets(
             &codebook,
             distance_type,
@@ -526,7 +517,9 @@ pub fn validate_codebook_value_type(
     codebook_type: &DataType,
     vector_type: &DataType,
 ) -> Result<()> {
-    if codebook_type != vector_type {
+    // Non-float columns are quantized as f32 residuals, so only a float
+    // column's own type is a contract here.
+    if vector_type.is_floating() && codebook_type != vector_type {
         return Err(Error::invalid_input(format!(
             "PQ codebook value type {codebook_type} does not match the vector value type \
              {vector_type}"
@@ -969,10 +962,6 @@ mod tests {
         );
     }
 
-    /// A caller-supplied codebook is sliced by column-derived arithmetic, so a
-    /// size that disagrees with the column has to be rejected here: oversized
-    /// would read the sub-vector boundaries at the wrong offsets and train a
-    /// garbage index, undersized would slice out of bounds and panic.
     #[test]
     fn test_build_rejects_codebook_value_type_mismatch() {
         use arrow_array::Float16Array;
@@ -996,29 +985,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_new_converts_cosine_to_l2() {
-        use arrow_array::Float32Array;
-        const DIM: usize = 8;
-        const NUM_SUB_VECTORS: usize = 2;
-
-        let codebook = FixedSizeListArray::try_new_from_values(
-            Float32Array::from_iter((0..256 * DIM).map(|v| v as f32)),
-            DIM as i32,
-        )
-        .unwrap();
-        let quantizer =
-            ProductQuantizer::new(NUM_SUB_VECTORS, 8, DIM, codebook, DistanceType::Cosine);
-        assert_eq!(quantizer.distance_type, DistanceType::L2);
-
-        // Quantizing through a Cosine-typed constructor used to reach
-        // k-means' unsupported-metric panic on the first batch.
-        let values = Float32Array::from_iter((0..64 * DIM).map(|v| v as f32));
-        let fsl = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
-        let codes = quantizer.quantize(&fsl).unwrap();
-        assert_eq!(codes.len(), 64);
-    }
-
+    /// A caller-supplied codebook is sliced by column-derived arithmetic, so a
+    /// size that disagrees with the column has to be rejected here: oversized
+    /// would read the sub-vector boundaries at the wrong offsets and train a
+    /// garbage index, undersized would slice out of bounds and panic.
     #[test]
     fn test_validate_supplied_codebook() {
         const DIM: usize = 128;
