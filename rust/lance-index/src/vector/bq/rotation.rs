@@ -232,15 +232,15 @@ mod tests {
         assert_eq!(output.len(), 129);
     }
 
-    /// RaBitQ's error-bound math rests on the fast rotation being close to
-    /// orthonormal. For power-of-two dims the pipeline is exactly orthogonal
-    /// up to f32 rounding; non-power-of-two dims pad, so norms are only
-    /// approximately preserved.
+    /// RaBitQ's error-bound math rests on the fast rotation being orthonormal.
+    /// It is, up to f32 rounding, for power-of-two dims and for the other
+    /// multiples of 8 that RaBitQ accepts, which take the truncated FWHT and
+    /// Kac path.
     #[test]
     fn test_fast_rotation_is_orthonormal_and_norm_preserving() {
         // Rotating each basis vector yields the rotation's columns; their
         // pairwise structure is the orthonormality statement.
-        for dim in [8_usize, 64, 128] {
+        for dim in [8_usize, 24, 64, 128, 200] {
             let mut rng = smallrand();
             let signs = seeded_signs(dim, &mut rng);
             let mut columns = vec![vec![0.0f32; dim]; dim];
@@ -262,10 +262,10 @@ mod tests {
             }
         }
 
-        // Random vectors keep their norm tightly for power-of-two dims...
+        // Random vectors keep their norm.
         let mut rng = smallrand();
         use rand::Rng;
-        for dim in [8_usize, 64, 128] {
+        for dim in [8_usize, 24, 64, 128, 200] {
             let signs = seeded_signs(dim, &mut rng);
             for _ in 0..8 {
                 let input: Vec<f32> = (0..dim).map(|_| rng.random::<f32>() - 0.5).collect();
@@ -275,21 +275,6 @@ mod tests {
                 let out_sq: f32 = output.iter().map(|v| v * v).sum();
                 assert!(
                     (in_sq - out_sq).abs() < 1e-5 * in_sq.max(1.0),
-                    "dim {dim}: input norm {in_sq}, output norm {out_sq}"
-                );
-            }
-        }
-        // ...and approximately (within ~5%) for padded, non-power-of-two dims.
-        for dim in [24_usize, 129, 200] {
-            let signs = seeded_signs(dim, &mut rng);
-            for _ in 0..8 {
-                let input: Vec<f32> = (0..dim).map(|_| rng.random::<f32>() - 0.5).collect();
-                let mut output = vec![0.0f32; dim];
-                apply_fast_rotation(&input, &mut output, &signs);
-                let in_sq: f32 = input.iter().map(|v| v * v).sum();
-                let out_sq: f32 = output.iter().map(|v| v * v).sum();
-                assert!(
-                    (in_sq - out_sq).abs() < 0.05 * in_sq,
                     "dim {dim}: input norm {in_sq}, output norm {out_sq}"
                 );
             }
