@@ -21,6 +21,21 @@ use arrow_schema::{DataType, Schema as ArrowSchema};
 use lance_core::Result;
 use lance_encoding::encodings::logical::primitive::dict::encoded_dictionary_values;
 
+/// A 128-bit BLAKE3 digest of a value's row encoding.
+///
+/// The tracker keeps one digest per distinct value instead of the value itself, so its
+/// memory is bounded by the key capacity (at most 65,536 digests of 16 bytes per column)
+/// rather than by the size of the values. Two distinct values sharing a digest would be
+/// counted once; the encoder's own check then rejects the page, as it does without the
+/// tracker.
+type ValueDigest = u128;
+
+fn digest(row: &[u8]) -> ValueDigest {
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&blake3::hash(row).as_bytes()[..16]);
+    ValueDigest::from_le_bytes(bytes)
+}
+
 /// How to reach a nested dictionary array from its parent array.
 #[derive(Debug, Clone)]
 enum PathStep {
@@ -41,8 +56,8 @@ struct TrackedDictionary {
     /// Declared value type, which `converter` encodes
     value_type: DataType,
     converter: RowConverter,
-    /// Row-encoded values written to the current file
-    values: HashSet<Box<[u8]>>,
+    /// Digests of the values written to the current file
+    values: HashSet<ValueDigest>,
 }
 
 /// Rows of leading batches that fit the current file, see [`DictionaryValueBudget::admit`].
@@ -219,7 +234,7 @@ fn collect_dictionaries(
 
 impl TrackedDictionary {
     /// Values of `batch` that the current file does not hold yet.
-    fn new_values(&self, batch: &RecordBatch) -> Result<HashSet<Box<[u8]>>> {
+    fn new_values(&self, batch: &RecordBatch) -> Result<HashSet<ValueDigest>> {
         let Some(array) = self.locate(batch) else {
             return Ok(HashSet::new());
         };
@@ -234,8 +249,8 @@ impl TrackedDictionary {
         let rows = self.converter.convert_columns(&[values])?;
         Ok(rows
             .iter()
-            .filter(|row| !self.values.contains(row.as_ref()))
-            .map(|row| row.as_ref().into())
+            .map(|row| digest(row.as_ref()))
+            .filter(|digest| !self.values.contains(digest))
             .collect())
     }
 
@@ -262,10 +277,10 @@ impl TrackedDictionary {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::types::{Int8Type, Int32Type};
+    use arrow_array::types::{Int8Type, Int16Type, Int32Type};
     use arrow_array::{
-        DictionaryArray, Int8Array, Int32Array, ListArray, StringArray, StringViewArray,
-        StructArray,
+        DictionaryArray, Int8Array, Int16Array, Int32Array, ListArray, StringArray,
+        StringViewArray, StructArray,
     };
     use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{Field, Fields};
@@ -458,5 +473,29 @@ mod tests {
             true,
         )]);
         assert!(DictionaryValueBudget::try_new(&schema).unwrap().is_none());
+    }
+
+    #[test]
+    fn keeps_one_fixed_size_digest_per_value() {
+        // Four batches of 64 values of 16 KiB each that differ only in their last characters.
+        let batch = |batch_index: usize| {
+            let values = StringArray::from_iter_values(
+                (0..64).map(|entry| format!("{}{batch_index:04}:{entry:04}", "x".repeat(16_374))),
+            );
+            let keys = (0..64).collect::<Int16Array>();
+            let dictionary = DictionaryArray::<Int16Type>::try_new(keys, Arc::new(values)).unwrap();
+            RecordBatch::try_from_iter([("d", Arc::new(dictionary) as ArrayRef)]).unwrap()
+        };
+        let mut budget = DictionaryValueBudget::try_new(&batch(0).schema())
+            .unwrap()
+            .unwrap();
+        for batch_index in 0..4 {
+            let batches = VecDeque::from([batch(batch_index)]);
+            assert!(!budget.admit(&batches, usize::MAX).unwrap().is_full);
+        }
+        // Every value is still told apart, but only its 16-byte digest is retained.
+        let values: &HashSet<ValueDigest> = &budget.dictionaries[0].values;
+        assert_eq!(values.len(), 256);
+        assert_eq!(size_of::<ValueDigest>(), 16);
     }
 }
