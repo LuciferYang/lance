@@ -1337,9 +1337,10 @@ async fn repack_with_a_dropped_struct_child_converges() {
     assert_eq!(dataset.manifest.version, version);
 }
 
-/// From V2.1 on, a data file lists no field id for a struct parent, only its
-/// leaves. The struct still moves by its leaves, only the new file answers for
-/// it, and the next run plans nothing.
+/// From V2.1 on, a data file lists a struct's leaves but not the struct
+/// itself, so the commit works out from the schema which files hold it. After
+/// the struct moves, the old file holds only `z`, the new file answers for
+/// `s`, and the next run plans nothing.
 #[tokio::test]
 async fn repack_moves_a_struct_whose_parent_has_no_file_field() {
     use arrow_array::{ArrayRef, StructArray};
