@@ -5956,29 +5956,16 @@ impl PySearchFilter {
             search_effort,
         ) = vector_query_params_from_dict(query, default_k)?;
 
-        // Pass None so the core resolves the column/index metric, matching
-        // the scanner path (dataset.rs:1615-1617); hard-defaulting to L2
-        // silently ranked cosine indexes by the wrong metric.
+        // Leave an unset metric to the core, which takes it from the index the
+        // search picks, as the `nearest` path does.
         let metric_type = metric_type_opt;
-
-        // The scanner path parses distance_range (dataset.rs:1575-1626);
-        // honor it here too instead of silently dropping the bounds. The
-        // key is always present in VectorSearchQuery's dict with a None
-        // default, so handle both absent and None values.
-        let (lower_bound, upper_bound) = match query.get_item("distance_range")? {
-            Some(dr) if !dr.is_none() => {
-                let (lower, upper): (Option<f32>, Option<f32>) = dr.extract()?;
-                (lower, upper)
-            }
-            _ => (None, None),
-        };
 
         let vector_query = VectorQuery {
             column,
             key,
             k,
-            lower_bound,
-            upper_bound,
+            lower_bound: None,
+            upper_bound: None,
             minimum_nprobes,
             maximum_nprobes,
             ef,
