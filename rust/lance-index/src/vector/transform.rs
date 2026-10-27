@@ -322,7 +322,8 @@ mod tests {
     use approx::assert_relative_eq;
     use arrow::buffer::NullBuffer;
     use arrow_array::{
-        FixedSizeListArray, Float16Array, Float32Array, Float64Array, Int32Array, UInt64Array,
+        ArrayRef, FixedSizeListArray, Float16Array, Float32Array, Float64Array, Int32Array,
+        UInt8Array, UInt64Array,
     };
     use arrow_schema::Schema;
     use half::f16;
@@ -386,6 +387,35 @@ mod tests {
         let batch = RecordBatch::try_new(schema.into(), vec![Arc::new(fsl)]).unwrap();
         let out = transformer.transform(&batch).unwrap();
         assert_eq!(out.num_rows(), 1);
+
+        // A null child in a non-null row drops that row, for float and
+        // integer vectors alike.
+        let float_child: ArrayRef = Arc::new(Float32Array::from(vec![
+            Some(1.0),
+            Some(2.0),
+            None,
+            Some(4.0),
+        ]));
+        let int_child: ArrayRef = Arc::new(UInt8Array::from(vec![Some(1), Some(2), None, Some(4)]));
+        for values in [float_child, int_child] {
+            let item = Arc::new(Field::new("item", values.data_type().clone(), true));
+            let fsl = FixedSizeListArray::try_new(item.clone(), 2, values, None).unwrap();
+            let schema = Schema::new(vec![Field::new(
+                "v",
+                DataType::FixedSizeList(item, 2),
+                true,
+            )]);
+            let batch = RecordBatch::try_new(schema.into(), vec![Arc::new(fsl)]).unwrap();
+            let out = transformer.transform(&batch).unwrap();
+            assert_eq!(out.num_rows(), 1, "{:?}", out.schema());
+        }
+
+        // Integer vectors without nulls keep every row.
+        let fsl =
+            FixedSizeListArray::try_new_from_values(UInt8Array::from(vec![1, 2, 3, 4]), 2).unwrap();
+        let schema = Schema::new(vec![Field::new("v", fsl.data_type().clone(), true)]);
+        let batch = RecordBatch::try_new(schema.into(), vec![Arc::new(fsl)]).unwrap();
+        assert_eq!(transformer.transform(&batch).unwrap().num_rows(), 2);
     }
 
     fn train_test_pca() -> Arc<PcaModel> {
