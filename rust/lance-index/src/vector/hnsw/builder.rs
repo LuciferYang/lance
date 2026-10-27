@@ -2473,7 +2473,7 @@ mod tests {
         #[case] total: usize,
     ) {
         const DIM: usize = 32;
-        // Seeded so a recall regression in CI reproduces locally.
+        // Seeded so the data and query are fixed across runs.
         let fsl = FixedSizeListArray::try_new_from_values(
             generate_random_array_with_seed::<Float32Type>(total * DIM, [42; 32]),
             DIM as i32,
@@ -2680,7 +2680,7 @@ mod tests {
     async fn test_acorn_filtered_search() {
         const DIM: usize = 32;
         const TOTAL: usize = 2048;
-        // Seeded so a recall regression in CI reproduces locally.
+        // Seeded so the data and query are fixed across runs.
         let fsl = FixedSizeListArray::try_new_from_values(
             generate_random_array_with_seed::<Float32Type>(TOTAL * DIM, [42; 32]),
             DIM as i32,
