@@ -201,11 +201,15 @@ impl FileFragment {
             .files
             .retain(|file| file.fields.iter().any(|&field| field != TOMBSTONE_FIELD_ID));
 
+        // An index can target a logical parent (such as a geometry) that has no
+        // field ID in the written file, so report every field of the write
+        // schema, as `update_columns` does, for commit to invalidate it.
         Ok(FragmentUpdateColumnsResult {
             fragment,
-            fields_modified: written_fields
-                .iter()
-                .filter_map(|&field| u32::try_from(field).ok())
+            fields_modified: columns
+                .write_schema
+                .fields_pre_order()
+                .filter_map(|field| u32::try_from(field.id).ok())
                 .collect(),
             matched_offsets,
         })
