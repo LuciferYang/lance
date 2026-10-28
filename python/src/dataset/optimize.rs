@@ -554,13 +554,13 @@ impl PyCompaction {
         let opts = parse_compaction_options(options, &config)?;
         let mut new_ds = dataset.ds.as_ref().clone();
         let fut = compact_files(&mut new_ds, opts, None);
-        let result = rt().block_on(None, fut)?;
+        let result = rt().block_on(None, fut);
         // A run that rewrites and repacks commits twice. If the second commit
-        // fails, `new_ds` is at the first, which has landed.
-        if result.is_ok() || new_ds.manifest.version != dataset.ds.manifest.version {
+        // fails or is interrupted, `new_ds` is at the first, which has landed.
+        if new_ds.manifest.version != dataset.ds.manifest.version {
             dataset_ref.borrow_mut().ds = Arc::new(new_ds);
         }
-        let metrics = result.map_err(|err| PyIOError::new_err(err.to_string()))?;
+        let metrics = result?.map_err(|err| PyIOError::new_err(err.to_string()))?;
         Ok(metrics.into())
     }
 
@@ -642,12 +642,12 @@ impl PyCompaction {
             Arc::new(DatasetIndexRemapperOptions::default()),
             &opts,
         );
-        let result = rt().block_on(None, fut)?;
+        let result = rt().block_on(None, fut);
         // See `execute`: the rewrites may have landed even on an error.
-        if result.is_ok() || new_ds.manifest.version != dataset.ds.manifest.version {
+        if new_ds.manifest.version != dataset.ds.manifest.version {
             dataset_ref.borrow_mut().ds = Arc::new(new_ds);
         }
-        let metrics = result.map_err(|err| PyIOError::new_err(err.to_string()))?;
+        let metrics = result?.map_err(|err| PyIOError::new_err(err.to_string()))?;
         Ok(metrics.into())
     }
 }

@@ -238,9 +238,9 @@ def test_commit_leaves_dataset_at_the_rewrite_when_the_repack_fails(tmp_path: Pa
         "rewrite_fragments",
     ]
     results = [task.execute(dataset) for task in plan.tasks]
-    # The update moves a row out of fragment 0, so the repack of fragment 0
-    # retries; the rewrite of fragments 1 and 2 is unaffected.
-    lance.dataset(uri).update({"c": "100"}, where="a = 0")
+    # Dropping c, which the repack of fragment 0 moves, makes the repack
+    # retry; the rewrite of fragments 1 and 2 does not conflict with it.
+    lance.dataset(uri).drop_columns(["c"])
     planned_version = dataset.version
 
     with pytest.raises(OSError, match="Retryable commit conflict"):
@@ -250,8 +250,8 @@ def test_commit_leaves_dataset_at_the_rewrite_when_the_repack_fails(tmp_path: Pa
     assert dataset.version == latest.version > planned_version + 1
     # The rewrite landed and the repack did not.
     fragments = dataset.get_fragments()
-    assert len(fragments) == 3
-    assert [len(f.metadata.files) for f in fragments if f.fragment_id == 0] == [3]
+    assert len(fragments) == 2
+    assert [len(f.metadata.files) for f in fragments if f.fragment_id == 0] == [2]
     assert dataset.to_table() == latest.to_table()
 
 
