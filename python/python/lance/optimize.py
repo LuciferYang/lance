@@ -141,8 +141,9 @@ class CompactionOptions(TypedDict, total=False):
     scope: Optional[Literal["all", "rewrite_fragments", "repack_columns"]]
     """
     Which tasks to plan: ``"rewrite_fragments"`` only rewrites fragments,
-    ``"repack_columns"`` only repacks columns, ``"all"`` does both.
-    (default: "all")
+    ``"repack_columns"`` only repacks columns, ``"all"`` does both. A run that
+    does both repacks only the fragments before the first one it rewrites; the
+    rest are repacked by a later run. (default: "all")
     """
     data_storage_version: Optional[str]
     """

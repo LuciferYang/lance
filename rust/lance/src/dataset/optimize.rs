@@ -360,6 +360,10 @@ pub struct CompactionOptions {
     /// more `column_groups` than the limit allows.
     /// The repack writes each new file whole, with no `max_bytes_per_file`
     /// split. Not planned under `ForceBinaryCopy`, since a repack reencodes.
+    /// A run that also rewrites fragments repacks only the fragments before
+    /// the first one it rewrites, since the rewrite gives the rest new ids;
+    /// they are repacked by a later run, or by one with `scope` set to
+    /// [`CompactionScope::RepackColumns`].
     ///
     /// Defaults to `None` (no file-count trigger). Must be at least 1.
     ///
@@ -393,8 +397,9 @@ pub struct CompactionOptions {
     /// shared file for the columns no group names. A fragment it leaves alone has a
     /// group repacked into a file of its own when no single file holds
     /// exactly that group's columns (see [`CompactionTaskKind::RepackColumns`]),
-    /// unless `scope` is [`CompactionScope::RewriteFragments`]; the columns no
-    /// group names are merged only when the fragment is over
+    /// unless `scope` is [`CompactionScope::RewriteFragments`] or the fragment
+    /// comes after one the run rewrites (see `max_data_files_per_fragment`);
+    /// the columns no group names are merged only when the fragment is over
     /// `max_data_files_per_fragment`. A group holding a blob column is left
     /// as it is. A name that is not a top-level column of the dataset (say,
     /// one dropped or renamed since the groups were configured) is ignored

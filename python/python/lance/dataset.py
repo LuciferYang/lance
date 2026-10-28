@@ -8100,7 +8100,8 @@ class DatasetOptimizer:
         scope: str, optional
             Which tasks to plan: ``"rewrite_fragments"`` only rewrites
             fragments, ``"repack_columns"`` only repacks columns, and
-            ``"all"`` (the default) does both. A run that does both commits
+            ``"all"`` (the default) does both. A run that does both repacks
+            only the fragments before the first one it rewrites, and commits
             two versions; if the second commit fails, the dataset is left at
             the first.
 
