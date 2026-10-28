@@ -557,7 +557,9 @@ impl PyCompaction {
         let result = rt().block_on(None, fut)?;
         // A run that rewrites and repacks commits twice. If the second commit
         // fails, `new_ds` is at the first, which has landed.
-        dataset_ref.borrow_mut().ds = Arc::new(new_ds);
+        if result.is_ok() || new_ds.manifest.version != dataset.ds.manifest.version {
+            dataset_ref.borrow_mut().ds = Arc::new(new_ds);
+        }
         let metrics = result.map_err(|err| PyIOError::new_err(err.to_string()))?;
         Ok(metrics.into())
     }
@@ -642,7 +644,9 @@ impl PyCompaction {
         );
         let result = rt().block_on(None, fut)?;
         // See `execute`: the rewrites may have landed even on an error.
-        dataset_ref.borrow_mut().ds = Arc::new(new_ds);
+        if result.is_ok() || new_ds.manifest.version != dataset.ds.manifest.version {
+            dataset_ref.borrow_mut().ds = Arc::new(new_ds);
+        }
         let metrics = result.map_err(|err| PyIOError::new_err(err.to_string()))?;
         Ok(metrics.into())
     }
