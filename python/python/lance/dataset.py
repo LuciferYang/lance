@@ -7998,7 +7998,8 @@ class DatasetOptimizer:
             Which tasks to plan: ``"rewrite_fragments"`` only rewrites
             fragments, ``"repack_columns"`` only repacks columns, and
             ``"all"`` (the default) does both. A run that does both commits
-            two versions.
+            two versions; if the second commit fails, the dataset is left at
+            the first.
 
         Returns
         -------

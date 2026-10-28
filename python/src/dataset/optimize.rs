@@ -554,10 +554,11 @@ impl PyCompaction {
         let opts = parse_compaction_options(options, &config)?;
         let mut new_ds = dataset.ds.as_ref().clone();
         let fut = compact_files(&mut new_ds, opts, None);
-        let metrics = rt().block_on(None, async move {
-            fut.await.map_err(|err| PyIOError::new_err(err.to_string()))
-        })??;
+        let result = rt().block_on(None, fut)?;
+        // A run that rewrites and repacks commits twice. If the second commit
+        // fails, `new_ds` is at the first, which has landed.
         dataset_ref.borrow_mut().ds = Arc::new(new_ds);
+        let metrics = result.map_err(|err| PyIOError::new_err(err.to_string()))?;
         Ok(metrics.into())
     }
 
@@ -605,7 +606,9 @@ impl PyCompaction {
     /// ----------
     /// dataset : lance.Dataset
     ///     The dataset to compact. The dataset instance will be updated to the
-    ///     new version once committed.
+    ///     new version once committed. Rewrites and repacks commit separately,
+    ///     so after an error it may be at a version the rewrites made; plan
+    ///     again rather than passing the same results back.
     /// rewrites : List[RewriteResult]
     ///     The results of the compaction tasks to include in the commit.
     /// options : dict, optional
@@ -637,10 +640,10 @@ impl PyCompaction {
             Arc::new(DatasetIndexRemapperOptions::default()),
             &opts,
         );
-        let metrics = rt()
-            .block_on(None, fut)?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        let result = rt().block_on(None, fut)?;
+        // See `execute`: the rewrites may have landed even on an error.
         dataset_ref.borrow_mut().ds = Arc::new(new_ds);
+        let metrics = result.map_err(|err| PyIOError::new_err(err.to_string()))?;
         Ok(metrics.into())
     }
 }

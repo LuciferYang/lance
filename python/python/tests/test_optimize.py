@@ -220,6 +220,36 @@ def test_distributed_repack(tmp_path: Path):
     assert dataset.to_table() == expected
 
 
+def test_commit_leaves_dataset_at_the_rewrite_when_the_repack_fails(tmp_path: Path):
+    # Fragment 0 is full and spread over three files, so it is repacked;
+    # fragments 1 and 2 are small, so they are rewritten into one.
+    uri = tmp_path / "dataset"
+    dataset = lance.write_dataset(pa.table({"a": range(8), "b": range(8)}), uri)
+    dataset.insert(
+        pa.table({"a": range(8, 16), "b": range(8, 16)}), max_rows_per_file=4
+    )
+    dataset.add_columns({"c": "a * 2"})
+    dataset.add_columns({"d": "a * 3"})
+    plan = Compaction.plan(
+        dataset, options=dict(target_rows_per_fragment=8, max_data_files_per_fragment=1)
+    )
+    assert sorted(task.kind for task in plan.tasks) == [
+        "repack_columns",
+        "rewrite_fragments",
+    ]
+    results = [task.execute(dataset) for task in plan.tasks]
+    # A new value of a column the repack moves makes only the repack retry.
+    lance.dataset(uri).update({"c": "100"}, where="a = 0")
+    planned_version = dataset.version
+
+    with pytest.raises(OSError, match="Retryable commit conflict"):
+        Compaction.commit(dataset, results)
+
+    latest = lance.dataset(uri)
+    assert dataset.version == latest.version > planned_version + 1
+    assert dataset.to_table() == latest.to_table()
+
+
 @pytest.mark.parametrize(
     "config, files",
     [

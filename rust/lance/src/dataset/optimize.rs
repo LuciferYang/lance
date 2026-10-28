@@ -4243,8 +4243,9 @@ async fn records_stable_row_id_moves(
 /// commit as one `Operation::DataReplacement` that moves values without
 /// changing them, so a run with both kinds of task makes two versions. A
 /// fragment in both kinds of task is rejected before either commit. If the second
-/// commit fails, the first stays committed and the error is returned; the
-/// repacks can be planned again.
+/// commit fails, the first stays committed, `dataset` is left at the version it
+/// made, and the error is returned. Plan again rather than passing the same
+/// results back: their rewrites would conflict with the commit that landed.
 ///
 /// With stable row IDs, tasks that recorded their row-address moves (see
 /// [`CompactionOptions::defer_index_remap`]) commit them even if `options` does not
