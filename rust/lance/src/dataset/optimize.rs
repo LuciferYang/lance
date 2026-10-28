@@ -361,9 +361,9 @@ pub struct CompactionOptions {
     /// The repack writes each new file whole, with no `max_bytes_per_file`
     /// split. Not planned under `ForceBinaryCopy`, since a repack reencodes.
     /// A run that also rewrites fragments repacks only the fragments before
-    /// the first one it rewrites, since the rewrite gives the rest new ids;
-    /// they are repacked by a later run, or by one with `scope` set to
-    /// [`CompactionScope::RepackColumns`].
+    /// the first one it rewrites, since the rewrite gives the rest new ids.
+    /// A later run repacks them if it rewrites nothing before them, as one
+    /// with `scope` set to [`CompactionScope::RepackColumns`] never does.
     ///
     /// Defaults to `None` (no file-count trigger). Must be at least 1.
     ///
@@ -1390,8 +1390,8 @@ impl DefaultCompactionPlanner {
     /// [`Dataset::column_layout_stats`] counts them.
     ///
     /// Committing a fragment rewrite gives every later fragment a new id, so
-    /// a repack of one of them would conflict with it; those are repacked by
-    /// a later run.
+    /// a repack of one of them would conflict with it; those are left for a
+    /// later run.
     fn plan_repacks(
         &self,
         dataset: &Dataset,
@@ -1422,15 +1422,14 @@ impl DefaultCompactionPlanner {
             return Ok(Vec::new());
         }
         let stats = dataset.column_layout_stats();
+        let mut deferred = 0_usize;
         let tasks = dataset
             .manifest
             .fragments
             .iter()
             .zip(stats)
             .filter(|(fragment, _)| {
-                first_rewritten.is_none_or(|first| fragment.id < first)
-                    && !u32::try_from(fragment.id)
-                        .is_ok_and(|id| self.excluded_fragment_ids.contains(id))
+                !u32::try_from(fragment.id).is_ok_and(|id| self.excluded_fragment_ids.contains(id))
             })
             .filter_map(|(fragment, stats)| {
                 let files = repack::plan_fragment_repack(
@@ -1440,6 +1439,10 @@ impl DefaultCompactionPlanner {
                     groups.as_deref(),
                     max_files,
                 )?;
+                if first_rewritten.is_some_and(|first| fragment.id >= first) {
+                    deferred += 1;
+                    return None;
+                }
                 let live_rows = fragment.num_rows().unwrap_or_default();
                 Some((
                     TaskData {
@@ -1450,6 +1453,14 @@ impl DefaultCompactionPlanner {
                 ))
             })
             .collect();
+        if let Some(first) = first_rewritten.filter(|_| deferred > 0) {
+            log::info!(
+                "not repacking {deferred} fragment(s) from fragment {first} on: this run \
+                 rewrites fragment {first}, which gives every fragment from it on a new id; a \
+                 run that rewrites nothing before them, such as one with scope RepackColumns, \
+                 repacks them"
+            );
+        }
         Ok(tasks)
     }
 }
@@ -1465,7 +1476,7 @@ impl DefaultCompactionPlanner {
 /// [`CompactionOptions::column_groups`] set, it also repacks the columns of a
 /// fragment spread over too many data files, or laid out other than the
 /// groups ask, into new files without moving its rows. A run that both
-/// rewrites fragments and repacks columns commits two versions (see
+/// rewrites fragments and repacks columns commits the two separately (see
 /// [`commit_compaction`]). [`CompactionOptions::scope`] limits a run to one
 /// kind of task.
 ///
@@ -2663,8 +2674,8 @@ pub enum CompactionTaskKind {
 /// Which kinds of task a compaction plans.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CompactionScope {
-    /// Rewrite the fragments that need it and repack the columns of the
-    /// others.
+    /// Rewrite the fragments that need it, and repack the columns of the
+    /// fragments before the first one rewritten.
     #[default]
     All,
     /// Only rewrite fragments.
@@ -4605,12 +4616,13 @@ async fn records_stable_row_id_moves(
 ///
 /// Fragment rewrites commit as one `Operation::Rewrite`; column repacks then
 /// commit as one `Operation::DataReplacement` that moves values without
-/// changing them, so a run with both kinds of task makes two versions. Since a
-/// rewrite gives every fragment from the first one it takes a new id, a repack
-/// of any of those is rejected before either commit. If the second
-/// commit fails, the first stays committed, `dataset` is left at the version it
-/// made, and the error is returned. Plan again rather than passing the same
-/// results back: their rewrites would conflict with the commit that landed.
+/// changing them, so a run with both kinds of task commits them separately.
+/// Since a rewrite gives every fragment from the first one it takes a new id, a
+/// repack of any of those is rejected before either commit. If the repack
+/// commit fails, the rewrite stays committed, `dataset` is left at the
+/// rewrite's version, and the error is returned. Plan again rather than passing
+/// the same results back: their rewrites would conflict with the commit that
+/// landed.
 ///
 /// Completed tasks are ordered by their source positions. Partial and gapped
 /// result sets also relabel the untouched trailing fragments so replacement IDs

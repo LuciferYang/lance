@@ -473,8 +473,10 @@ public class CompactionOptions implements Serializable {
     /**
      * Maximum number of data files a fragment may hold columns in before its columns are repacked
      * into fewer files. Each {@code addColumns} backfill adds one file per fragment. A repack
-     * rewrites only the columns that move and keeps rows, fragment ids and indices as they are.
-     * Unset means no file-count trigger.
+     * rewrites only the columns that move and keeps rows, fragment ids and indices as they are. A
+     * run that also rewrites fragments repacks only the fragments before the first one it rewrites;
+     * the rest are left for a later run that rewrites nothing before them. Unset means no
+     * file-count trigger.
      *
      * @throws IllegalArgumentException if {@code maxDataFilesPerFragment} is not positive
      */
@@ -487,9 +489,9 @@ public class CompactionOptions implements Serializable {
     /**
      * Top-level columns to keep in their own data files. Each inner list becomes one data file per
      * fragment; the columns no group names share one file. Fragments the compaction rewrites are
-     * written this way, and the others have their columns repacked to match. Names that are not
-     * top-level columns are ignored. An empty list keeps the {@code lance.compaction.column_groups}
-     * table config, if any.
+     * written this way, and the ones before the first rewritten fragment have their columns
+     * repacked to match. Names that are not top-level columns are ignored. An empty list keeps the
+     * {@code lance.compaction.column_groups} table config, if any.
      */
     public Builder withColumnGroups(List<List<String>> columnGroups) {
       this.columnGroups = copyGroups(Objects.requireNonNull(columnGroups, "columnGroups"));

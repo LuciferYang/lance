@@ -555,8 +555,9 @@ impl PyCompaction {
         let mut new_ds = dataset.ds.as_ref().clone();
         let fut = compact_files(&mut new_ds, opts, None);
         let result = rt().block_on(None, fut);
-        // A run that rewrites and repacks commits twice. If the second commit
-        // fails or is interrupted, `new_ds` is at the first, which has landed.
+        // A run that rewrites and repacks commits them separately. If the
+        // repack commit fails or is interrupted, `new_ds` is at the rewrite's
+        // version, which has landed.
         if new_ds.manifest.version != dataset.ds.manifest.version {
             dataset_ref.borrow_mut().ds = Arc::new(new_ds);
         }

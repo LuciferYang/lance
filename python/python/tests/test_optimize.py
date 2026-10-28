@@ -239,7 +239,8 @@ def test_commit_leaves_dataset_at_the_rewrite_when_the_repack_fails(tmp_path: Pa
     ]
     results = [task.execute(dataset) for task in plan.tasks]
     # Dropping c, which the repack of fragment 0 moves, makes the repack
-    # retry; the rewrite of fragments 1 and 2 does not conflict with it.
+    # commit fail with a retryable conflict; the rewrite of fragments 1 and 2
+    # does not conflict with the drop.
     lance.dataset(uri).drop_columns(["c"])
     planned_version = dataset.version
 

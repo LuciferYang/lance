@@ -143,7 +143,8 @@ class CompactionOptions(TypedDict, total=False):
     Which tasks to plan: ``"rewrite_fragments"`` only rewrites fragments,
     ``"repack_columns"`` only repacks columns, ``"all"`` does both. A run that
     does both repacks only the fragments before the first one it rewrites; the
-    rest are repacked by a later run. (default: "all")
+    rest are left for a later run that rewrites nothing before them, such as
+    one with scope ``"repack_columns"``. (default: "all")
     """
     data_storage_version: Optional[str]
     """

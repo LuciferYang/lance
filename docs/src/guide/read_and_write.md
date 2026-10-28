@@ -536,7 +536,10 @@ as table config:
   own. Fragments that compaction rewrites are written this way too.
 
 `scope` limits a run to one kind of work: `"rewrite_fragments"`,
-`"repack_columns"`, or `"all"` (the default).
+`"repack_columns"`, or `"all"` (the default). A rewrite gives every fragment
+from the first one it rewrites a new id, so a run that does both repacks only
+the fragments before that one; a run with `scope="repack_columns"` reaches the
+rest.
 
 ```python
 dataset.optimize.compact_files(max_data_files_per_fragment=2)
