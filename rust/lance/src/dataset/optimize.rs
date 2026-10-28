@@ -1078,26 +1078,32 @@ impl CompactionPlanner for DefaultCompactionPlanner {
         };
         let mut deferred_repacks = None;
         if self.options.scope != CompactionScope::RewriteFragments {
-            let rewritten: HashSet<u64> = all_tasks
+            let first_rewritten = all_tasks
                 .iter()
                 .flat_map(|(task, _)| task.fragments.iter().map(|fragment| fragment.id))
-                .collect();
-            let (repacks, deferred) = self.plan_repacks(dataset, &rewritten)?;
+                .min();
+            let (repacks, deferred) = self.plan_repacks(dataset, first_rewritten)?;
             all_tasks.extend(repacks);
-            deferred_repacks = rewritten.iter().min().copied().zip(Some(deferred));
+            deferred_repacks = first_rewritten.zip(Some(deferred));
         }
 
         let tasks = limit_tasks_to_source_budget(&self.options, dataset.schema(), all_tasks)?;
-        if let Some((first, deferred)) = deferred_repacks.filter(|(_, deferred)| *deferred > 0)
-            && tasks
+        if let Some((first, deferred)) = deferred_repacks {
+            // Counted against the tasks the budget kept: a fragment whose
+            // rewrite was cut is left unrepacked too.
+            let kept: HashSet<u64> = tasks
                 .iter()
-                .any(|task| task.fragments.iter().any(|fragment| fragment.id == first))
-        {
-            log::info!(
-                "not repacking {deferred} fragment(s) after fragment {first}: this run rewrites \
-                 fragment {first}, which gives every fragment from it on a new id; a run that \
-                 rewrites nothing before them, such as one with scope RepackColumns, repacks them"
-            );
+                .flat_map(|task| task.fragments.iter().map(|fragment| fragment.id))
+                .collect();
+            let left = deferred.iter().filter(|id| !kept.contains(id)).count();
+            if kept.contains(&first) && left > 0 {
+                log::info!(
+                    "not repacking {left} fragment(s) after fragment {first}: this run \
+                     rewrites fragment {first}, which gives every fragment from it on a new \
+                     id; a run that rewrites nothing before them, such as one with scope \
+                     RepackColumns, repacks them"
+                );
+            }
         }
 
         let mut options = self.options.clone();
@@ -1109,6 +1115,9 @@ impl CompactionPlanner for DefaultCompactionPlanner {
         Ok(compaction_plan)
     }
 }
+
+/// A planned task with its live row count.
+type PlannedTask = (TaskData, usize);
 
 impl DefaultCompactionPlanner {
     /// The tasks that rewrite fragments, each with its live row count.
@@ -1397,11 +1406,11 @@ impl DefaultCompactionPlanner {
         Ok(all_tasks)
     }
 
-    /// The tasks that repack the columns of a fragment before the first one
-    /// in `rewritten`, each with its live row count, and how many fragments
-    /// after it would have been repacked. A fragment is repacked when its
-    /// files do not match `column_groups`, or when it holds columns in more
-    /// than `max_data_files_per_fragment` files, as
+    /// The tasks that repack the columns of a fragment before
+    /// `first_rewritten`, each with its live row count, and the ids of the
+    /// fragments from it on that would otherwise be repacked. A fragment is
+    /// repacked when its files do not match `column_groups`, or when it holds
+    /// columns in more than `max_data_files_per_fragment` files, as
     /// [`Dataset::column_layout_stats`] counts them.
     ///
     /// Committing a fragment rewrite gives every later fragment a new id, so
@@ -1410,8 +1419,8 @@ impl DefaultCompactionPlanner {
     fn plan_repacks(
         &self,
         dataset: &Dataset,
-        rewritten: &HashSet<u64>,
-    ) -> Result<(Vec<(TaskData, usize)>, usize)> {
+        first_rewritten: Option<u64>,
+    ) -> Result<(Vec<PlannedTask>, Vec<u64>)> {
         let groups = if self.options.column_groups.is_empty() {
             None
         } else {
@@ -1422,7 +1431,7 @@ impl DefaultCompactionPlanner {
         };
         let max_files = self.options.max_data_files_per_fragment;
         if groups.is_none() && max_files.is_none() {
-            return Ok((Vec::new(), 0));
+            return Ok((Vec::new(), Vec::new()));
         }
         // A repack reencodes the columns it moves. `validate()` already
         // rejects `column_groups` with ForceBinaryCopy.
@@ -1434,20 +1443,17 @@ impl DefaultCompactionPlanner {
                 "not planning column repacks: compaction_mode=ForceBinaryCopy does not \
                  reencode, and a repack does"
             );
-            return Ok((Vec::new(), 0));
+            return Ok((Vec::new(), Vec::new()));
         }
-        let first_rewritten = rewritten.iter().min().copied();
         let stats = dataset.column_layout_stats();
-        let mut deferred = 0_usize;
+        let mut deferred = Vec::new();
         let tasks = dataset
             .manifest
             .fragments
             .iter()
             .zip(stats)
             .filter(|(fragment, _)| {
-                !rewritten.contains(&fragment.id)
-                    && !u32::try_from(fragment.id)
-                        .is_ok_and(|id| self.excluded_fragment_ids.contains(id))
+                !u32::try_from(fragment.id).is_ok_and(|id| self.excluded_fragment_ids.contains(id))
             })
             .filter_map(|(fragment, stats)| {
                 let files = repack::plan_fragment_repack(
@@ -1458,7 +1464,7 @@ impl DefaultCompactionPlanner {
                     max_files,
                 )?;
                 if first_rewritten.is_some_and(|first| fragment.id >= first) {
-                    deferred += 1;
+                    deferred.push(fragment.id);
                     return None;
                 }
                 let live_rows = fragment.num_rows().unwrap_or_default();
