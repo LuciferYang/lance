@@ -5575,14 +5575,21 @@ mod tests {
         let before = fixture.count_files().await.unwrap();
 
         // Every attached version is older than the policy's cutoff.
-        let operation = detached.cleanup(
-            CleanupPolicyBuilder::default()
-                .before_timestamp(utc_now() + TimeDelta::days(1))
-                .build(),
-        );
+        let policy = CleanupPolicyBuilder::default()
+            .before_timestamp(utc_now() + TimeDelta::days(1))
+            .build();
+        let operation = detached.cleanup(policy.clone());
         for error in [
             operation.explain().await.unwrap_err(),
             operation.execute().await.unwrap_err(),
+            detached
+                .cleanup_with_policy(policy.clone())
+                .await
+                .unwrap_err(),
+            detached
+                .cleanup_old_versions(TimeDelta::zero(), None, None)
+                .await
+                .unwrap_err(),
         ] {
             assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
             assert_contains!(error.to_string(), "detached version");
