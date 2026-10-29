@@ -39,8 +39,8 @@ use lance_io::utils::{
 };
 use lance_namespace::LanceNamespace;
 use lance_table::format::{
-    DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, MAGIC, Manifest,
-    ManifestBuildConfig, RowIdMeta, pb, populate_manifest_schema_dictionaries,
+    ClusteringDefinition, DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata,
+    MAGIC, Manifest, ManifestBuildConfig, RowIdMeta, pb, populate_manifest_schema_dictionaries,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation, ManifestNamingScheme,
@@ -153,8 +153,8 @@ use lance_core::box_error;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_namespace::models::{DeclareTableRequest, DescribeTableRequest};
 use lance_table::feature_flags::{
-    apply_feature_flags, ensure_can_read_manifest, ensure_can_write_manifest,
-    validate_non_reusable_field_id_flags, validate_paired_feature_flags,
+    apply_feature_flags, apply_index_object_metadata_flag, ensure_can_read_manifest,
+    ensure_can_write_manifest, validate_non_reusable_field_id_flags, validate_paired_feature_flags,
 };
 use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
@@ -784,6 +784,35 @@ impl Dataset {
             _ => e,
         })?;
 
+        let manifest_size = object_reader.size().await.map_err(|err| match err {
+            object_store::Error::NotFound { path, source } => {
+                Error::dataset_not_found(path, source)
+            }
+            _ => Error::io(format!(
+                "failed to read manifest {}: {}",
+                manifest_location.path, err
+            )),
+        })?;
+        if manifest_size < 16 {
+            if manifest_location.size.is_some() {
+                let manifest_location = ManifestLocation {
+                    size: None,
+                    ..manifest_location.clone()
+                };
+                return Box::pin(Self::load_manifest(
+                    object_store,
+                    &manifest_location,
+                    uri,
+                    session,
+                ))
+                .await;
+            }
+            return Err(Error::corrupt_file(
+                manifest_location.path.clone(),
+                format!("Invalid format: manifest is only {manifest_size} bytes (minimum 16)"),
+            ));
+        }
+
         let last_block =
             read_last_block(object_reader.as_ref())
                 .await
@@ -791,7 +820,10 @@ impl Dataset {
                     object_store::Error::NotFound { path, source } => {
                         Error::dataset_not_found(path, source)
                     }
-                    _ => Error::io_source(err.into()),
+                    _ => Error::io(format!(
+                        "failed to read manifest {}: {}",
+                        manifest_location.path, err
+                    )),
                 })?;
 
         // A stale cached size yields a bogus footer offset. Detect it (the block
@@ -1219,6 +1251,14 @@ impl Dataset {
     /// Get the fully qualified URI of this dataset.
     pub fn uri(&self) -> &str {
         &self.uri
+    }
+
+    /// The commit handler this dataset commits through. Lets a caller wrap it
+    /// for one commit via [`CommitBuilder::with_commit_handler`], for example
+    /// to fence that commit to an exact version, without reopening the
+    /// dataset or knowing how the handler was chosen.
+    pub fn commit_handler(&self) -> Arc<dyn CommitHandler> {
+        self.commit_handler.clone()
     }
 
     pub fn branch_location(&self) -> BranchLocation {
@@ -1940,6 +1980,34 @@ impl Dataset {
         column: impl AsRef<str>,
     ) -> Result<Vec<Option<BlobFile>>> {
         blob::take_blobs_by_addresses(self, row_addrs, column.as_ref()).await
+    }
+
+    /// Scan every row of this dataset with its blob v2 columns as values another
+    /// dataset can be written from: the payload bytes of every blob this dataset
+    /// stores, and an External blob's absolute URI and byte range, at any depth.
+    ///
+    /// Each batch holds the payloads of its blobs in memory.
+    pub async fn scan_blobs_as_logical(self: &Arc<Self>) -> Result<DatasetRecordBatchStream> {
+        let mut scan = self.scan();
+        scan.with_row_address();
+        let batches = scan.try_into_stream().await?;
+        let plan = Arc::new(optimize::BlobV2BatchRewritePlan::try_new(
+            self.schema(),
+            lance_io::stream::RecordBatchStream::schema(&batches).as_ref(),
+            false,
+            false,
+        )?);
+        let schema = plan.output_schema().clone();
+        let dataset = self.clone();
+        let batches = batches
+            .and_then(move |batch| {
+                let (plan, dataset) = (plan.clone(), dataset.clone());
+                async move { plan.transform_batch(&dataset, batch).await }
+            })
+            .map_err(|err| datafusion::error::DataFusionError::External(Box::new(err)));
+        Ok(DatasetRecordBatchStream::new(Box::pin(
+            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, batches),
+        )))
     }
 
     /// Take [BlobFile] by row indices (offsets in the dataset).
@@ -3817,6 +3885,8 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
     // the ones in between). On non-lexically-ordered stores this uses the version
     // hint to avoid an O(n) listing.
     let io_parallelism = dataset.object_store.as_ref().io_parallelism();
+    // Both stages must poll their input even when the store permits only one I/O.
+    let stage_parallelism = (io_parallelism / 2).max(1);
     let locations = dataset.commit_handler.list_manifest_locations_since(
         &dataset.base,
         dataset.object_store.as_ref(),
@@ -3847,7 +3917,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                 Ok((manifest, location))
             }
         })
-        .try_buffer_unordered(io_parallelism / 2);
+        .try_buffer_unordered(stage_parallelism);
     let transactions = manifests
         .map_ok(move |(manifest, location)| async move {
             let manifest_copy = manifest.clone();
@@ -3885,7 +3955,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                 };
             Ok((manifest.version, transaction))
         })
-        .try_buffer_unordered(io_parallelism / 2);
+        .try_buffer_unordered(stage_parallelism);
 
     let dataset = async move {
         if let Ok((latest_manifest, location)) = latest_rx.await {
@@ -4368,6 +4438,9 @@ pub(crate) struct ManifestWriteConfig {
     /// `cleanup_frag_reuse_index` against the current manifest entry; see
     /// `ManifestBuildConfig::tagged_frag_reuse_trim`.
     tagged_frag_reuse_trim: bool, // default false
+    /// The writer's complete desired clustering definitions list for an
+    /// `UpdateConfig` commit; see `ManifestBuildConfig::clustering_definitions`.
+    clustering_definitions: Option<Vec<ClusteringDefinition>>, // default None
 }
 
 impl Default for ManifestWriteConfig {
@@ -4382,6 +4455,7 @@ impl Default for ManifestWriteConfig {
             migration_next_row_id: None,
             activate_non_reusable_field_ids: false,
             tagged_frag_reuse_trim: false,
+            clustering_definitions: None,
         }
     }
 }
@@ -4414,6 +4488,22 @@ impl ManifestWriteConfig {
     ///
     /// The timestamp is resolved here rather than during the build so it goes
     /// through this crate's mockable `SystemTime`.
+    pub(crate) fn has_clustering_definitions(&self) -> bool {
+        self.clustering_definitions.is_some()
+    }
+
+    /// Whether the definitions list names an id the read manifest does not
+    /// hold, i.e. the commit allocates. One pass over each list; the
+    /// allocation itself is validated by the manifest build.
+    pub(crate) fn allocates_clustering_definitions(&self, read: &Manifest) -> bool {
+        self.clustering_definitions.as_ref().is_some_and(|desired| {
+            let current: HashSet<u32> = read.clustering.iter().map(|c| c.id).collect();
+            desired
+                .iter()
+                .any(|definition| !current.contains(&definition.id))
+        })
+    }
+
     pub(crate) fn to_build_config(&self) -> ManifestBuildConfig {
         ManifestBuildConfig {
             auto_set_feature_flags: self.auto_set_feature_flags,
@@ -4424,6 +4514,7 @@ impl ManifestWriteConfig {
             disable_transaction_file: self.disable_transaction_file,
             migration_next_row_id: self.migration_next_row_id,
             activate_non_reusable_field_ids: self.activate_non_reusable_field_ids,
+            clustering_definitions: self.clustering_definitions.clone(),
             spilled_row_lineage: Default::default(),
         }
     }
@@ -4516,6 +4607,10 @@ pub(crate) async fn write_manifest_file(
             manifest,
             indices.as_deref().unwrap_or_default(),
         );
+        // Here as well as in `build_manifest`: the clone and restore paths reach
+        // this write with their index section but without a build, and a clone
+        // starts from a masked writer word.
+        apply_index_object_metadata_flag(manifest, indices.as_deref().unwrap_or_default());
     }
     // After the flag reset, so it judges the flags being published. Here rather
     // than in `build_manifest`, which restore and clone bypass.
