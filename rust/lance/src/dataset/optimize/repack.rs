@@ -173,10 +173,10 @@ pub(super) fn plan_fragment_repack(
         files = dropped;
     };
 
-    let (all, all_after) = merge(candidates)?;
+    let (all, _) = merge(candidates)?;
     let holding = file_columns.iter().filter(|c| !c.is_empty()).count();
-    let (merged, _) = if all.len() < holding || max_files == 1 {
-        (all, all_after)
+    let merged = if all.len() < holding || max_files == 1 {
+        all
     } else {
         let mut by_size = all.clone();
         by_size.sort_by_key(|index| {
@@ -186,27 +186,37 @@ pub(super) fn plan_fragment_repack(
             ))
         });
         let largest = by_size[0];
+        // No proposal leaves fewer live files: the new file, the file kept,
+        // and each file holding a column outside `all`, which no merge moves.
+        let floor = holding - all.len() + 2;
         // For each file kept: merge the files sharing no column with it,
         // which leaves its data in place, or every other file as long as the
         // kept file keeps a column.
-        by_size
-            .iter()
-            .flat_map(|kept| {
-                let untouched = all
-                    .iter()
-                    .copied()
-                    .filter(|index| file_columns[*index].is_disjoint(&file_columns[*kept]))
-                    .collect();
-                let others = merge(all.iter().copied().filter(|i| i != kept).collect())
-                    .filter(|(files, _)| !file_columns[*kept].is_subset(&columns_of(files)));
-                [merge(untouched), others]
-            })
-            .flatten()
-            .min_by_key(|(files, after)| {
-                let live_after = after.files.iter().filter(|file| is_live(file)).count();
-                (files.contains(&largest), live_after)
-            })
-            .unwrap_or((all, all_after))
+        let proposals = by_size.iter().flat_map(|kept| {
+            let untouched = all
+                .iter()
+                .copied()
+                .filter(|index| file_columns[*index].is_disjoint(&file_columns[*kept]))
+                .collect();
+            let others = merge(all.iter().copied().filter(|i| i != kept).collect())
+                .filter(|(files, _)| !file_columns[*kept].is_subset(&columns_of(files)));
+            [merge(untouched), others].into_iter().flatten()
+        });
+        let mut best: Option<((bool, usize), Vec<usize>)> = None;
+        for (files, after) in proposals {
+            let live_after = after.files.iter().filter(|file| is_live(file)).count();
+            let score = (files.contains(&largest), live_after);
+            if best
+                .as_ref()
+                .is_none_or(|(best_score, _)| score < *best_score)
+            {
+                best = Some((score, files));
+            }
+            if score == (false, floor) {
+                break;
+            }
+        }
+        best.map_or(all, |(_, files)| files)
     };
     Some(vec![columns_of(&merged).into_iter().collect()])
 }
@@ -265,21 +275,22 @@ pub(super) async fn execute_repack(
             Ok(Some(file)) => written.push(file),
             Ok(None) => {}
             Err(err) => {
-                let partial = Fragment {
-                    files: written,
-                    ..Fragment::new(fragment.id)
-                };
-                cleanup_data_fragments(&dataset.object_store, &dataset.base, None, &[partial])
-                    .await;
+                discard(dataset, fragment.id, written).await;
                 return Err(err);
             }
         }
     }
 
+    let after = match fragment.replace_files(schema, &written) {
+        Ok(after) => after,
+        Err(err) => {
+            discard(dataset, fragment.id, written).await;
+            return Err(err);
+        }
+    };
     let metrics = CompactionMetrics {
         files_added: written.len(),
-        files_removed: fragment.files.len() + written.len()
-            - fragment.replace_files(schema, &written)?.files.len(),
+        files_removed: fragment.files.len() + written.len() - after.files.len(),
         ..Default::default()
     };
     Ok(RewriteResult {
@@ -293,6 +304,16 @@ pub(super) async fn execute_repack(
             files: written,
         }),
     })
+}
+
+/// Delete the files a repack task of fragment `fragment_id` wrote before it
+/// failed.
+async fn discard(dataset: &Dataset, fragment_id: u64, files: Vec<DataFile>) {
+    let partial = Fragment {
+        files,
+        ..Fragment::new(fragment_id)
+    };
+    cleanup_data_fragments(&dataset.object_store, &dataset.base, None, &[partial]).await;
 }
 
 /// Write `columns` of `source` to one new data file. `None` when the

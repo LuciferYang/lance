@@ -424,6 +424,51 @@ async fn repack_task_refuses_output_properties(
     assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
 }
 
+/// A hand-built task moving a column the fragment has no data for next to
+/// one it has makes no change the commit would accept, so it fails after
+/// writing and deletes what it wrote.
+#[tokio::test]
+async fn repack_task_deletes_its_files_when_the_layout_is_refused() {
+    let test_dir = TempStrDir::default();
+    let mut dataset = write(&test_dir, LanceFileVersion::V2_0).await;
+    dataset
+        .add_columns(
+            NewColumnTransform::SqlExpressions(vec![("d".into(), "a + 1".into())]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    // n = 4 has no data file.
+    dataset
+        .add_columns(
+            NewColumnTransform::AllNulls(Arc::new(Schema::new(vec![Field::new(
+                "n",
+                DataType::Int32,
+                true,
+            )]))),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let data_files = || {
+        std::fs::read_dir(format!("{test_dir}/data"))
+            .unwrap()
+            .count()
+    };
+    let before = data_files();
+
+    let task = CompactionTask {
+        task: TaskData::repack_columns(dataset.manifest.fragments[0].clone(), vec![vec![3, 4]]),
+        read_version: dataset.manifest.version,
+        options: repack_options(Some(1)),
+    };
+    let err = task.execute(&dataset).await.unwrap_err();
+    assert!(err.to_string().contains("no changes were made"), "{err}");
+    assert_eq!(data_files(), before);
+}
+
 /// Run a repack of every fragment to the point of commit.
 async fn stale_repack_results(
     dataset: &Dataset,
