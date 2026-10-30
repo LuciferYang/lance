@@ -274,8 +274,8 @@ async fn repack_drops_file_left_with_only_dropped_columns() {
 #[tokio::test]
 async fn compaction_rewrites_and_repacks_in_one_run() {
     let mut dataset = write_backfilled().await;
-    // Fragment 1 qualifies for a rewrite, fragment 0 only for a repack.
-    dataset.delete("a = 4 OR a = 5").await.unwrap();
+    // Fragment 0 qualifies for a rewrite, fragment 1 only for a repack.
+    dataset.delete("a = 0 OR a = 1").await.unwrap();
     let before = dataset.scan().try_into_batch().await.unwrap();
     let version = dataset.manifest.version;
 
@@ -287,12 +287,12 @@ async fn compaction_rewrites_and_repacks_in_one_run() {
     let plan = plan_compaction(&dataset, &options).await.unwrap();
     assert_eq!(plan.tasks.len(), 2, "{plan:?}");
     assert_eq!(plan.tasks[0].kind, CompactionTaskKind::RewriteFragments);
-    assert_eq!(plan.tasks[0].fragments[0].id, 1);
+    assert_eq!(plan.tasks[0].fragments[0].id, 0);
     assert!(matches!(
         plan.tasks[1].kind,
         CompactionTaskKind::RepackColumns { .. }
     ));
-    assert_eq!(plan.tasks[1].fragments[0].id, 0);
+    assert_eq!(plan.tasks[1].fragments[0].id, 1);
 
     let metrics = compact_files(&mut dataset, options, None).await.unwrap();
     let last = dataset.manifest.version;
@@ -311,42 +311,15 @@ async fn compaction_rewrites_and_repacks_in_one_run() {
     assert_eq!(metrics.fragments_removed, 1);
     assert_eq!(metrics.fragments_added, 1);
     assert_eq!(live_file_counts(&dataset), vec![1, 1]);
-    assert_eq!(dataset.manifest.fragments[0].id, 0);
-    assert_eq!(dataset.scan().try_into_batch().await.unwrap(), before);
-    dataset.validate().await.unwrap();
-}
-
-/// A rewrite gives every fragment from the first one it takes a new id, so a
-/// fragment after it is left for the next run to repack.
-#[tokio::test]
-async fn repack_after_a_rewritten_fragment_waits_for_the_next_run() {
-    let mut dataset = write_backfilled().await;
-    // Fragment 0 qualifies for a rewrite; fragment 1 is over the file limit.
-    dataset.delete("a = 0 OR a = 1").await.unwrap();
-    let before = dataset.scan().try_into_batch().await.unwrap();
-    let options = CompactionOptions {
-        target_rows_per_fragment: 3,
-        max_data_files_per_fragment: Some(1),
-        ..Default::default()
-    };
-
-    let plan = plan_compaction(&dataset, &options).await.unwrap();
-    assert_eq!(plan.tasks.len(), 1, "{plan:?}");
-    assert_eq!(plan.tasks[0].kind, CompactionTaskKind::RewriteFragments);
-    compact_files(&mut dataset, options.clone(), None)
-        .await
-        .unwrap();
-    assert_eq!(live_file_counts(&dataset), vec![1, 3]);
-
-    let plan = plan_compaction(&dataset, &options).await.unwrap();
-    assert_eq!(plan.tasks.len(), 1, "{plan:?}");
-    assert!(matches!(
-        plan.tasks[0].kind,
-        CompactionTaskKind::RepackColumns { .. }
-    ));
-    compact_files(&mut dataset, options, None).await.unwrap();
-    assert_eq!(live_file_counts(&dataset), vec![1, 1]);
-    assert_eq!(dataset.scan().try_into_batch().await.unwrap(), before);
+    // The rewritten fragment gets a new id, so it now scans last; the repack
+    // changes no value.
+    let rewritten = dataset.checkout_version(last - 1).await.unwrap();
+    let after_rewrite = rewritten.scan().try_into_batch().await.unwrap();
+    assert_eq!(after_rewrite.num_rows(), before.num_rows());
+    assert_eq!(
+        dataset.scan().try_into_batch().await.unwrap(),
+        after_rewrite
+    );
     dataset.validate().await.unwrap();
 }
 
@@ -1114,26 +1087,12 @@ async fn repack_counts_only_the_files_it_reads_against_the_byte_budget() {
     assert_eq!(plan.tasks.len(), 2, "{plan:?}");
 }
 
-/// A repack of a fragment the rewrite gives a new id is refused before either
-/// commit: the fragment itself, or one after it.
-#[rstest]
-#[case::same_fragment(0)]
-#[case::later_fragment(1)]
+/// A fragment both rewritten and repacked is refused before either commit.
 #[tokio::test]
-async fn commit_rejects_a_repack_the_rewrite_would_relabel(#[case] repacked: u64) {
+async fn commit_rejects_a_fragment_in_both_kinds_of_task() {
     let mut dataset = write_backfilled().await;
     let version = dataset.manifest.version;
-    let repacks: Vec<_> = stale_repack_results(&dataset, &repack_options(Some(1), vec![]))
-        .await
-        .into_iter()
-        .filter(|result| {
-            result
-                .repacked_files
-                .as_ref()
-                .is_some_and(|files| files.fragment_id == repacked)
-        })
-        .collect();
-    assert_eq!(repacks.len(), 1);
+    let repacks = stale_repack_results(&dataset, &repack_options(Some(1), vec![])).await;
     let rewrite = CompactionTask {
         task: TaskData::rewrite_fragments(vec![dataset.manifest.fragments[0].clone()]),
         read_version: version,

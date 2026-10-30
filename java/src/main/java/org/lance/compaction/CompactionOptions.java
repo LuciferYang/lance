@@ -401,9 +401,9 @@ public class CompactionOptions implements Serializable {
     }
 
     /**
-     * Maximum number of fragments whose identities may change in a single run. This includes
-     * compacted source fragments and following fragments relabeled to preserve row order. The
-     * planner selects candidates from a suffix within this limit.
+     * Maximum number of source fragments to compact in a single run. Tasks are included until
+     * adding the next task would exceed this limit, allowing for incremental compaction. Fragments
+     * are processed oldest first.
      *
      * @throws IllegalArgumentException if {@code maxSourceFragments} is not positive
      */
@@ -451,9 +451,8 @@ public class CompactionOptions implements Serializable {
 
     /**
      * Fragment IDs to exclude from compaction planning. Excluded fragments remain unchanged and act
-     * as boundaries, so fragments on opposite sides are not combined into the same task. To
-     * preserve row order, only candidates after the last present excluded fragment are eligible.
-     * Duplicate and unknown IDs are ignored.
+     * as boundaries, so fragments on opposite sides are not combined into the same task. Duplicate
+     * and unknown IDs are ignored.
      *
      * @throws IllegalArgumentException if an ID is negative or exceeds the unsigned 32-bit range
      */
@@ -473,10 +472,8 @@ public class CompactionOptions implements Serializable {
     /**
      * Maximum number of data files a fragment may hold columns in before its columns are repacked
      * into fewer files. Each {@code addColumns} backfill adds one file per fragment. A repack
-     * rewrites only the columns that move and keeps rows, fragment ids and indices as they are. A
-     * run that also rewrites fragments repacks only the fragments before the first one it rewrites;
-     * the rest are left for a later run that rewrites nothing before them. Unset means no
-     * file-count trigger.
+     * rewrites only the columns that move and keeps rows, fragment ids and indices as they are.
+     * Unset means no file-count trigger.
      *
      * @throws IllegalArgumentException if {@code maxDataFilesPerFragment} is not positive
      */
@@ -489,9 +486,9 @@ public class CompactionOptions implements Serializable {
     /**
      * Top-level columns to keep in their own data files. Each inner list becomes one data file per
      * fragment; the columns no group names share one file. Fragments the compaction rewrites are
-     * written this way, and the ones before the first rewritten fragment have their columns
-     * repacked to match. Names that are not top-level columns are ignored. An empty list keeps the
-     * {@code lance.compaction.column_groups} table config, if any.
+     * written this way, and the others have their columns repacked to match. Names that are not
+     * top-level columns are ignored. An empty list keeps the {@code lance.compaction.column_groups}
+     * table config, if any.
      */
     public Builder withColumnGroups(List<List<String>> columnGroups) {
       this.columnGroups = copyGroups(Objects.requireNonNull(columnGroups, "columnGroups"));

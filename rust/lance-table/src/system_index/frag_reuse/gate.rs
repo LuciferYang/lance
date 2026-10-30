@@ -566,6 +566,7 @@ mod tests {
                 field_metadata_updates: HashMap::new(),
             },
             "update_mem_wal_state" => Operation::UpdateMemWalState {
+                dir_id: String::new(),
                 compacted_sstables: vec![],
             },
             "clone" => Operation::Clone {

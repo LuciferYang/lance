@@ -15,10 +15,7 @@ package org.lance.compaction;
 
 /** Which kinds of task a compaction plans. */
 public enum CompactionScope {
-  /**
-   * Rewrite the fragments that need it, and repack the columns of the fragments before the first
-   * one rewritten (default).
-   */
+  /** Rewrite the fragments that need it and repack the columns of the others (default). */
   ALL("all"),
   /** Only rewrite fragments. */
   REWRITE_FRAGMENTS("rewrite_fragments"),
