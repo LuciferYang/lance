@@ -400,6 +400,30 @@ fn rewrite_result_without_repacked_files_is_a_rewrite() {
     assert!(result.repacked_files.is_none());
 }
 
+/// Output properties describe new fragments, and a repack writes none.
+#[rstest]
+#[case::clustering_id(Some(1), HashMap::new())]
+#[case::metadata(None, HashMap::from([("k".to_string(), "v".to_string())]))]
+#[tokio::test]
+async fn repack_task_refuses_output_properties(
+    #[case] clustering_id: Option<u32>,
+    #[case] metadata: HashMap<String, String>,
+) {
+    let dataset = write_backfilled().await;
+    let fragment = dataset.manifest.fragments[0].clone();
+    let task = CompactionTask {
+        task: TaskData {
+            output_clustering_id: clustering_id,
+            output_metadata: metadata,
+            ..TaskData::repack_columns(fragment, vec![vec![3, 4]])
+        },
+        read_version: dataset.manifest.version,
+        options: repack_options(Some(1)),
+    };
+    let err = task.execute(&dataset).await.unwrap_err();
+    assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+}
+
 /// Run a repack of every fragment to the point of commit.
 async fn stale_repack_results(
     dataset: &Dataset,

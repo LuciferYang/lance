@@ -1025,7 +1025,8 @@ impl DefaultCompactionPlanner {
     /// a selected source covered by an index this build cannot read (a member
     /// left alone may be covered). `max_source_fragments`,
     /// `max_source_rows` and `max_source_bytes` bound the selected tasks, in
-    /// group order.
+    /// group order. Only rewrites are planned: `scope` and
+    /// `max_data_files_per_fragment` are not consulted.
     pub async fn plan_groups(
         &self,
         dataset: &Dataset,
@@ -1640,15 +1641,7 @@ impl DefaultCompactionPlanner {
                     max_files,
                 )?;
                 let live_rows = fragment.num_rows().unwrap_or_default();
-                Some((
-                    TaskData {
-                        fragments: vec![fragment.clone()],
-                        kind: CompactionTaskKind::RepackColumns { files },
-                        output_clustering_id: None,
-                        output_metadata: HashMap::new(),
-                    },
-                    live_rows,
-                ))
+                Some((TaskData::repack_columns(fragment.clone(), files), live_rows))
             })
             .collect();
         Ok(tasks)
@@ -2860,7 +2853,8 @@ pub struct TaskData {
     /// The fragments to compact.
     pub fragments: Vec<Fragment>,
     /// What the task does with them. Absent in a task serialized before
-    /// repacking existed, which rewrote its fragments.
+    /// repacking existed, which rewrote its fragments. A worker built before
+    /// then ignores the field and rewrites a repack task's fragment instead.
     #[serde(default)]
     pub kind: CompactionTaskKind,
     /// `Fragment::clustering_id` of every output fragment, chosen by the
@@ -2891,6 +2885,17 @@ impl TaskData {
         Self {
             fragments,
             kind: CompactionTaskKind::RewriteFragments,
+            output_clustering_id: None,
+            output_metadata: HashMap::new(),
+        }
+    }
+
+    /// A task that rewrites the `files` (each the top-level field ids of one
+    /// new file) of `fragment`'s columns without moving its rows.
+    pub fn repack_columns(fragment: Fragment, files: Vec<Vec<i32>>) -> Self {
+        Self {
+            fragments: vec![fragment],
+            kind: CompactionTaskKind::RepackColumns { files },
             output_clustering_id: None,
             output_metadata: HashMap::new(),
         }

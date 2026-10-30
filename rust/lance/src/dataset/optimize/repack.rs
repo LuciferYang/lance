@@ -227,6 +227,12 @@ pub(super) async fn execute_repack(
             task.fragments.len()
         )));
     };
+    if task.output_clustering_id.is_some() || !task.output_metadata.is_empty() {
+        return Err(Error::invalid_input(
+            "a RepackColumns task writes no new fragment, so it takes no output_clustering_id \
+             or output_metadata",
+        ));
+    }
     let write_version = options.write_version(dataset);
     versions::validate_write_version(
         dataset.manifest.data_storage_format.lance_file_format(),
