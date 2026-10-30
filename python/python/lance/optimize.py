@@ -129,14 +129,6 @@ class CompactionOptions(TypedDict, total=False):
     keeps rows, fragment ids and indices as they are. (default: None, no
     file-count trigger)
     """
-    column_groups: Optional[list[list[str]]]
-    """
-    Top-level columns to keep in their own data files. Each inner list becomes
-    one data file per fragment; the columns no group names share one file.
-    Fragments the compaction rewrites are written this way, and the others
-    have their columns repacked to match. Names that are not top-level
-    columns are ignored. (default: None, one file per fragment)
-    """
     scope: Optional[Literal["all", "rewrite_fragments", "repack_columns"]]
     """
     Which tasks to plan: ``"rewrite_fragments"`` only rewrites fragments,

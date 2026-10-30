@@ -480,7 +480,19 @@ async fn test_overlay_matches_respect_physical_row_selection(
 /// the fragment keeps shadowing the base it was written over.
 #[tokio::test]
 async fn repack_columns_preserves_data_overlay() {
-    let dataset = create_base_dataset().await;
+    let mut dataset = create_base_dataset().await;
+    // A backfill gives each fragment a second file, so a limit of 1 repacks.
+    dataset
+        .add_columns(
+            crate::dataset::NewColumnTransform::SqlExpressions(vec![(
+                "ext".into(),
+                "id + 1".into(),
+            )]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
     // Fragment 0, offset 1 is id=1, age=10; the overlay changes its age to 999.
     let mut dataset = commit_overlay(
         dataset,
@@ -493,17 +505,17 @@ async fn repack_columns_preserves_data_overlay() {
     .await;
     assert_eq!(ids_matching(&dataset, "age = 999").await, vec![1]);
 
-    // Move `age`, the overlaid column, into a file of its own. Its values only
+    // Merge both files, `age`, the overlaid column, included. Its values only
     // moved, so the overlay on `age` must survive and keep shadowing the base.
     let options = crate::dataset::optimize::CompactionOptions {
-        column_groups: vec![vec!["age".into()]],
+        max_data_files_per_fragment: Some(1),
         scope: crate::dataset::optimize::CompactionScope::RepackColumns,
         ..Default::default()
     };
     crate::dataset::optimize::compact_files(&mut dataset, options, None)
         .await
         .unwrap();
-    assert_eq!(dataset.get_fragment(0).unwrap().metadata().files.len(), 2);
+    assert_eq!(dataset.get_fragment(0).unwrap().metadata().files.len(), 1);
 
     assert_eq!(
         dataset.get_fragment(0).unwrap().metadata().overlays.len(),

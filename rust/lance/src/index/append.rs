@@ -7195,11 +7195,11 @@ mod tests {
         }
     }
 
-    /// A `column_groups` compaction writes an indexed column's seed into that
-    /// column's group file, which need not be the fragment's first file; the
+    /// A column repack writes an indexed column's seed into the new file it
+    /// moves the column to, which need not be the fragment's first file; the
     /// harvest has to find it there.
     #[tokio::test]
-    async fn test_harvest_seeds_from_column_group_file() {
+    async fn test_harvest_seeds_from_repacked_file() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::Int32, false),
             Field::new("b", DataType::Int32, false),
@@ -7223,15 +7223,29 @@ mod tests {
         )
         .await
         .unwrap();
+        for (name, expr) in [("c", "a + 1"), ("d", "a + 2")] {
+            dataset
+                .add_columns(
+                    crate::dataset::NewColumnTransform::SqlExpressions(vec![(
+                        name.into(),
+                        expr.into(),
+                    )]),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
         let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap)
             .with_params(&serde_json::json!({"use_seeds": true}));
         dataset
-            .create_index(&["a"], IndexType::ZoneMap, None, &params, false)
+            .create_index(&["c"], IndexType::ZoneMap, None, &params, false)
             .await
             .unwrap();
-        // {b} is unclaimed and becomes the first file; {a} is the second.
+        // [a, b] stays first; c and d move into one new file after it.
         let options = CompactionOptions {
-            column_groups: vec![vec!["a".into()]],
+            max_data_files_per_fragment: Some(2),
+            scope: crate::dataset::optimize::CompactionScope::RepackColumns,
             ..Default::default()
         };
         compact_files(&mut dataset, options, None).await.unwrap();
@@ -7241,9 +7255,9 @@ mod tests {
             .iter()
             .map(|fragment| fragment.metadata().clone())
             .collect();
-        let a_id = dataset.schema().field("a").unwrap().id;
+        let c_id = dataset.schema().field("c").unwrap().id;
         assert!(
-            !fragments[0].files[0].fields.contains(&a_id),
+            !fragments[0].files[0].fields.contains(&c_id),
             "the indexed column is not in the first file: {:?}",
             fragments[0].files
         );
@@ -7252,12 +7266,12 @@ mod tests {
             .await
             .unwrap()
             .iter()
-            .find(|index| index.fields == [a_id])
+            .find(|index| index.fields == [c_id])
             .unwrap()
             .clone();
         let seeds = try_harvest_seeds(&dataset, &fragments, &index)
             .await
             .unwrap();
-        assert!(seeds.is_some(), "the seed in the group file is found");
+        assert!(seeds.is_some(), "the seed in the repacked file is found");
     }
 }

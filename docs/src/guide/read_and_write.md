@@ -467,14 +467,10 @@ down scans and random reads. Compaction can repack a fragment's columns into
 fewer data files instead. A repack moves no rows, so fragment ids, row
 addresses, deletions, data overlays and index coverage stay as they are.
 
-Repacking is off by default. Set either option, as a `compact_files` argument or
-as table config:
-
-- `max_data_files_per_fragment` (`lance.compaction.max_data_files_per_fragment`):
-  repack a fragment that holds its columns in more files than this.
-- `column_groups` (`lance.compaction.column_groups`, groups separated by `;` and
-  columns by `,`): keep these top-level columns together in a file of their
-  own. Fragments that compaction rewrites are written this way too.
+Repacking is off by default. Set `max_data_files_per_fragment`, as a
+`compact_files` argument or as the table config key
+`lance.compaction.max_data_files_per_fragment`, to repack a fragment that holds
+its columns in more files than this.
 
 `scope` limits a run to one kind of work: `"rewrite_fragments"`,
 `"repack_columns"`, or `"all"` (the default).
@@ -482,8 +478,8 @@ as table config:
 ```python
 dataset.optimize.compact_files(max_data_files_per_fragment=2)
 
-# Only repack, and keep the embedding in a file of its own.
-dataset.optimize.compact_files(column_groups=[["embedding"]], scope="repack_columns")
+# Only repack.
+dataset.optimize.compact_files(max_data_files_per_fragment=1, scope="repack_columns")
 
 # Per fragment: live data files, file sizes, fields per file, dead field slots.
 dataset.stats.column_layout_stats()

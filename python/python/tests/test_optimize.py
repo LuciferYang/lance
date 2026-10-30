@@ -204,9 +204,9 @@ def test_distributed_repack(tmp_path: Path):
     dataset = _backfilled(tmp_path)
     expected = dataset.to_table()
 
-    # c and d sit in separate files, so the group moves them into one.
+    # c and d sit in separate files, so a limit of 2 merges them.
     plan = Compaction.plan(
-        dataset, options=dict(column_groups=[["c", "d"]], scope="repack_columns")
+        dataset, options=dict(max_data_files_per_fragment=2, scope="repack_columns")
     )
     assert [task.kind for task in plan.tasks] == ["repack_columns"] * 2
     results = [
@@ -260,8 +260,7 @@ def test_commit_leaves_dataset_at_the_rewrite_when_the_repack_fails(tmp_path: Pa
     "config, files",
     [
         ({"lance.compaction.max_data_files_per_fragment": "1"}, [1, 1]),
-        # c and d sit in separate files; the group moves them into one.
-        ({"lance.compaction.column_groups": "c, d"}, [2, 2]),
+        ({"lance.compaction.max_data_files_per_fragment": "2"}, [2, 2]),
     ],
 )
 def test_repack_options_come_from_dataset_config(tmp_path: Path, config, files):
@@ -294,17 +293,6 @@ def test_repack_rejects_bad_options(tmp_path: Path):
     dataset.update_config({"lance.compaction.max_data_files_per_fragment": "lots"})
     with pytest.raises(ValueError, match="expected a positive integer"):
         dataset.optimize.compact_files(scope="repack_columns")
-
-
-def test_compact_files_repacks_column_groups(tmp_path: Path):
-    dataset = _backfilled(tmp_path)
-    expected = dataset.to_table()
-
-    # c and d sit in separate files; the group moves them into one.
-    dataset.optimize.compact_files(column_groups=[["c", "d"]], scope="repack_columns")
-
-    assert _files_per_fragment(dataset) == [2, 2]
-    assert dataset.to_table() == expected
 
 
 def test_repack_keeps_vector_index(tmp_path: Path):

@@ -1002,17 +1002,26 @@ async fn test_merge_insert_inserted_fragments_get_seeds() {
     assert_new_files_seed_physical_rows(&dataset, &before, "val").await;
 }
 
-/// A column repack moving `val` into a file of its own writes that file's
-/// seed from the moved values, deleted rows included.
+/// A column repack moving `val` into a new file writes that file's seed from
+/// the moved values, deleted rows included.
 #[tokio::test]
 async fn test_column_repack_seeds_moved_column() {
     let dir = TempStrDir::default();
     let mut dataset = dataset_with_val_index(dir.as_str(), true).await;
     dataset.delete("id % 3 = 0").await.unwrap();
+    // A backfill gives each fragment a second file, so a limit of 1 repacks.
+    dataset
+        .add_columns(
+            NewColumnTransform::SqlExpressions(vec![("ext".into(), "id + 1".into())]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
     let before = data_file_paths(&dataset);
     let fragment_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
     let options = CompactionOptions {
-        column_groups: vec![vec!["val".into()]],
+        max_data_files_per_fragment: Some(1),
         scope: CompactionScope::RepackColumns,
         ..Default::default()
     };

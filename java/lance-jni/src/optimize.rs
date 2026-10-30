@@ -53,7 +53,6 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativePlanCompaction
     excluded_fragment_ids: JObject,           // List<Long>
     data_storage_version: JObject,            // Optional<String>
     max_data_files_per_fragment: JObject,     // Optional<Long>
-    column_groups: JObject,                   // List<List<String>>
     scope: JObject,                           // Optional<String>
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
@@ -77,7 +76,6 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativePlanCompaction
             excluded_fragment_ids,
             data_storage_version,
             max_data_files_per_fragment,
-            column_groups,
             scope
         ),
         JObject::null()
@@ -104,7 +102,6 @@ fn inner_plan_compaction<'local>(
     excluded_fragment_ids: JObject,           // List<Long>
     data_storage_version: JObject,            // Optional<String>
     max_data_files_per_fragment: JObject,     // Optional<Long>
-    column_groups: JObject,                   // List<List<String>>
     scope: JObject,                           // Optional<String>
 ) -> Result<JObject<'local>> {
     let config = {
@@ -135,7 +132,6 @@ fn inner_plan_compaction<'local>(
         env,
         &mut compaction_options,
         &max_data_files_per_fragment,
-        &column_groups,
         &scope,
     )?;
 
@@ -277,7 +273,6 @@ pub extern "system" fn Java_org_lance_compaction_CompactionTask_nativeExecute<'l
     excluded_fragment_ids: JObject,           // List<Long>
     data_storage_version: JObject,            // Optional<String>
     max_data_files_per_fragment: JObject,     // Optional<Long>
-    column_groups: JObject,                   // List<List<String>>
     scope: JObject,                           // Optional<String>
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
@@ -303,7 +298,6 @@ pub extern "system" fn Java_org_lance_compaction_CompactionTask_nativeExecute<'l
             excluded_fragment_ids,
             data_storage_version,
             max_data_files_per_fragment,
-            column_groups,
             scope
         ),
         JObject::null()
@@ -332,7 +326,6 @@ fn inner_execute_task<'local>(
     excluded_fragment_ids: JObject,           // List<Long>
     data_storage_version: JObject,            // Optional<String>
     max_data_files_per_fragment: JObject,     // Optional<Long>
-    column_groups: JObject,                   // List<List<String>>
     scope: JObject,                           // Optional<String>
 ) -> Result<JObject<'local>> {
     let task_data: TaskData = task_data.extract_object(env)?;
@@ -364,7 +357,6 @@ fn inner_execute_task<'local>(
         env,
         &mut compaction_options,
         &max_data_files_per_fragment,
-        &column_groups,
         &scope,
     )?;
     let compaction_task = CompactionTask {
@@ -391,7 +383,7 @@ const REWRITE_RESULT_CLASS: &str = "org/lance/compaction/RewriteResult";
 const REWRITE_RESULT_CONSTRUCTOR_SIG: &str = "(Lorg/lance/compaction/CompactionMetrics;Ljava/util/List;Ljava/util/List;J[BLjava/lang/Long;Ljava/util/List;)V";
 const COMPACTION_OPTIONS_CLASS: &str = "org/lance/compaction/CompactionOptions";
 const COMPACTION_MODE_CLASS: &str = "org/lance/compaction/CompactionMode";
-const COMPACTION_OPTIONS_CONSTRUCTOR_SIG: &str = "(Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/List;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/List;Ljava/util/Optional;)V";
+const COMPACTION_OPTIONS_CONSTRUCTOR_SIG: &str = "(Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/List;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;)V";
 
 /// The Java `TaskData` carries no output properties, so a task whose outputs
 /// carry a clustering id or metadata cannot cross into Java without losing
@@ -520,15 +512,6 @@ impl IntoJava for &CompactionOptions {
         let max_data_files_per_fragment =
             to_java_long_obj(env, self.max_data_files_per_fragment.map(|v| v as i64))?;
         let max_data_files_per_fragment_opt = to_java_optional(env, max_data_files_per_fragment)?;
-        let mut column_groups = Vec::with_capacity(self.column_groups.len());
-        for group in &self.column_groups {
-            let names = group
-                .iter()
-                .map(|name| Ok(JObject::from(env.new_string(name)?)))
-                .collect::<Result<Vec<_>>>()?;
-            column_groups.push(to_java_list(env, &names)?);
-        }
-        let column_groups = to_java_list(env, &column_groups)?;
         let scope = match self.scope {
             CompactionScope::All => "all",
             CompactionScope::RewriteFragments => "rewrite_fragments",
@@ -557,7 +540,6 @@ impl IntoJava for &CompactionOptions {
                 JValueGen::Object(&excluded_fragment_ids),
                 JValueGen::Object(&data_storage_version_opt),
                 JValueGen::Object(&max_data_files_per_fragment_opt),
-                JValueGen::Object(&column_groups),
                 JValueGen::Object(&scope_opt),
             ],
         )?)

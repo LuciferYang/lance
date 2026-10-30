@@ -2,8 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Column repacking, the compaction task that rewrites some of one fragment's
-//! columns into new data files without moving rows: fewer files, or the files
-//! `column_groups` asks for.
+//! columns into fewer data files without moving rows.
 //!
 //! Every `add_columns` backfill gives each fragment one more data file, and a
 //! large fragment with few deletions never qualifies for a rewrite, so its
@@ -66,17 +65,12 @@ fn file_coverage(file: &DataFile, schema: &Schema) -> HashSet<i32> {
 /// The new files a repack of `fragment` should write, each the top-level
 /// field ids it holds, or `None` when no repack is due.
 ///
-/// `groups` are the column groups, each the top-level field ids to keep in a
-/// file of their own. A group is moved unless one live file holds exactly its
-/// columns; moving it out leaves the other columns where they were. Over
-/// `max_files`, the files holding only columns no group names are merged as
-/// well, under the rule below.
-///
-/// A merge only takes files it empties: files whose columns can all move,
-/// which hold no spilled lineage and share no column with a file holding it,
-/// and whose other fields (a struct header) belong to columns that move too.
-/// The files left keep the columns that do not move. Without groups, when
-/// every file holding a column can be emptied, at least one file stays
+/// A repack is due when the fragment holds columns in more than `max_files`
+/// files. A merge only takes files it empties: files whose columns can all
+/// move, which hold no spilled lineage and share no column with a file holding
+/// it, and whose other fields (a struct header) belong to columns that move
+/// too. The files left keep the columns that do not move. When every file
+/// holding a column can be emptied, at least one file stays
 /// unless `max_files` is 1 or the search below finds no merge. Trying the
 /// files largest first by recorded size, the one kept is the first whose
 /// merge (of the files sharing no column with it, else of every other file,
@@ -86,9 +80,8 @@ fn file_coverage(file: &DataFile, schema: &Schema) -> HashSet<i32> {
 /// limit of 1. Nothing is merged unless at least two files would be emptied,
 /// so a merge lowers the file count.
 ///
-/// A column the fragment has no data for (added as all nulls) is left out of
-/// its group, and a group holding a blob column, or a column whose fields are
-/// only partly in the fragment's files, is left as it is. The new files carry
+/// A blob column, or a column whose fields are only partly in the fragment's
+/// files, is left where it is. The new files carry
 /// no row lineage, so a repack that would move every column out of the file
 /// holding the fragment's spilled lineage is not planned: that file would
 /// stay for the lineage alone until a rewrite of the fragment reclaims it.
@@ -104,11 +97,9 @@ pub(super) fn plan_fragment_repack(
     schema: &Schema,
     fragment: &Fragment,
     live_files: usize,
-    groups: Option<&[Vec<i32>]>,
-    max_files: Option<usize>,
+    max_files: usize,
 ) -> Option<Vec<Vec<i32>>> {
-    let over_file_limit = max_files.is_some_and(|max| live_files > max);
-    if groups.is_none() && !over_file_limit {
+    if live_files <= max_files {
         return None;
     }
     // A V1 file cannot tombstone single fields.
@@ -224,76 +215,54 @@ pub(super) fn plan_fragment_repack(
         files = next;
     };
 
-    let wanted: Vec<BTreeSet<i32>> = match groups {
-        Some(groups) => {
-            let mut wanted: Vec<BTreeSet<i32>> = groups
-                .iter()
-                .map(|group| group.iter().copied().collect())
-                .collect();
-            let claimed: BTreeSet<i32> = wanted.iter().flatten().copied().collect();
-            if over_file_limit {
-                let merged = emptied(
-                    candidates
-                        .iter()
+    let wanted: Vec<BTreeSet<i32>> = {
+        let all = emptied(candidates);
+        let holding = file_columns.iter().filter(|c| !c.is_empty()).count();
+        // A file a move cannot empty stays anyway. Otherwise at least one
+        // file stays unless the limit is 1 or the search below finds no
+        // merge.
+        let merged = if all.len() < 2 || all.len() < holding || max_files == 1 {
+            all
+        } else {
+            let mut by_size = all.clone();
+            by_size.sort_by_key(|index| {
+                std::cmp::Reverse((
+                    live[*index].0.file_size_bytes.get().map(|size| size.get()),
+                    file_columns[*index].len(),
+                ))
+            });
+            // For each file kept, largest first: merge the files sharing
+            // no column with it, which leaves its data in place, else every
+            // other file, as long as the kept file keeps a column. A plan
+            // that leaves the largest file in place wins.
+            let plans = by_size.iter().flat_map(|kept| {
+                let untouched = emptied(
+                    all.iter()
                         .copied()
-                        .filter(|index| file_columns[*index].is_disjoint(&claimed))
+                        .filter(|index| file_columns[*index].is_disjoint(&file_columns[*kept]))
                         .collect(),
                 );
-                if merged.len() > 1 {
-                    wanted.push(columns_of(&merged));
-                }
-            }
-            wanted
-        }
-        None => {
-            let all = emptied(candidates);
-            let holding = file_columns.iter().filter(|c| !c.is_empty()).count();
-            // A file a move cannot empty stays anyway. Otherwise at least one
-            // file stays unless the limit is 1 or the search below finds no
-            // merge.
-            let merged = if all.len() < 2 || all.len() < holding || max_files == Some(1) {
-                all
-            } else {
-                let mut by_size = all.clone();
-                by_size.sort_by_key(|index| {
-                    std::cmp::Reverse((
-                        live[*index].0.file_size_bytes.get().map(|size| size.get()),
-                        file_columns[*index].len(),
-                    ))
-                });
-                // For each file kept, largest first: merge the files sharing
-                // no column with it, which leaves its data in place, else every
-                // other file, as long as the kept file keeps a column. A plan
-                // that leaves the largest file in place wins.
-                let plans = by_size.iter().flat_map(|kept| {
-                    let untouched = emptied(
-                        all.iter()
-                            .copied()
-                            .filter(|index| file_columns[*index].is_disjoint(&file_columns[*kept]))
-                            .collect(),
-                    );
-                    let others = emptied(all.iter().copied().filter(|i| i != kept).collect());
-                    let keeps_a_column = !file_columns[*kept].is_subset(&columns_of(&others));
-                    [Some(untouched), keeps_a_column.then_some(others)]
-                        .into_iter()
-                        .flatten()
-                        .filter(|merged| merged.len() > 1)
-                });
-                let largest = by_size[0];
-                plans
-                    .clone()
-                    .find(|merged| !merged.contains(&largest))
-                    .or_else(|| plans.clone().next())
-                    // For no file kept does either merge take two files and
-                    // leave it a column, so they all merge, as under a limit
-                    // of 1.
-                    .unwrap_or_else(|| all.clone())
-            };
-            if merged.len() > 1 {
-                vec![columns_of(&merged)]
-            } else {
-                Vec::new()
-            }
+                let others = emptied(all.iter().copied().filter(|i| i != kept).collect());
+                let keeps_a_column = !file_columns[*kept].is_subset(&columns_of(&others));
+                [Some(untouched), keeps_a_column.then_some(others)]
+                    .into_iter()
+                    .flatten()
+                    .filter(|merged| merged.len() > 1)
+            });
+            let largest = by_size[0];
+            plans
+                .clone()
+                .find(|merged| !merged.contains(&largest))
+                .or_else(|| plans.clone().next())
+                // For no file kept does either merge take two files and
+                // leave it a column, so they all merge, as under a limit
+                // of 1.
+                .unwrap_or_else(|| all.clone())
+        };
+        if merged.len() > 1 {
+            vec![columns_of(&merged)]
+        } else {
+            Vec::new()
         }
     };
 

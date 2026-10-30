@@ -334,42 +334,6 @@ public class CompactionTest {
     }
   }
 
-  @Test
-  public void testRepackColumnGroups(@TempDir Path tempDir) throws Exception {
-    String datasetPath = tempDir.resolve("test_repack_column_groups").toString();
-    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
-      TestUtils.SimpleTestDataset testDataset =
-          new TestUtils.SimpleTestDataset(allocator, datasetPath);
-      testDataset.createEmptyDataset().close();
-      try (Dataset dataset = testDataset.write(1, 10)) {
-        // Files [id, name] and [double_id].
-        dataset.addColumns(
-            new SqlExpressions.Builder().withExpression("double_id", "id * 2").build(),
-            Optional.empty());
-
-        List<List<String>> groups = Collections.singletonList(Arrays.asList("name", "double_id"));
-        CompactionOptions options =
-            CompactionOptions.builder()
-                .withColumnGroups(groups)
-                .withScope(CompactionScope.REPACK_COLUMNS)
-                .build();
-        CompactionPlan plan = Compaction.planCompaction(dataset, options);
-        assertEquals(groups, plan.getCompactionOptions().getColumnGroups());
-        assertEquals(1, plan.getCompactionTasks().size());
-        CompactionTask task = plan.getCompactionTasks().get(0);
-        assertEquals(
-            Collections.singletonList(Arrays.asList(1, 2)), task.getTaskData().getRepackFiles());
-
-        Compaction.commitCompaction(
-            dataset, Collections.singletonList(task.execute(dataset)), plan.getCompactionOptions());
-        dataset.checkoutLatest();
-        // The base file keeps id; the new file holds the group. Before: {2, 1}.
-        assertArrayEquals(
-            new int[] {1, 2}, dataset.getColumnLayoutStatistics().getFieldsPerFile()[0]);
-      }
-    }
-  }
-
   /**
    * A TaskData and a RewriteResult serialized by the classes as they were before the repack fields
    * were added (TaskData with no fragments; RewriteResult with metrics 1/2/3/4, no fragments, read

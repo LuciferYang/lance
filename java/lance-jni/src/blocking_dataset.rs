@@ -3700,9 +3700,6 @@ fn convert_java_compaction_options_to_rust(
             &[],
         )?
         .l()?;
-    let column_groups = env
-        .call_method(&java_options, "getColumnGroups", "()Ljava/util/List;", &[])?
-        .l()?;
     let scope = env
         .call_method(&java_options, "getScope", "()Ljava/util/Optional;", &[])?
         .l()?;
@@ -3726,13 +3723,7 @@ fn convert_java_compaction_options_to_rust(
         &data_storage_version,
         config,
     )?;
-    apply_repack_options(
-        env,
-        &mut options,
-        &max_data_files_per_fragment,
-        &column_groups,
-        &scope,
-    )?;
+    apply_repack_options(env, &mut options, &max_data_files_per_fragment, &scope)?;
     Ok(options)
 }
 

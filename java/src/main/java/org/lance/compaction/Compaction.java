@@ -52,7 +52,6 @@ public class Compaction {
           compactionOptions.getExcludedFragmentIds(),
           compactionOptions.getDataStorageVersion(),
           compactionOptions.getMaxDataFilesPerFragment(),
-          compactionOptions.getColumnGroups(),
           compactionOptions.getScope());
     }
   }
@@ -160,6 +159,5 @@ public class Compaction {
       List<Long> excludedFragmentIds,
       Optional<String> dataStorageVersion,
       Optional<Long> maxDataFilesPerFragment,
-      List<List<String>> columnGroups,
       Optional<String> scope);
 }
