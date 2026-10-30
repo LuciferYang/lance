@@ -186,9 +186,8 @@ pub(super) fn plan_fragment_repack(
             ))
         });
         let largest = by_size[0];
-        // No proposal leaves fewer live files: the new file, the file kept,
-        // and each file holding a column outside `all`, which no merge moves.
-        let floor = holding - all.len() + 2;
+        // Every proposal leaves at least the new file and the file kept.
+        let floor = 2;
         // For each file kept: merge the files sharing no column with it,
         // which leaves its data in place, or every other file as long as the
         // kept file keeps a column.
