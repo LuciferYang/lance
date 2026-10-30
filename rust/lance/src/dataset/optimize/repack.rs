@@ -149,9 +149,9 @@ pub(super) fn plan_fragment_repack(
     };
     // Shrinks `files` to those the commit of moving all their columns drops,
     // and returns them with the post-image; `None` once fewer than two are
-    // left or the commit would refuse the file. A file can hold the struct
-    // header of a column it has no data for, so taking one file out of the
-    // set can keep another alive.
+    // left or the commit would refuse one new file holding all their columns.
+    // A file can hold the struct header of a column it has no data for, so
+    // taking one file out of the set can keep another alive.
     let merge = |mut files: Vec<usize>| loop {
         if files.len() < 2 {
             return None;
