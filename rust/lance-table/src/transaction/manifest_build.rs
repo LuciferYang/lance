@@ -26,7 +26,7 @@ thread_local! {
     static LAST_CLUSTERING_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 use crate::format::overlay::staleness::field_affects_index;
-use crate::format::overlay::{OverlayCoverage, TOMBSTONE_FIELD_ID};
+use crate::format::overlay::OverlayCoverage;
 use crate::format::{
     DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, ManifestBuildConfig, RowIdMeta,
     overlay::DataOverlayFile,
@@ -1519,140 +1519,31 @@ impl Transaction {
                 replacements,
                 data_change,
             } => {
-                let (old_fragment_ids, new_datafiles): (Vec<&u64>, Vec<&DataFile>) = replacements
-                    .iter()
-                    .map(|DataReplacementGroup(fragment_id, new_file)| (fragment_id, new_file))
-                    .unzip();
-
                 let existing_fragments = maybe_existing_fragments?;
 
-                // Apply the groups in order. Several groups may name the same
-                // fragment (one new file each), so each applies to the
-                // fragment as the previous ones left it.
-                let mut replaced: HashMap<u64, Fragment> = HashMap::new();
-                for (frag_id, new_file) in old_fragment_ids.iter().zip(new_datafiles) {
-                    let frag = match replaced.get(*frag_id) {
-                        Some(frag) => frag,
-                        None => existing_fragments
-                            .iter()
-                            .find(|f| f.id == **frag_id)
-                            .ok_or_else(|| {
-                                Error::invalid_input(
-                                    "Fragment being replaced not found in existing fragments",
-                                )
-                            })?,
-                    };
-                    let mut new_frag = frag.clone();
-
-                    // Physical mappings differ across V2 encodings (a nested
-                    // parent may have no column of its own). Replacement and
-                    // tombstoning operate on the logical field coverage.
-                    let replacement_ids = new_file
-                        .schema(&schema)
-                        .field_ids()
-                        .into_iter()
-                        .chain(new_file.fields.iter().copied())
-                        .collect::<HashSet<_>>();
-
-                    // TODO(rmeng): check new file and fragment are the same length
-
-                    let mut columns_covered = HashSet::new();
-                    // Set when an existing file covers exactly the replaced
-                    // fields, so the whole file swaps rather than part of it.
-                    let mut replaced_in_place = false;
-                    for file in &mut new_frag.files {
-                        if file.fields == new_file.fields
-                            && file.file_major_version == new_file.file_major_version
-                            && file.file_minor_version == new_file.file_minor_version
-                        {
-                            // assign the new file path / size / base to the fragment
-                            file.path = new_file.path.clone();
-                            file.file_size_bytes = new_file.file_size_bytes.clone();
-                            file.base_id = new_file.base_id;
-                            replaced_in_place = true;
-                        }
-                        columns_covered.extend(file.schema(&schema).field_ids());
-                        columns_covered.extend(file.fields.iter().copied());
-                    }
-                    // Reject a file whose version does not decode before any
-                    // arm publishes it.
-                    new_file.file_version()?;
-
-                    // SPECIAL CASE: if the column(s) being replaced are not covered by the fragment
-                    // Then it means it's a all-NULL column that is being replaced with real data
-                    // just add it to the final fragments. Push the DataFile as
-                    // given so every field (including base_id) is preserved.
-                    if columns_covered.is_disjoint(&replacement_ids) {
-                        new_frag.files.push(new_file.clone());
-                    } else if !replaced_in_place
-                        && replacement_ids.is_subset(&columns_covered)
-                        && new_frag.files.iter().all(|file| {
-                            file.file_version()
-                                .is_ok_and(|version| version != ConcreteFileVersion::V1)
-                                || file
-                                    .fields
-                                    .iter()
-                                    .all(|field| !replacement_ids.contains(field))
-                        })
+                // Several groups may name the same fragment (one new file
+                // each); they apply to it in order.
+                let mut new_files_by_fragment: Vec<(u64, Vec<DataFile>)> = Vec::new();
+                for DataReplacementGroup(fragment_id, new_file) in replacements {
+                    match new_files_by_fragment
+                        .iter_mut()
+                        .find(|(id, _)| id == fragment_id)
                     {
-                        // Tombstone the replaced fields where they live and
-                        // append the new file to answer for them, the idiom
-                        // `update_columns` uses. Compaction decides that layout,
-                        // so the fields may sit in one wider file or span
-                        // several.
-                        //
-                        // Legacy V1 is excluded: its reader derives the page table
-                        // offset from the first field in the metadata, so
-                        // tombstoning one field leaves its siblings decoding from
-                        // the wrong pages. A field a V1 file covers keeps
-                        // exact-match replacement.
-                        for file in &mut new_frag.files {
-                            // Same reason as the guard above.
-                            if file.file_version()? == ConcreteFileVersion::V1 {
-                                continue;
-                            }
-                            file.fields = file
-                                .fields
-                                .iter()
-                                .map(|field| {
-                                    if replacement_ids.contains(field) {
-                                        TOMBSTONE_FIELD_ID
-                                    } else {
-                                        *field
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                                .into();
-                        }
-                        // Every data file must share at least one field with
-                        // the dataset schema: a file kept alive only by
-                        // tombstones or by ids the schema no longer defines is
-                        // unreachable to readers, uncollectable by cleanup,
-                        // and reported corrupt by validate(). The exception is
-                        // a file carrying one of the fragment's spilled row
-                        // lineage sequences: their reserved ids are never in
-                        // the schema, the file holds their only copy, and the
-                        // replaced user columns in it are dead space until
-                        // compaction.
-                        let live_ids = schema
-                            .fields_pre_order()
-                            .map(|field| field.id)
-                            .collect::<HashSet<i32>>();
-                        let spilled = new_frag.spilled_row_lineage_field_ids();
-                        new_frag.files.retain(|file| {
-                            file.fields
-                                .iter()
-                                .any(|f| live_ids.contains(f) || spilled.contains(f))
-                        });
-                        new_frag.files.push(new_file.clone());
+                        Some((_, files)) => files.push(new_file.clone()),
+                        None => new_files_by_fragment.push((*fragment_id, vec![new_file.clone()])),
                     }
+                }
 
-                    // Nothing changed in the current fragment, which is not expected -- error out
-                    if &new_frag == frag {
-                        return Err(Error::invalid_input(
-                            "Expected to modify the fragment but no changes were made. This means the new data files does not align with any exiting datafiles. Please check if the schema of the new data files matches the schema of the old data files including the file major and minor versions",
-                        ));
-                    }
+                for (frag_id, new_files) in &new_files_by_fragment {
+                    let frag = existing_fragments
+                        .iter()
+                        .find(|f| f.id == *frag_id)
+                        .ok_or_else(|| {
+                            Error::invalid_input(
+                                "Fragment being replaced not found in existing fragments",
+                            )
+                        })?;
+                    let mut new_frag = frag.replace_files(&schema, new_files)?;
 
                     // New base values supersede any overlay still shadowing
                     // them, so tombstone the overlaid fields. An overlay
@@ -1662,13 +1553,11 @@ impl Transaction {
                     // being newer it stays last, preserving the ordering.
                     // Values that only moved supersede nothing.
                     if *data_change {
-                        let replaced_fields: Vec<u32> = new_file
-                            .schema(&schema)
-                            .field_ids()
+                        let replaced_fields: Vec<u32> = new_files
                             .iter()
-                            .chain(new_file.fields.iter())
-                            .filter(|&&id| id >= 0)
-                            .map(|&id| id as u32)
+                            .flat_map(|new_file| new_file.covered_field_ids(&schema))
+                            .filter(|&id| id >= 0)
+                            .map(|id| id as u32)
                             .collect();
                         let (mut superseded, newer): (Vec<_>, Vec<_>) = new_frag
                             .overlays
@@ -1682,14 +1571,12 @@ impl Transaction {
                         new_frag.overlays = superseded;
                     }
 
-                    replaced.insert(**frag_id, new_frag);
+                    final_fragments.push(new_frag);
                 }
-                final_fragments.extend(replaced.into_values());
 
-                let fragments_changed = old_fragment_ids
+                let fragments_changed = new_files_by_fragment
                     .iter()
-                    .cloned()
-                    .cloned()
+                    .map(|(id, _)| *id)
                     .collect::<HashSet<_>>();
 
                 // 4. push fragments that didn't change back to final_fragments
@@ -2343,7 +2230,7 @@ impl Transaction {
 mod tests {
     use super::*;
     use crate::feature_flags::FLAG_OBJECT_METADATA;
-    use crate::format::overlay::OverlayCoverage;
+    use crate::format::overlay::{OverlayCoverage, TOMBSTONE_FIELD_ID};
     use crate::format::pb;
     use crate::format::{
         DeletionFile, DeletionFileType, ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID,

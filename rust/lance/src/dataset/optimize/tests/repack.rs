@@ -1500,3 +1500,39 @@ fn repack_plans_nothing_for_header_only_files() {
         None
     );
 }
+
+/// Of the proposals that leave the largest file in place, the one leaving the
+/// fewest live files wins: moving `s` out of k.lance as well as `b` and `c`
+/// leaves two files where merging only `b` and `c` leaves three.
+#[test]
+fn repack_prefers_the_proposal_leaving_the_fewest_files() {
+    use arrow_schema::Fields;
+    let child = |name: &str| Field::new(name, DataType::Int32, true);
+    let sized = |path: &str, fields: Vec<i32>, size: u64| {
+        let mut file = v2_0_file(path, fields);
+        file.file_size_bytes = lance_io::utils::CachedFileSize::new(size);
+        file
+    };
+    // a=0, s=1 {x=2, y=3}, b=4, c=5.
+    let schema = lance_schema(Schema::new(vec![
+        child("a"),
+        Field::new(
+            "s",
+            DataType::Struct(Fields::from(vec![child("x"), child("y")])),
+            true,
+        ),
+        child("b"),
+        child("c"),
+    ]));
+    let mut fragment = Fragment::new(0);
+    fragment.files = vec![
+        sized("k.lance", vec![0, 1, 2], 100),
+        sized("m1.lance", vec![1, 3], 10),
+        sized("m2.lance", vec![4], 10),
+        sized("m3.lance", vec![5], 10),
+    ];
+    assert_eq!(
+        crate::dataset::optimize::repack::plan_fragment_repack(&schema, &fragment, 4, 2),
+        Some(vec![vec![1, 4, 5]])
+    );
+}
