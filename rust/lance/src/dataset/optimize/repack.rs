@@ -4,11 +4,11 @@
 //! Column repacking, the compaction task that rewrites some of one fragment's
 //! columns into fewer data files without moving rows.
 //!
-//! Every `add_columns` backfill gives each fragment one more data file, and a
-//! large fragment with few deletions never qualifies for a rewrite, so its
-//! files pile up. A [`CompactionTaskKind::RepackColumns`] task reads some of
-//! the fragment's columns, writes them to new files, and commits the files as
-//! an `Operation::DataReplacement` with `data_change: false`: the fragment id,
+//! Every `add_columns` backfill gives each fragment one more data file, and no
+//! rewrite trigger counts files, so they pile up. A
+//! [`CompactionTaskKind::RepackColumns`] task reads some of the fragment's
+//! columns, writes them to new files, and commits the files as an
+//! `Operation::DataReplacement` with `data_change: false`: the fragment id,
 //! row addresses, overlays and index coverage are left as they are.
 //!
 //! [`CompactionTaskKind::RepackColumns`]: super::CompactionTaskKind::RepackColumns
@@ -62,8 +62,8 @@ fn propose(schema: &Schema, fragment: &Fragment, columns: &BTreeSet<i32>) -> Opt
 /// Each proposal merges whole files and is applied with
 /// [`Fragment::replace_files`], as the commit will apply it; it takes only the
 /// files the commit drops. Unless the limit is 1 or a file must stay anyway,
-/// one file is kept: a proposal leaving the largest file in place wins, then
-/// the one leaving the fewest live files.
+/// one file is kept when a proposal can leave one: a proposal leaving the
+/// largest file in place wins, then the one leaving the fewest live files.
 ///
 /// [`FragmentColumnLayoutStats::live_file_count`]: crate::dataset::compaction_stats::FragmentColumnLayoutStats::live_file_count
 pub(super) fn plan_fragment_repack(
@@ -149,8 +149,9 @@ pub(super) fn plan_fragment_repack(
     };
     // Shrinks `files` to those the commit of moving all their columns drops,
     // and returns them with the post-image; `None` once fewer than two are
-    // left. A file can hold the struct header of a column it has no data for,
-    // so taking one file out of the set can keep another alive.
+    // left or the commit would refuse the file. A file can hold the struct
+    // header of a column it has no data for, so taking one file out of the
+    // set can keep another alive.
     let merge = |mut files: Vec<usize>| loop {
         if files.len() < 2 {
             return None;
@@ -218,8 +219,9 @@ pub(super) fn plan_fragment_repack(
     Some(vec![columns_of(&merged).into_iter().collect()])
 }
 
-/// Write `files`, the new files of `task`, a repack task, against `dataset`,
-/// which must be at the plan's read version.
+/// Write one new file per entry of `files` (the top-level field ids it holds)
+/// for repack task `task`, against `dataset`, which must be at the plan's
+/// read version.
 pub(super) async fn execute_repack(
     dataset: &Dataset,
     task: &TaskData,

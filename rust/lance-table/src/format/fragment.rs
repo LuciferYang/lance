@@ -858,9 +858,11 @@ impl Fragment {
     /// Swap `new_files` into this fragment, applied in order: what a
     /// `DataReplacement` commit does to the data files of a fragment.
     ///
-    /// A new file replaces an existing file holding exactly its fields, or is
-    /// appended when the fragment has no data for its fields, or is appended
-    /// after its fields are tombstoned where they live (never in a V1 file).
+    /// A new file replaces an existing file holding exactly its fields in the
+    /// same file version, or is appended when the fragment has no data for its
+    /// fields, or is appended after its fields are tombstoned where they live.
+    /// A V1 file cannot tombstone a field, so a field one holds takes only an
+    /// exact match.
     /// A file then left with no field of `schema` and none of the fragment's
     /// spilled row lineage is dropped. Pure: no IO, only `files` changes. A
     /// new file that changes nothing is an error.

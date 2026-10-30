@@ -23,8 +23,10 @@ import java.util.Objects;
 /**
  * Replace the data files backing some fields of existing fragments with new files, without moving
  * rows. Each group names a fragment and one new data file for it; a fragment can take several
- * groups, applied in order. Used for null column population, and by compaction to repack columns
- * into fewer files.
+ * groups, applied in order. At commit, a file holding exactly the new file's fields in the same
+ * file version is swapped for it; otherwise those fields are tombstoned where they live and the new
+ * file is appended. A field a V1 file holds takes only an exact match. Used for null column
+ * population, and by compaction to repack columns into fewer files.
  *
  * <p>{@code dataChange == false} declares that the new files hold the same values as the files they
  * replace: indices keep their coverage, overlays keep shadowing, and no row is reported as updated.

@@ -342,13 +342,15 @@ pub struct CompactionOptions {
     pub max_overlays_per_fragment: Option<usize>,
     /// Repack the columns of a fragment that holds them in more than this many
     /// data files ([`FragmentColumnLayoutStats::live_file_count`]) into fewer
-    /// files. Each `add_columns` backfill adds a file per fragment, and a large
-    /// fragment with few deletions is never rewritten. A repack keeps rows,
-    /// fragment ids and index coverage (see
-    /// [`CompactionTaskKind::RepackColumns`]) and writes each new file whole,
-    /// ignoring `max_bytes_per_file`. Files holding a blob column, a column
-    /// only partly in the fragment, or spilled row lineage stay, so a fragment
-    /// can stay above the limit. Not planned under `ForceBinaryCopy`.
+    /// files. Each `add_columns` backfill adds a file per fragment, and no
+    /// rewrite trigger counts files. A repack keeps rows, fragment ids and
+    /// index coverage (see [`CompactionTaskKind::RepackColumns`]) and writes
+    /// each new file whole, ignoring `max_bytes_per_file`. Files holding a blob
+    /// column, a column only partly in the fragment, or spilled row lineage
+    /// stay, as do files sharing a column with the lineage file, so a fragment
+    /// can stay above the limit. Above a limit of 1, when every file could go,
+    /// one is kept if a merge can leave it, the largest if possible. Not
+    /// planned under `ForceBinaryCopy`.
     ///
     /// Defaults to `None` (no repack). Must be at least 1.
     ///

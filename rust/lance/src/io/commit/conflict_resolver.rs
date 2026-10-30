@@ -496,8 +496,9 @@ impl<'a> TransactionRebase<'a> {
     }
 
     /// Whether this transaction is a replacement whose values only moved
-    /// (compaction). A concurrent drop or delete of its target makes it retry
-    /// rather than fail.
+    /// (compaction). A concurrent drop or delete of its target then fails it
+    /// with a retryable conflict instead of an incompatible one, and a
+    /// concurrent index build does not conflict with it.
     fn only_moves_values(&self) -> bool {
         matches!(
             self.transaction.operation,
