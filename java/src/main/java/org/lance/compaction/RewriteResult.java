@@ -80,7 +80,7 @@ public class RewriteResult implements Serializable {
   }
 
   /**
-   * The data files a column repack wrote, empty when the fragment had no rows to write.
+   * The data files a column repack wrote.
    *
    * @return null for the result of a fragment rewrite
    */

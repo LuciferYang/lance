@@ -1523,15 +1523,12 @@ impl Transaction {
 
                 // Several groups may name the same fragment (one new file
                 // each); they apply to it in order.
-                let mut new_files_by_fragment: Vec<(u64, Vec<DataFile>)> = Vec::new();
+                let mut new_files_by_fragment: BTreeMap<u64, Vec<DataFile>> = BTreeMap::new();
                 for DataReplacementGroup(fragment_id, new_file) in replacements {
-                    match new_files_by_fragment
-                        .iter_mut()
-                        .find(|(id, _)| id == fragment_id)
-                    {
-                        Some((_, files)) => files.push(new_file.clone()),
-                        None => new_files_by_fragment.push((*fragment_id, vec![new_file.clone()])),
-                    }
+                    new_files_by_fragment
+                        .entry(*fragment_id)
+                        .or_default()
+                        .push(new_file.clone());
                 }
 
                 for (frag_id, new_files) in &new_files_by_fragment {
@@ -1575,8 +1572,8 @@ impl Transaction {
                 }
 
                 let fragments_changed = new_files_by_fragment
-                    .iter()
-                    .map(|(id, _)| *id)
+                    .keys()
+                    .copied()
                     .collect::<HashSet<_>>();
 
                 // 4. push fragments that didn't change back to final_fragments

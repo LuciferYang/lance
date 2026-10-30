@@ -116,16 +116,12 @@ pub enum Operation {
     },
     /// Replace the data files backing some fields of existing fragments with
     /// new files, without moving rows. Each group names a fragment and one new
-    /// data file for it. At commit, against the fragment as it stands then, a
-    /// file holding exactly the new file's fields (in the same file version) is
-    /// swapped for it; otherwise the new file's fields are tombstoned where
-    /// they live and the new file is appended, and a file left holding no
-    /// field of the schema is dropped. A fragment can take several groups, one
-    /// per new file, applied in order. Used for null column population, and by
-    /// compaction to repack columns into fewer files.
+    /// data file for it; a fragment can take several groups, applied in order
+    /// to the fragment as it stands at commit. [`Fragment::replace_files`]
+    /// says what happens to its files. Used for null column population, and
+    /// by compaction to repack columns into fewer files.
     ///
-    /// The fields of a legacy (V1) data file cannot be tombstoned one by one,
-    /// so a field held by a V1 file can only be replaced by an exact match.
+    /// [`Fragment::replace_files`]: crate::format::Fragment::replace_files
     DataReplacement {
         replacements: Vec<DataReplacementGroup>,
         /// Whether the new files change any value. `false` means the values

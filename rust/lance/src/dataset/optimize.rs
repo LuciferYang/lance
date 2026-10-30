@@ -340,23 +340,17 @@ pub struct CompactionOptions {
     /// carries any overlay, or `None` to disable the overlay-count trigger
     /// entirely.
     pub max_overlays_per_fragment: Option<usize>,
-    /// Maximum number of data files a fragment may hold columns in before its
-    /// columns are repacked into fewer files. Each `add_columns` backfill adds
-    /// one file per fragment; a large, deletion-free fragment never qualifies
-    /// for a rewrite, so this is the trigger that collapses those files. The
-    /// repack rewrites only the columns that move and keeps rows, fragment ids
-    /// and indices as they are (see [`CompactionTaskKind::RepackColumns`]).
-    /// The count is [`FragmentColumnLayoutStats::live_file_count`]. Only
-    /// files the repack empties are merged, at least two at a time. A file
-    /// stays when it holds a blob column, a column only partly in the
-    /// fragment's files, or spilled row lineage, or shares a column with a
-    /// file holding spilled row lineage; when every file holding a column
-    /// could go, at least one stays (the largest when some merge leaves it)
-    /// unless the limit is 1. So a fragment can stay above the limit.
-    /// The repack writes each new file whole, with no `max_bytes_per_file`
-    /// split. Not planned under `ForceBinaryCopy`, since a repack reencodes.
+    /// Repack the columns of a fragment that holds them in more than this many
+    /// data files ([`FragmentColumnLayoutStats::live_file_count`]) into fewer
+    /// files. Each `add_columns` backfill adds a file per fragment, and a large
+    /// fragment with few deletions is never rewritten. A repack keeps rows,
+    /// fragment ids and index coverage (see
+    /// [`CompactionTaskKind::RepackColumns`]) and writes each new file whole,
+    /// ignoring `max_bytes_per_file`. Files holding a blob column, a column
+    /// only partly in the fragment, or spilled row lineage stay, so a fragment
+    /// can stay above the limit. Not planned under `ForceBinaryCopy`.
     ///
-    /// Defaults to `None` (no file-count trigger). Must be at least 1.
+    /// Defaults to `None` (no repack). Must be at least 1.
     ///
     /// [`FragmentColumnLayoutStats::live_file_count`]: crate::dataset::compaction_stats::FragmentColumnLayoutStats::live_file_count
     #[serde(default)]
@@ -1760,7 +1754,7 @@ pub async fn compact_files_with_planner(
     let snapshot = &dataset.clone();
     let results: Vec<RewriteResult> = futures::stream::iter(compaction_plan.compaction_tasks())
         .map(|task| async move { task.execute(snapshot).await })
-        .buffer_unordered(concurrency.max(1))
+        .buffer_unordered(concurrency)
         .try_collect()
         .await?;
     commit_compaction(dataset, results, remap_options, options).await
@@ -2974,13 +2968,12 @@ impl CompactionTask {
         } else {
             Cow::Owned(dataset.checkout_version(self.read_version).await?)
         };
-        let task = self.task.clone();
-        match task.kind {
+        match &self.task.kind {
             CompactionTaskKind::RewriteFragments => {
-                rewrite_files(dataset, task, &self.options).await
+                rewrite_files(dataset, self.task.clone(), &self.options).await
             }
-            CompactionTaskKind::RepackColumns { .. } => {
-                repack::execute_repack(&dataset, task, &self.options).await
+            CompactionTaskKind::RepackColumns { files } => {
+                repack::execute_repack(&dataset, &self.task, files, &self.options).await
             }
         }
     }
@@ -3316,7 +3309,7 @@ pub struct RewriteResult {
 pub struct RepackedFiles {
     /// The fragment the files belong to.
     pub fragment_id: u64,
-    /// The new files, empty when the fragment had no rows to write.
+    /// The new files.
     pub files: Vec<lance_table::format::DataFile>,
 }
 
@@ -4329,14 +4322,12 @@ async fn records_stable_row_id_moves(
 /// some of the tasks have been committed, the remainder of the tasks will not
 /// be able to be committed and should be considered cancelled.
 ///
-/// Fragment rewrites commit as one `Operation::Rewrite`; column repacks then
-/// commit as one `Operation::DataReplacement` that moves values without
-/// changing them, so a run with both kinds of task commits them separately. A
-/// fragment in both kinds of task is rejected before either commit. If the repack
-/// commit fails, the rewrite stays committed, `dataset` is left at the
-/// rewrite's version, and the error is returned. Plan again rather than passing
-/// the same results back: their rewrites would conflict with the commit that
-/// landed.
+/// Fragment rewrites commit as one `Operation::Rewrite`, then column repacks
+/// as one `Operation::DataReplacement` that moves values without changing
+/// them. A fragment in both kinds of result is rejected before either commit.
+/// If the repack commit fails, the rewrite stays committed and `dataset` is
+/// left at its version; plan again rather than passing the same results back,
+/// since their rewrites would conflict with the commit that landed.
 ///
 /// With stable row IDs, tasks that recorded their row-address moves (see
 /// [`CompactionOptions::defer_index_remap`]) commit them even if `options` does not

@@ -10,6 +10,8 @@
 //! the fragment's columns, writes them to new files, and commits the files as
 //! an `Operation::DataReplacement` with `data_change: false`: the fragment id,
 //! row addresses, overlays and index coverage are left as they are.
+//!
+//! [`CompactionTaskKind::RepackColumns`]: super::CompactionTaskKind::RepackColumns
 
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
@@ -18,10 +20,7 @@ use lance_core::datatypes::{Field as LanceField, Schema};
 use lance_file::version::ConcreteFileVersion;
 use lance_table::format::{DataFile, Fragment};
 
-use super::{
-    CompactionMetrics, CompactionOptions, CompactionTaskKind, RepackedFiles, RewriteResult,
-    TaskData,
-};
+use super::{CompactionMetrics, CompactionOptions, RepackedFiles, RewriteResult, TaskData};
 use crate::dataset::fragment::FileFragment;
 use crate::dataset::transaction::{DataReplacementGroup, Operation, TransactionBuilder};
 use crate::dataset::{Dataset, cleanup_data_fragments, versions};
@@ -148,10 +147,10 @@ pub(super) fn plan_fragment_repack(
             .flat_map(|index| file_columns[*index].iter().copied())
             .collect()
     };
-    // The files of `files` that the commit of a move of all their columns
-    // drops, with what it leaves of the fragment; `None` unless at least two.
-    // A file may also hold a field of a column it holds no data for (a struct
-    // header), so leaving it out can keep another file alive in turn.
+    // Shrinks `files` to those the commit of moving all their columns drops,
+    // and returns them with the post-image; `None` once fewer than two are
+    // left. A file can hold the struct header of a column it has no data for,
+    // so taking one file out of the set can keep another alive.
     let merge = |mut files: Vec<usize>| loop {
         if files.len() < 2 {
             return None;
@@ -186,8 +185,6 @@ pub(super) fn plan_fragment_repack(
             ))
         });
         let largest = by_size[0];
-        // Every proposal leaves at least the new file and the file kept.
-        let floor = 2;
         // For each file kept: merge the files sharing no column with it,
         // which leaves its data in place, or every other file as long as the
         // kept file keeps a column.
@@ -211,7 +208,8 @@ pub(super) fn plan_fragment_repack(
             {
                 best = Some((score, files));
             }
-            if score == (false, floor) {
+            // Every proposal leaves at least the new file and the file kept.
+            if score == (false, 2) {
                 break;
             }
         }
@@ -220,16 +218,14 @@ pub(super) fn plan_fragment_repack(
     Some(vec![columns_of(&merged).into_iter().collect()])
 }
 
-/// Write the new files of a [`CompactionTaskKind::RepackColumns`] task
-/// against `dataset`, which must be at the plan's read version.
+/// Write `files`, the new files of `task`, a repack task, against `dataset`,
+/// which must be at the plan's read version.
 pub(super) async fn execute_repack(
     dataset: &Dataset,
-    task: TaskData,
+    task: &TaskData,
+    files: &[Vec<i32>],
     options: &CompactionOptions,
 ) -> Result<RewriteResult> {
-    let CompactionTaskKind::RepackColumns { files } = &task.kind else {
-        return Err(Error::internal("execute_repack called with a rewrite task"));
-    };
     let [fragment] = task.fragments.as_slice() else {
         return Err(Error::invalid_input(format!(
             "a RepackColumns task names exactly one fragment, got {}",
@@ -247,12 +243,6 @@ pub(super) async fn execute_repack(
         dataset.manifest.data_storage_format.lance_file_format(),
         write_version,
     )?;
-    if write_version == ConcreteFileVersion::V1 {
-        return Err(Error::not_supported(
-            "repacking columns needs the V2 file format: a V1 file cannot tombstone \
-             single fields",
-        ));
-    }
 
     // Read the base values only: the overlays stay on the fragment and keep
     // shadowing them, so every live row reads as it did.
@@ -271,8 +261,7 @@ pub(super) async fn execute_repack(
             .map(|field| field.name.as_str())
             .collect();
         match write_one_file(&source, schema, &names, batch_size, write_version).await {
-            Ok(Some(file)) => written.push(file),
-            Ok(None) => {}
+            Ok(file) => written.push(file),
             Err(err) => {
                 discard(dataset, fragment.id, written).await;
                 return Err(err);
@@ -315,15 +304,14 @@ async fn discard(dataset: &Dataset, fragment_id: u64, files: Vec<DataFile>) {
     cleanup_data_fragments(&dataset.object_store, &dataset.base, None, &[partial]).await;
 }
 
-/// Write `columns` of `source` to one new data file. `None` when the
-/// fragment has no rows to write.
+/// Write `columns` of `source` to one new data file.
 async fn write_one_file(
     source: &FileFragment,
     schema: &Schema,
     columns: &[&str],
     batch_size: Option<u32>,
     write_version: ConcreteFileVersion,
-) -> Result<Option<DataFile>> {
+) -> Result<DataFile> {
     let write_schema = schema.project(columns)?;
     let mut updater = source
         .updater_with_version(
@@ -341,24 +329,24 @@ async fn write_one_file(
         updater.finish().await
     }
     .await;
-    let fragment = match finished {
+    let mut fragment = match finished {
         Ok(fragment) => fragment,
         Err(err) => {
             updater.cleanup_unfinished_writer().await;
             return Err(err);
         }
     };
-    // The updater appends the file it wrote to the fragment's files.
-    Ok((fragment.files.len() > source.metadata().files.len())
-        .then(|| fragment.files.last().cloned())
-        .flatten())
+    // The updater appends the file it wrote, and writes none for no rows.
+    fragment
+        .files
+        .split_off(source.metadata().files.len())
+        .pop()
+        .ok_or_else(|| Error::invalid_input(format!("fragment {} has no rows", fragment.id)))
 }
 
 /// Commit the files of repack results as one `DataReplacement` that moves
 /// values without changing them. Each result applies to its fragment as it
-/// stands at commit, so a concurrent change to other columns of the fragment
-/// is kept; one that touches the moved columns fails the commit with a
-/// retryable conflict.
+/// stands at commit.
 pub(super) async fn commit_repacked_files(
     dataset: &mut Dataset,
     results: Vec<RewriteResult>,
@@ -371,9 +359,6 @@ pub(super) async fn commit_repacked_files(
         let Some(repacked) = result.repacked_files else {
             continue;
         };
-        if repacked.files.is_empty() {
-            continue;
-        }
         metrics += result.metrics;
         read_version = read_version.min(result.read_version);
         replacements.extend(
@@ -388,7 +373,7 @@ pub(super) async fn commit_repacked_files(
     }
     let transaction = TransactionBuilder::new(
         // The earliest version a repack read, so the conflict check covers
-        // every write since (the same reason vertical compaction uses it).
+        // every write since, as for rewrites.
         read_version,
         Operation::DataReplacement {
             replacements,

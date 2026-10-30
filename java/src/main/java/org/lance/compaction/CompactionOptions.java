@@ -439,13 +439,10 @@ public class CompactionOptions implements Serializable {
      * Maximum number of data files a fragment may hold columns in before its columns are repacked
      * into fewer files. Each {@code addColumns} backfill adds one file per fragment. A repack
      * rewrites only the columns that move and keeps rows, fragment ids and indices as they are.
-     * Unset means no file-count trigger.
-     *
-     * @throws IllegalArgumentException if {@code maxDataFilesPerFragment} is not positive
+     * Unset means no repack.
      */
     public Builder withMaxDataFilesPerFragment(long maxDataFilesPerFragment) {
-      this.maxDataFilesPerFragment =
-          Optional.of(positiveBudget("maxDataFilesPerFragment", maxDataFilesPerFragment));
+      this.maxDataFilesPerFragment = Optional.of(maxDataFilesPerFragment);
       return this;
     }
 

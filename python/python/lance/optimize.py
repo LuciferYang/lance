@@ -127,7 +127,7 @@ class CompactionOptions(TypedDict, total=False):
     columns are repacked into fewer files. Each ``add_columns`` backfill adds
     one file per fragment. A repack rewrites only the columns that move and
     keeps rows, fragment ids and indices as they are. (default: None, no
-    file-count trigger)
+    repack)
     """
     scope: Optional[Literal["all", "rewrite_fragments", "repack_columns"]]
     """
