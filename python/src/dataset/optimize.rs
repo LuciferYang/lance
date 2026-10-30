@@ -529,7 +529,8 @@ impl PyCompaction {
     /// ----------
     /// dataset : lance.Dataset
     ///    The dataset to compact. The dataset instance will be updated to the
-    ///    new version once complete.
+    ///    new version once complete. Rewrites and repacks commit separately,
+    ///    so after an error it may be at a version the rewrites made.
     /// options : CompactionOptions
     ///    The compaction options.
     ///

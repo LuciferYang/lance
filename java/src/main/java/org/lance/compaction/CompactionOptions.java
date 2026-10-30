@@ -393,9 +393,10 @@ public class CompactionOptions implements Serializable {
 
     /**
      * Maximum number of source bytes to compact in a single run, measured as the total size of the
-     * source fragments' data and overlay files. Tasks are included until adding the next task would
-     * exceed this limit. Blob v2 payloads live in separate blob files and are not counted, so this
-     * is not a cap on total compaction I/O for datasets with blob columns.
+     * source fragments' data and overlay files (for a column repack, only the data files holding
+     * the columns it moves). Tasks are included until adding the next task would exceed this limit.
+     * Blob v2 payloads live in separate blob files and are not counted, so this is not a cap on
+     * total compaction I/O for datasets with blob columns.
      *
      * @throws IllegalArgumentException if {@code maxSourceBytes} is not positive
      */
@@ -439,7 +440,8 @@ public class CompactionOptions implements Serializable {
      * Maximum number of data files a fragment may hold columns in before its columns are repacked
      * into fewer files. Each {@code addColumns} backfill adds one file per fragment. A repack
      * rewrites only the columns that move and keeps rows, fragment ids and indices as they are.
-     * Unset means no repack. Must be at least 1; checked when the compaction is planned.
+     * Unset uses {@code lance.compaction.max_data_files_per_fragment} from the table config, or no
+     * repack. Must be at least 1; checked when the compaction is planned.
      */
     public Builder withMaxDataFilesPerFragment(long maxDataFilesPerFragment) {
       this.maxDataFilesPerFragment = Optional.of(maxDataFilesPerFragment);

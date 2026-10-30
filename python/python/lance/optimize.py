@@ -107,7 +107,8 @@ class CompactionOptions(TypedDict, total=False):
     max_source_bytes: Optional[int]
     """
     Maximum number of source bytes to compact in a single run, measured as
-    the total size of the source fragments' data and overlay files. Tasks
+    the total size of the source fragments' data and overlay files (for a
+    column repack, only the data files holding the columns it moves). Tasks
     are included until adding the next task would exceed this limit.
     Blob v2 payloads live in separate blob files and are not counted, so
     this is not a cap on total compaction I/O for datasets with blob
@@ -126,7 +127,8 @@ class CompactionOptions(TypedDict, total=False):
     Maximum number of data files a fragment may hold columns in before its
     columns are repacked into fewer files. Each ``add_columns`` backfill adds
     one file per fragment. A repack rewrites only the columns that move and
-    keeps rows, fragment ids and indices as they are. (default: None, no
+    keeps rows, fragment ids and indices as they are. (default: the table
+    config ``lance.compaction.max_data_files_per_fragment``, else None, no
     repack)
     """
     scope: Optional[Literal["all", "rewrite_fragments", "repack_columns"]]

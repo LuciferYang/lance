@@ -315,7 +315,8 @@ pub struct CompactionOptions {
     /// Defaults to `None` (no limit).
     pub max_source_rows: Option<usize>,
     /// Maximum number of source bytes to compact in a single run, measured as
-    /// the total size of the source fragments' data and overlay files. When
+    /// the total size of the source fragments' data and overlay files (for a
+    /// column repack, only the data files holding the columns it moves). When
     /// set, tasks are included in the plan until adding the next task would
     /// exceed this limit.
     /// Blob v2 payloads live in separate blob files and are not counted, so
@@ -868,8 +869,9 @@ pub struct CompactionMetrics {
     pub fragments_added: usize,
     /// The number of files that have been removed, including deletion files.
     pub files_removed: usize,
-    /// The number of data files that have been added: one per new fragment for
-    /// a fragment rewrite, and one per new file for a column repack.
+    /// The number of files that have been added: each new fragment's data
+    /// files and deletion file for a fragment rewrite, and each new data file
+    /// for a column repack.
     pub files_added: usize,
 }
 
@@ -1596,9 +1598,10 @@ impl DefaultCompactionPlanner {
     }
 
     /// The tasks that repack the columns of a fragment not in `rewritten`,
-    /// each with its live row count. A fragment is repacked when it holds
+    /// each with its live row count. A fragment is considered when it holds
     /// columns in more than `max_data_files_per_fragment` files, as
-    /// [`Dataset::column_layout_stats`] counts them.
+    /// [`Dataset::column_layout_stats`] counts them, and
+    /// `repack::plan_fragment_repack` decides what to merge.
     fn plan_repacks(
         &self,
         dataset: &Dataset,
@@ -2886,8 +2889,9 @@ impl TaskData {
         }
     }
 
-    /// A task that rewrites the `files` (each the top-level field ids of one
-    /// new file) of `fragment`'s columns without moving its rows.
+    /// A task that writes `fragment`'s columns into new files, one per entry of
+    /// `files` (the top-level field ids that file holds), without moving its
+    /// rows.
     pub fn repack_columns(fragment: Fragment, files: Vec<Vec<i32>>) -> Self {
         Self {
             fragments: vec![fragment],
@@ -2903,14 +2907,16 @@ impl TaskData {
 pub enum CompactionTaskKind {
     /// Rewrite the task's fragments into new fragments, merging small ones,
     /// dropping deleted rows and materializing overlays. Moves rows, so
-    /// indices covering the fragments are remapped.
+    /// indices covering the fragments have to follow them (see
+    /// [`CompactionOptions::defer_index_remap`]).
     #[default]
     RewriteFragments,
     /// Rewrite some columns of the task's one fragment into new data files,
     /// leaving the fragment id, rows, deletions, overlays and index coverage
     /// as they are. Each entry of `files` is one new file, given as the field
     /// ids of the top-level columns it holds. The files the columns leave
-    /// keep their other columns; a file left with none is dropped.
+    /// keep their other columns; a file then left with no schema column and
+    /// no spilled row lineage is dropped.
     RepackColumns { files: Vec<Vec<i32>> },
 }
 
@@ -4333,7 +4339,8 @@ async fn records_stable_row_id_moves(
 ///
 /// With stable row IDs, tasks that recorded their row-address moves (see
 /// [`CompactionOptions::defer_index_remap`]) commit them even if `options` does not
-/// set `defer_index_remap`; either all tasks or none must have recorded them.
+/// set `defer_index_remap`; either all rewrite results or none must have
+/// recorded them.
 pub async fn commit_compaction(
     dataset: &mut Dataset,
     completed_tasks: Vec<RewriteResult>,

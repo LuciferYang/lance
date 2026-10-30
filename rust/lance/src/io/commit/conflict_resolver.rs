@@ -208,8 +208,8 @@ fn may_alter_nullability(operation: &Operation) -> bool {
 /// Whether `operation` can commit rows that falsify such a change: by writing
 /// a null into a scanned field, or by omitting a required column entirely (a
 /// stale append's fragments read as null for columns they predate). `Delete`
-/// only removes rows, and `Rewrite` and a `DataReplacement` without
-/// `data_change` preserve the values they move; `Project` already conflicts
+/// only removes rows, and `Rewrite` and a `DataReplacement` with
+/// `data_change: false` preserve the values they move; `Project` already conflicts
 /// with projections and merges elsewhere.
 fn supplies_values(operation: &Operation) -> bool {
     matches!(

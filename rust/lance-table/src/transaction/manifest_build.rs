@@ -542,9 +542,9 @@ impl Transaction {
     /// before anything is derived, keeps `current_indices` as the original
     /// list, and derives the prepared list: on an in-place column rewrite
     /// (an update with `fields_modified`, a merge swapping a column's data
-    /// file, a data replacement) the coverage it invalidates is withdrawn
-    /// along a tagged fragment reuse history or pruned by fragment id on any
-    /// other table (`withdraw_in_place_rewrites`). Every other operation
+    /// file, a data replacement that changes data) the coverage it invalidates
+    /// is withdrawn along a tagged fragment reuse history or pruned by fragment
+    /// id on any other table (`withdraw_in_place_rewrites`). Every other operation
     /// prepares the list unchanged; `Restore` never reaches the builder and
     /// restores its snapshot's list whole.
     ///
@@ -1576,7 +1576,7 @@ impl Transaction {
                     .copied()
                     .collect::<HashSet<_>>();
 
-                // 4. push fragments that didn't change back to final_fragments
+                // Push fragments that didn't change back to final_fragments
                 let unmodified_fragments = existing_fragments
                     .iter()
                     .filter(|f| !fragments_changed.contains(&f.id))
@@ -1585,8 +1585,8 @@ impl Transaction {
 
                 final_fragments.extend(unmodified_fragments);
 
-                // A replacement changes what its rows read as, so stamp them
-                // updated. Without this, get_updated_rows never reports them and
+                // A replacement that changes data changes what its rows read
+                // as, so stamp them updated. Without this, get_updated_rows never reports them and
                 // an incremental consumer skips them for good.
                 if next_row_id.is_some() && *data_change {
                     let new_version = current_manifest.map_or(1, |m| m.version + 1);

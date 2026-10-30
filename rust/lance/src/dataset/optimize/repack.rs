@@ -44,7 +44,8 @@ fn holds_blob(field: &LanceField) -> bool {
 
 /// What a commit of one new file holding `columns` (top-level field ids) leaves
 /// of `fragment`, or `None` when the commit would refuse that file. The file
-/// stands in for the one a repack writes and has no path.
+/// stands in for the one a repack writes: it has no path and takes the version
+/// of the fragment's first file.
 fn propose(schema: &Schema, fragment: &Fragment, columns: &BTreeSet<i32>) -> Option<Fragment> {
     let columns: Vec<i32> = columns.iter().copied().collect();
     let fields = schema.project_by_ids(&columns, true).field_ids();

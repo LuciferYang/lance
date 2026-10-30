@@ -461,9 +461,9 @@ of this, it's recommended to rewrite files before re-building indices.
 
 #### Repack columns
 
-Each `add_columns` backfill gives every fragment one more data file. A large
-fragment with few deletions is never rewritten, so those files pile up and slow
-down scans and random reads. Compaction can repack a fragment's columns into
+Each `add_columns` backfill gives every fragment one more data file, and no
+compaction trigger counts data files, so those files pile up and slow down
+scans and random reads. Compaction can repack a fragment's columns into
 fewer data files instead. A repack moves no rows, so fragment ids, row
 addresses, deletions, data overlays and index coverage stay as they are.
 
@@ -481,7 +481,8 @@ dataset.optimize.compact_files(max_data_files_per_fragment=2)
 # Only repack.
 dataset.optimize.compact_files(max_data_files_per_fragment=1, scope="repack_columns")
 
-# Per fragment: live data files, file sizes, fields per file, dead field slots.
+# Per fragment: live data files, file sizes, fields per file, dead-slot ratio,
+# overlay count.
 dataset.stats.column_layout_stats()
 ```
 

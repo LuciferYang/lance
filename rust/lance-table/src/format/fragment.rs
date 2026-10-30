@@ -862,10 +862,10 @@ impl Fragment {
     /// same file version numbers, or is appended when the fragment has no data
     /// for its fields, or, when the fragment holds all of them, is appended
     /// after they are tombstoned where they live. A V1 file cannot tombstone a
-    /// field, so a field one holds takes only an exact match.
-    /// A file then left with no field of `schema` and none of the fragment's
-    /// spilled row lineage is dropped. Pure: no IO, only `files` changes. A
-    /// new file that changes nothing is an error.
+    /// field, so a field one holds takes only an exact match. In the
+    /// tombstoning case, every file then left with no field of `schema` and
+    /// none of the fragment's spilled row lineage is dropped. Pure: no IO,
+    /// only `files` changes. A new file that changes nothing is an error.
     pub fn replace_files(&self, schema: &Schema, new_files: &[DataFile]) -> Result<Self> {
         new_files
             .iter()
@@ -878,8 +878,9 @@ impl Fragment {
         let mut new_frag = self.clone();
 
         // Physical mappings differ across V2 encodings (a nested
-        // parent may have no column of its own). Replacement and
-        // tombstoning operate on the logical field coverage.
+        // parent may have no column of its own). Choosing the arm and
+        // tombstoning use the logical field coverage; the exact-match swap
+        // compares `fields` as written.
         let replacement_ids = new_file.covered_field_ids(schema);
 
         // TODO(rmeng): check new file and fragment are the same length
@@ -907,7 +908,7 @@ impl Fragment {
 
         // SPECIAL CASE: if the column(s) being replaced are not covered by the fragment
         // Then it means it's a all-NULL column that is being replaced with real data
-        // just add it to the final fragments. Push the DataFile as
+        // just append it to this fragment. Push the DataFile as
         // given so every field (including base_id) is preserved.
         if columns_covered.is_disjoint(&replacement_ids) {
             new_frag.files.push(new_file.clone());
@@ -954,13 +955,12 @@ impl Fragment {
             // Every data file must share at least one field with
             // the dataset schema: a file kept alive only by
             // tombstones or by ids the schema no longer defines is
-            // unreachable to readers, uncollectable by cleanup,
-            // and reported corrupt by validate(). The exception is
-            // a file carrying one of the fragment's spilled row
-            // lineage sequences: their reserved ids are never in
-            // the schema, the file holds their only copy, and the
-            // replaced user columns in it are dead space until
-            // compaction.
+            // unreachable to readers and uncollectable by cleanup.
+            // The exception is a file carrying one of the fragment's
+            // spilled row lineage sequences: their reserved ids are
+            // never in the schema, the file holds their only copy,
+            // and the replaced user columns in it are dead space
+            // until compaction.
             let live_ids = schema
                 .fields_pre_order()
                 .map(|field| field.id)
