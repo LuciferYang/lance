@@ -25,8 +25,8 @@ use crate::format::clustering::{ChangedReferences, validate_clustering_of};
 thread_local! {
     static LAST_CLUSTERING_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
-use crate::format::overlay::staleness::field_affects_index;
 use crate::format::overlay::OverlayCoverage;
+use crate::format::overlay::staleness::field_affects_index;
 use crate::format::{
     DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, ManifestBuildConfig, RowIdMeta,
     overlay::DataOverlayFile,

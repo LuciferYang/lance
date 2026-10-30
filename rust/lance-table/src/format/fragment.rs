@@ -865,9 +865,11 @@ impl Fragment {
     /// spilled row lineage is dropped. Pure: no IO, only `files` changes. A
     /// new file that changes nothing is an error.
     pub fn replace_files(&self, schema: &Schema, new_files: &[DataFile]) -> Result<Self> {
-        new_files.iter().try_fold(self.clone(), |fragment, new_file| {
-            fragment.replace_file(schema, new_file)
-        })
+        new_files
+            .iter()
+            .try_fold(self.clone(), |fragment, new_file| {
+                fragment.replace_file(schema, new_file)
+            })
     }
 
     fn replace_file(&self, schema: &Schema, new_file: &DataFile) -> Result<Self> {
