@@ -844,7 +844,6 @@ impl<'a> TransactionRebase<'a> {
             update_mode: self_update_mode,
             updated_fragments: self_updated_fragments,
             fields_modified: self_fields_modified,
-            mem_wal_dir_id: None,
             ..
         } = &self.transaction.operation
         {
