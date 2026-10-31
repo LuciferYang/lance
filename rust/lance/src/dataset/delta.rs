@@ -428,6 +428,8 @@ impl DatasetDelta {
 
     /// Get inserted rows between the two versions.
     ///
+    /// Requires stable row ids at both nonzero endpoints; version 0 is the empty snapshot.
+    ///
     /// This returns rows where `_row_created_at_version` is greater than `begin_version`
     /// and less than or equal to `end_version`.
     /// Rows and their values are read as of the resolved end version.
@@ -464,6 +466,8 @@ impl DatasetDelta {
     }
 
     /// Get updated rows between the two versions.
+    ///
+    /// Requires stable row ids at both nonzero endpoints; version 0 is the empty snapshot.
     ///
     /// This returns rows where `_row_last_updated_at_version` is greater than `begin_version`
     /// and less than or equal to `end_version`, but `_row_created_at_version` is less than
@@ -502,6 +506,8 @@ impl DatasetDelta {
     }
 
     /// Get upserted rows between the two versions.
+    ///
+    /// Requires stable row ids at both nonzero endpoints; version 0 is the empty snapshot.
     ///
     /// This returns rows meet following conditions:
     /// Condition 1:
@@ -552,6 +558,23 @@ impl DatasetDelta {
         } else {
             self.base_dataset.checkout_version(end_version).await?
         };
+        if begin_version != 0 && begin_version != end_version {
+            let begin = if begin_version == self.base_dataset.version().version {
+                self.base_dataset.clone()
+            } else {
+                self.base_dataset.checkout_version(begin_version).await?
+            };
+            if !begin.manifest.uses_stable_row_ids() {
+                return Err(Error::invalid_input(format!(
+                    "row changes require stable row ids, version {begin_version} does not use them"
+                )));
+            }
+        }
+        if end_version != 0 && !dataset.manifest.uses_stable_row_ids() {
+            return Err(Error::invalid_input(format!(
+                "row changes require stable row ids, version {end_version} does not use them"
+            )));
+        }
         let inserted_filter = || {
             format!(
                 "{ROW_CREATED_AT_VERSION} > {begin_version} AND {ROW_CREATED_AT_VERSION} <= {end_version}"
@@ -1029,6 +1052,8 @@ mod tests {
     use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION, WILDCARD};
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_io::stream::RecordBatchStream;
+    use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
+    use lance_table::io::commit::write_manifest_file_to_path;
     use lance_table::rowids::version::{
         RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence,
     };
@@ -1380,10 +1405,14 @@ mod tests {
     #[rstest]
     #[case::empty_snapshot(0, 0)]
     #[case::same_version(1, 1)]
+    #[case::unchanged_range(2, 3)]
     #[case::reversed_range(3, 1)]
     #[tokio::test]
     async fn test_delta_pruning_empty(#[case] begin: u64, #[case] end: u64) {
-        let dataset = create_test_dataset(4, 1, "value", true).await;
+        let mut dataset = create_test_dataset(4, 1, "value", true).await;
+        for _ in 0..2 {
+            dataset.delete("false").await.unwrap();
+        }
         dataset.object_store.io_stats_incremental();
         let delta = dataset
             .delta()
@@ -1408,7 +1437,18 @@ mod tests {
                 assert!(batch.column_by_name(column).is_some());
             }
         }
-        assert_eq!(dataset.object_store.io_stats_incremental().read_iops, 0);
+        // Endpoint validation can read manifests, but pruning must avoid data files.
+        assert!(
+            dataset
+                .object_store
+                .io_stats_incremental()
+                .requests
+                .iter()
+                .all(|request| !request
+                    .path
+                    .filename()
+                    .is_some_and(|filename| filename.ends_with(".lance")))
+        );
     }
 
     #[rstest]
@@ -2460,20 +2500,99 @@ mod tests {
         }
     }
 
-    /// A range spanning the stable-id migration has a bare begin endpoint
-    /// and is rejected, naming the offending version.
+    #[rstest]
     #[tokio::test]
-    async fn test_mixed_stable_id_endpoints_are_rejected() {
+    async fn test_row_changes_require_stable_row_ids(
+        #[values(RowChange::Inserted, RowChange::Updated, RowChange::Upserted)] change: RowChange,
+        #[values(0, 1, 2)] begin_version: u64,
+    ) {
         let dir = lance_core::utils::tempfile::TempStrDir::default();
-        let mut dataset = write_dataset_temp(&dir, 0, 10, 1, "v1", false, false).await;
-        dataset.migrate_to_stable_row_ids().await.unwrap();
+        write_dataset_temp(&dir, 0, 1, 1, "v1", false, false).await;
+        let dataset = write_dataset_temp(&dir, 1, 1, 1, "v2", false, true).await;
+        assert_eq!(dataset.get_fragments().len(), 2);
+        let delta = dataset
+            .delta()
+            .with_begin_version(begin_version)
+            .with_end_version(2)
+            .build()
+            .unwrap();
 
-        let delta = dataset.delta().compared_against_version(1).build().unwrap();
-        let err = delta.get_deleted_row_ids().await.err().unwrap();
+        assert_eq!(
+            delta.list_transactions().await.unwrap().len() as u64,
+            2 - begin_version
+        );
+        let err = delta.scan_rows(change).await.err().unwrap();
+        assert!(matches!(err, lance_core::Error::InvalidInput { .. }));
+        let unsupported_version = if begin_version == 0 { 2 } else { begin_version };
         assert!(
-            err.to_string().contains("stable row ids") && err.to_string().contains("version 1"),
+            err.to_string().contains("require stable row ids")
+                && err
+                    .to_string()
+                    .contains(&format!("version {unsupported_version} does not use them")),
             "{err}"
         );
+    }
+
+    /// Both endpoint manifests must advertise stable row ids.
+    #[rstest]
+    #[case::begin(false)]
+    #[case::end(true)]
+    #[tokio::test]
+    async fn test_mixed_stable_id_endpoints_are_rejected(
+        #[case] has_unsupported_end: bool,
+        #[values(false, true)] has_historical_handle: bool,
+    ) {
+        let dir = lance_core::utils::tempfile::TempStrDir::default();
+        let mut dataset = write_dataset_temp(&dir, 0, 2, 1, "v1", false, false).await;
+        dataset.migrate_to_stable_row_ids().await.unwrap();
+
+        let (begin_version, unsupported_version) = if has_unsupported_end {
+            let stable_version = dataset.manifest.version;
+            dataset.delete("false").await.unwrap();
+            // Current writers forbid disabling stable ids. Persist the test flag so
+            // endpoint checkouts also see it when the commit handler reloads the manifest.
+            let manifest = Arc::make_mut(&mut dataset.manifest);
+            manifest.reader_feature_flags &= !FLAG_STABLE_ROW_IDS;
+            write_manifest_file_to_path(
+                dataset.object_store.as_ref(),
+                manifest,
+                None,
+                &dataset.manifest_location.path,
+                None,
+            )
+            .await
+            .unwrap();
+            dataset = Dataset::open(&dir).await.unwrap();
+            (stable_version, dataset.manifest.version)
+        } else {
+            (1, 1)
+        };
+        let end_version = dataset.manifest.version;
+        if has_historical_handle {
+            dataset = dataset.checkout_version(1).await.unwrap();
+        }
+        let delta = dataset
+            .delta()
+            .with_begin_version(begin_version)
+            .with_end_version(end_version)
+            .build()
+            .unwrap();
+        for result in [
+            delta.get_deleted_row_ids().await,
+            delta.get_inserted_rows().await,
+            delta.get_updated_rows().await,
+            delta.get_upserted_rows().await,
+        ] {
+            let err = result.err().unwrap();
+            assert!(matches!(err, lance_core::Error::InvalidInput { .. }));
+            assert!(
+                err.to_string().contains("require stable row ids")
+                    && err
+                        .to_string()
+                        .contains(&format!("version {unsupported_version} does not use them")),
+                "{err}"
+            );
+        }
     }
 
     /// One deletion per fragment across many fragments.
